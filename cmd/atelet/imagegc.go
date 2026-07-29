@@ -46,7 +46,6 @@ var (
 	imageCacheLowPct   = pflag.Int("image-cache-low-percent", 80, "Cache-volume usage percentage eviction frees down to. Must be lower than --image-cache-high-percent.")
 	imageCacheMaxBytes = pflag.Int64("image-cache-max-bytes", 0, "Absolute cap on the summed size of cached layers, evicted down to independently of the volume watermarks. 0 means no cap.")
 	imageCacheMinAge   = pflag.Duration("image-cache-min-age", 2*time.Minute, "Layers and image records younger than this are never evicted (protects images pulled but not yet mounted).")
-	imageCachePinTTL   = pflag.Duration("image-cache-pull-pin-ttl", 15*time.Minute, "TTL of the expiring pin protecting each in-flight image pull from eviction; only matters if atelet dies mid-pull.")
 	imageCacheGCDryRun = pflag.Bool("image-cache-gc-dry-run", false, "Compute and log eviction decisions without deleting anything.")
 )
 
@@ -187,7 +186,6 @@ func runImageCacheGCPass(ctx context.Context, store *imagecache.Store, cacheDir 
 		slog.Int("orphan_layers", stats.OrphanLayers),
 		slog.Int("skipped_rooted", stats.SkippedRooted),
 		slog.Int("skipped_fresh", stats.SkippedFresh),
-		slog.Int("skipped_pinned", stats.SkippedPinned),
 		slog.Int64("cache_size_bytes", cacheSize),
 		slog.Bool("dry_run", *imageCacheGCDryRun),
 		slog.Duration("took", time.Since(tStart)),
@@ -218,9 +216,6 @@ func runImageCacheGCPass(ctx context.Context, store *imagecache.Store, cacheDir 
 	case target > 0:
 		*consecutiveShortfalls = 0
 		slog.InfoContext(ctx, "Image cache GC pass complete", attrs...)
-	case stats.OrphanLayers > 0:
-		*consecutiveShortfalls = 0
-		slog.InfoContext(ctx, "Image cache GC reclaimed orphan layers", attrs...)
 	default:
 		// No disk pressure and no orphans: stay quiet. The gauges are
 		// the "GC is alive" signal, not a log line per tick.

@@ -14,20 +14,25 @@
 
 package imagecache
 
-// Regression tests for defects found reviewing the Phase 2 GC POC. Each was
-// written as a failing probe against the original implementation and is kept
-// here, passing, to pin the fix:
+// Regression tests for defects found in the two review rounds of the
+// Phase 2 GC POC, adapted to the record-first design (DESIGN-V2): pull
+// writes the image record before unpacking, pins are deferred to Phase 3,
+// and orphan recovery runs only at startup (RecoverOrphans). Each test
+// pins the v2 disposition of a probe that failed against v1:
 //
-//   - orphan layers (no surviving record references them) are reclaimed by
-//     the orphan sweep, both in the interrupted-pull shape and the
-//     digestless-bundle-spec shape;
-//   - a pull neither shortens nor removes a longer-lived preload pin;
+//   - orphans (layers no record references) are crash debris, reclaimed at
+//     startup — and a live process can no longer create them;
+//   - a mid-pull layer is protected by the pre-written record's refcount +
+//     the record's progress-touched freshness, with no in-flight set;
+//   - a partial record enumeration skips the startup scan entirely rather
+//     than sweeping on bad refcounts;
 //   - size backfill survives directories the image made unreadable;
-//   - dry-run mutates nothing, including pin files.
+//   - dry-run mutates nothing.
 
 import (
 	"archive/tar"
 	"context"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -36,15 +41,16 @@ import (
 	"time"
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/tarball"
 )
 
-// PROBE 1: a layer left in the pool with no referencing image record is
-// invisible to eviction — nothing ever enumerates the layer pool looking for
-// unreferenced dirs, so it can never be reclaimed. This is the state a pull
-// that dies partway leaves behind (layers land individually, the record is
-// written last), and the state a crash between record-removal and
-// layer-retire leaves behind.
-func TestOrphanLayerIsReclaimed(t *testing.T) {
+// PROBE 1 (review 1, H1): a layer left in the pool with no referencing
+// image record must be reclaimable. In v2 that state is crash debris by
+// definition (pull pre-writes its record; eviction retires layers in the
+// pass that drops their records), so it is reclaimed by the STARTUP scan —
+// and deliberately NOT by the periodic pass, which reaches layers only
+// through records (the leak-until-restart trade documented in DESIGN-V2 §5).
+func TestOrphanLayerReclaimedAtStartup(t *testing.T) {
 	_, host := newTestRegistry(t)
 	ref := host + "/test/orphan:latest"
 	pushImage(t, ref, v1.Config{}, layerFromEntries(t, []tarEntry{
@@ -54,66 +60,30 @@ func TestOrphanLayerIsReclaimed(t *testing.T) {
 	store := newTestStore(t)
 	img := mustEnsure(t, store, ref)
 
-	// Simulate the interrupted-pull / crashed-eviction state: layers on disk,
-	// no image record referencing them.
+	// Crash-debris state: layer on disk, no record referencing it.
 	if err := os.Remove(store.recordPath(img.Digest)); err != nil {
 		t.Fatal(err)
 	}
 	backdateStore(t, store, 3*time.Hour)
 
-	// Free-everything pass, twice (in case one pass needs to observe the
-	// other's work).
-	for i := 0; i < 2; i++ {
-		if _, err := store.EvictUnused(context.Background(), math.MaxInt64, false); err != nil {
-			t.Fatalf("EvictUnused: %v", err)
-		}
+	// The periodic pass must NOT touch it: no online whole-pool scans.
+	if _, err := store.EvictUnused(context.Background(), math.MaxInt64, false); err != nil {
+		t.Fatalf("EvictUnused: %v", err)
+	}
+	if _, err := os.Stat(img.LayerDirs[0]); err != nil {
+		t.Fatalf("periodic pass swept an orphan; that scan belongs to startup only: %v", err)
 	}
 
-	if got := layerDirsOnDisk(t, store); len(got) != 0 {
-		t.Errorf("orphan layers survive a free-everything pass: %v", got)
-	}
-	size, err := store.CacheSize()
+	// "Restart": reopening the store runs RecoverOrphans and reclaims it.
+	reopened, err := New(store.root)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("New (restart): %v", err)
 	}
-	if size != 0 {
-		t.Errorf("CacheSize() = %d after freeing everything; those bytes are unreclaimable "+
-			"but still counted against --image-cache-max-bytes", size)
+	if got := layerDirsOnDisk(t, reopened); len(got) != 0 {
+		t.Errorf("orphan layers survive startup recovery: %v", got)
 	}
-}
-
-// PROBE 2: EnsureImage writes a pull pin unconditionally and deletes it
-// unconditionally on success, so any pull of an image clobbers a longer-lived
-// pin on the same digest. Phase 3's PreloadImage writes exactly such a pin.
-func TestPullPinPreservesPreloadPin(t *testing.T) {
-	_, host := newTestRegistry(t)
-	ref := host + "/test/preloaded:latest"
-	pushImage(t, ref, v1.Config{}, layerFromEntries(t, []tarEntry{
-		{name: "f", typeflag: tar.TypeReg, mode: 0o644, body: "hi"},
-	}))
-
-	store := newTestStore(t)
-	// Resolve the digest with a throwaway store so the real store still takes
-	// the cache-miss path below.
-	digest := mustEnsure(t, newTestStore(t), ref).Digest
-
-	// An operator/Phase-3 preload pin: hold this image for an hour.
-	if err := store.writePin(digest, pinReasonPreload, time.Hour); err != nil {
-		t.Fatalf("writePin(preload): %v", err)
-	}
-
-	// A perfectly ordinary actor start pulls the same image.
-	mustEnsure(t, store, ref)
-
-	if !store.pinnedNow(digest) {
-		t.Error("a pull removed the pre-existing preload pin")
-	}
-	b, err := os.ReadFile(store.pinPath(digest))
-	if err != nil {
-		t.Fatalf("pin file gone entirely: %v", err)
-	}
-	if !strings.Contains(string(b), pinReasonPreload) {
-		t.Errorf("preload pin was overwritten by the pull pin: %s", b)
+	if size, err := reopened.CacheSize(); err != nil || size != 0 {
+		t.Errorf("CacheSize() = %d, %v after startup recovery; orphan bytes still counted", size, err)
 	}
 }
 
@@ -179,12 +149,12 @@ func TestLayerSizeBackfillSkipsUnreadableDirs(t *testing.T) {
 	}
 }
 
-// PROBE 4: the layer-rooted-but-record-evicted path (a bundle written by a
-// pre-Phase-2 atelet, i.e. every actor running across the upgrade) is a
-// routine, non-crash way to manufacture the PROBE 1 orphan state: the pass
-// deletes the only record referencing the layer and keeps the layer because
-// LayerHexes vetoes it. Once that bundle goes away the layer is referenced by
-// nothing and, per PROBE 1, is unreclaimable for the life of the node.
+// PROBE 4 (review 1): a digestless bundle spec (written by a pre-Phase-2
+// atelet, i.e. every actor running across the upgrade) must not strand its
+// layers. In v2 the exact-layer-set rooting rule keeps the RECORD alive
+// while the bundle exists, so when the bundle goes the record and layers
+// are evicted together through the ordinary path — no orphan is ever
+// manufactured, and no sweep is needed.
 func TestDigestlessSpecLayersReclaimedAfterBundleGone(t *testing.T) {
 	_, host := newTestRegistry(t)
 	ref := host + "/test/upgrade:latest"
@@ -206,12 +176,16 @@ func TestDigestlessSpecLayersReclaimedAfterBundleGone(t *testing.T) {
 	}
 	backdateStore(t, store, 3*time.Hour)
 
-	// Pass 1, while the actor runs: record goes, layer is held by LayerHexes.
+	// Pass 1, while the actor runs: the exact-layer-set rule roots the
+	// record, so record AND layer both survive.
 	if _, err := store.EvictUnused(context.Background(), math.MaxInt64, false); err != nil {
 		t.Fatalf("EvictUnused: %v", err)
 	}
 	if _, err := os.Stat(img.LayerDirs[0]); err != nil {
 		t.Fatalf("layer of a running (digestless) actor was evicted: %v", err)
+	}
+	if _, err := os.Stat(store.recordPath(img.Digest)); err != nil {
+		t.Fatalf("record of a running (digestless) actor was evicted — that would strand its layers: %v", err)
 	}
 
 	// The actor finishes; atelet removes the bundle.
@@ -224,67 +198,68 @@ func TestDigestlessSpecLayersReclaimedAfterBundleGone(t *testing.T) {
 		t.Fatalf("EvictUnused: %v", err)
 	}
 	if got := layerDirsOnDisk(t, store); len(got) != 0 {
-		t.Errorf("layer left unreferenced by pass 1 is unreclaimable: %v", got)
+		t.Errorf("digestless-spec layers not reclaimed after bundle removal: %v", got)
 	}
 }
 
-// PROBE 5: --image-cache-gc-dry-run is documented as "compute and log
-// eviction decisions without deleting anything", but the pass unconditionally
-// runs sweepExpiredPins, which deletes pin files.
-func TestDryRunLeavesPinFilesAlone(t *testing.T) {
-	store := newTestStore(t)
-	digest := v1.Hash{Algorithm: "sha256", Hex: strings.Repeat("ef", 32)}
-	if err := store.writePin(digest, pinReasonPull, -time.Second); err != nil {
-		t.Fatal(err)
-	}
+// Review 2, CRITICAL: layers of an in-flight pull must survive eviction.
+// v1 patched this with an in-memory in-flight set; v2 makes it structural —
+// pull writes the record before unpacking, so a mid-pull layer is held by
+// (a) the record's refcount and (b) the record's freshness, which the
+// per-layer progress touch renews for as long as the pull advances. The
+// wedged-pull disposal is also pinned here: a record with no progress for
+// longer than min-age is evicted together with its partial layers, as an
+// ordinary LRU unit.
+func TestRecordFirstProtectsInFlightPull(t *testing.T) {
+	store := newTestStore(t) // default min-age: 2m
 
-	if _, err := store.EvictUnused(context.Background(), math.MaxInt64, true); err != nil {
-		t.Fatalf("EvictUnused(dry): %v", err)
-	}
-	if _, err := os.Stat(store.pinPath(digest)); os.IsNotExist(err) {
-		t.Error("dry-run pass deleted an on-disk pin file")
-	}
-}
-
-// A pull unpacks its layers individually and writes the image record last,
-// so a layer that landed early has no record, no bundle spec, and — once it
-// is older than minAge — no age veto either. Nothing may reclaim it while
-// the pull that is producing it is still running: EnsureImage would return
-// LayerDirs pointing at deleted paths (unlike the cache-hit path, pull does
-// not re-verify), and the bundle spec would name a nonexistent lowerdir.
-func TestOrphanSweepSpareseInFlightPullLayers(t *testing.T) {
-	store := newTestStore(t, WithMinAge(0)) // every layer is instantly "old"
-
-	// Simulate the middle of a pull: layer landed, record not yet written.
+	// Simulate mid-pull under record-first: record written (fresh), first
+	// layer landed, remaining layers still downloading.
 	diffID := v1.Hash{Algorithm: "sha256", Hex: strings.Repeat("5c", 32)}
+	pending := v1.Hash{Algorithm: "sha256", Hex: strings.Repeat("6d", 32)}
+	digest := v1.Hash{Algorithm: "sha256", Hex: strings.Repeat("7e", 32)}
 	dir := store.layerDir(diffID)
 	if err := os.MkdirAll(filepath.Join(dir, layerFSDirName), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	release := store.holdInFlight([]v1.Hash{diffID})
+	rec := imageRecord{Version: 1, DiffIDs: []string{diffID.String(), pending.String()}}
+	if err := store.writeRecord(digest, rec); err != nil {
+		t.Fatal(err)
+	}
+	// Even if the layer itself is old (it may have been in the pool for
+	// months from another image), the fresh record must hold it.
+	backdate(t, dir, 3*time.Hour)
 
 	if _, err := store.EvictUnused(context.Background(), math.MaxInt64, false); err != nil {
 		t.Fatalf("EvictUnused: %v", err)
 	}
 	if _, err := os.Stat(dir); err != nil {
-		t.Fatalf("orphan sweep reclaimed a layer belonging to an in-flight pull: %v", err)
+		t.Fatalf("eviction reclaimed a layer referenced by a fresh (in-flight) record: %v", err)
+	}
+	if _, err := os.Stat(store.recordPath(digest)); err != nil {
+		t.Fatalf("eviction removed a fresh (in-flight) record: %v", err)
 	}
 
-	// Once the pull finishes without writing a record (i.e. it failed), the
-	// layer is a genuine orphan and the next pass takes it.
-	release()
+	// Wedged pull: no progress touch for longer than min-age. The record and
+	// its partial layers are evicted together — reclaimed, not leaked.
+	backdate(t, store.recordPath(digest), 3*time.Hour)
 	if _, err := store.EvictUnused(context.Background(), math.MaxInt64, false); err != nil {
 		t.Fatalf("EvictUnused: %v", err)
 	}
+	if _, err := os.Stat(store.recordPath(digest)); !os.IsNotExist(err) {
+		t.Errorf("wedged-pull record survived: %v", err)
+	}
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
-		t.Errorf("layer of a finished pull with no record was not reclaimed: %v", err)
+		t.Errorf("wedged-pull partial layer survived: %v", err)
 	}
 }
 
-// A pass that could not enumerate every image record must not run the
-// orphan sweep: refcounts derived from a partial listing make referenced
-// layers look unreferenced, and the sweep would delete a live cache.
-func TestOrphanSweepSkippedWhenEnumerationIncomplete(t *testing.T) {
+// Review 2, HIGH: refcounts derived from a partial record enumeration must
+// never drive orphan reclamation. In v2 the only reclamation scan runs at
+// startup, and it skips itself entirely (conservative, logged) when any
+// record fails to read or decode — while New still succeeds, because a
+// corrupt record must not keep atelet from serving actors.
+func TestStartupOrphanScanSkippedWhenEnumerationIncomplete(t *testing.T) {
 	_, host := newTestRegistry(t)
 	ref := host + "/test/enum:latest"
 	pushImage(t, ref, v1.Config{}, layerFromEntries(t, []tarEntry{
@@ -294,29 +269,37 @@ func TestOrphanSweepSkippedWhenEnumerationIncomplete(t *testing.T) {
 	img := mustEnsure(t, store, ref)
 	backdateStore(t, store, 3*time.Hour)
 
-	// Corrupt one record so its diffIDs contribute no refcounts, while the
-	// record itself survives as a non-candidate.
-	recs, err := os.ReadDir(store.manifestsDir())
-	if err != nil {
+	// A genuine orphan AND a corrupt record: the orphan must be spared
+	// because the corrupt record makes the enumeration untrustworthy.
+	orphan := filepath.Join(store.layersDir(), strings.Repeat("aa", 32))
+	if err := os.MkdirAll(filepath.Join(orphan, layerFSDirName), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(store.manifestsDir(), recs[0].Name()), []byte("{not json"), 0o600); err != nil {
+	backdate(t, orphan, 3*time.Hour)
+	if err := os.WriteFile(store.recordPath(v1.Hash{Algorithm: "sha256", Hex: strings.Repeat("bb", 32)}), []byte("{not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := store.EvictUnused(context.Background(), 0, false); err == nil {
-		t.Error("expected the pass to report the unreadable record")
+	reopened, err := New(store.root)
+	if err != nil {
+		t.Fatalf("New must survive a corrupt record (atelet must still serve): %v", err)
 	}
+	if _, err := os.Stat(orphan); err != nil {
+		t.Errorf("startup scan ran on an incomplete enumeration and swept a layer: %v", err)
+	}
+	// The intact image is untouched either way.
 	for _, d := range img.LayerDirs {
 		if _, err := os.Stat(d); err != nil {
-			t.Errorf("layers were swept after an incomplete record enumeration: %v", err)
+			t.Errorf("intact image layer swept: %v", err)
 		}
 	}
+	_ = reopened
 }
 
-// A directory name that is not a layer digest must never reach the rename
-// path (which shortens the name) or crash the pass.
-func TestOrphanSweepIgnoresNonLayerDirs(t *testing.T) {
+// A directory name that is not a layer digest must never be treated as a
+// layer — not by the periodic pass, and not by the startup scan (which
+// would otherwise also panic abbreviating a short name for rename-aside).
+func TestNonLayerDirsIgnored(t *testing.T) {
 	store := newTestStore(t, WithMinAge(0))
 	junk := filepath.Join(store.layersDir(), "notadigest")
 	if err := os.MkdirAll(junk, 0o700); err != nil {
@@ -327,29 +310,59 @@ func TestOrphanSweepIgnoresNonLayerDirs(t *testing.T) {
 		t.Fatalf("EvictUnused: %v", err)
 	}
 	if stats.OrphanLayers != 0 {
-		t.Errorf("swept a non-layer dir: %+v", stats)
+		t.Errorf("periodic pass swept something: %+v", stats)
+	}
+	if _, err := New(store.root, WithMinAge(0)); err != nil {
+		t.Fatalf("New: %v", err)
 	}
 	if _, err := os.Stat(junk); err != nil {
 		t.Errorf("non-layer dir was removed: %v", err)
 	}
 }
 
-// A pull pin must not evict a preload pin that expires sooner than the pull
-// TTL: writePin previously kept the later expiry but overwrote the reason,
-// so the pull's completion deleted the preload holder outright.
-func TestShorterPreloadPinSurvivesLongerPullPin(t *testing.T) {
+// The record must exist BEFORE unpacking — the load-bearing ordering of the
+// record-first design. A pull that fails partway therefore leaves a record
+// (resumable progress that ages out via LRU), never unexplained layers.
+func TestFailedPullLeavesResumableRecordNotOrphans(t *testing.T) {
+	_, host := newTestRegistry(t)
+	ref := host + "/test/badlayer:latest"
+	good := layerFromEntries(t, []tarEntry{
+		{name: "ok", typeflag: tar.TypeReg, mode: 0o644, body: strings.Repeat("g", 2048)},
+	})
+	// Valid blob, invalid tar: unpack fails after download succeeds.
+	bad, err := tarball.LayerFromOpener(func() (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader("this is not a tar archive at all")), nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pushImage(t, ref, v1.Config{}, good, bad)
+
 	store := newTestStore(t)
-	digest := v1.Hash{Algorithm: "sha256", Hex: strings.Repeat("7a", 32)}
+	_, err = store.EnsureImage(context.Background(), ref)
+	if err == nil {
+		t.Fatal("EnsureImage succeeded on an image with an untarrable layer")
+	}
 
-	if err := store.writePin(digest, pinReasonPreload, 5*time.Minute); err != nil {
+	recs, err := os.ReadDir(store.manifestsDir())
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.writePin(digest, pinReasonPull, 15*time.Minute); err != nil {
-		t.Fatal(err)
+	if len(recs) == 0 {
+		t.Fatal("failed pull left no record: its landed layers are unexplained (v1's orphan factory)")
 	}
-	store.removePin(digest, pinReasonPull) // pull completes
-
-	if !store.pinnedNow(digest) {
-		t.Error("a pull destroyed a preload pin whose TTL was shorter than the pull TTL")
+	// Whatever layers landed are referenced by that record — assert none is
+	// an orphan by running the startup scan and checking nothing is swept.
+	backdateStore(t, store, 3*time.Hour)
+	for _, r := range recs {
+		backdate(t, filepath.Join(store.manifestsDir(), r.Name()), 0) // keep records fresh
+	}
+	before := layerDirsOnDisk(t, store)
+	reopened, err := New(store.root)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if after := layerDirsOnDisk(t, reopened); len(after) != len(before) {
+		t.Errorf("startup scan swept layers of a failed-but-recorded pull: %v -> %v", before, after)
 	}
 }

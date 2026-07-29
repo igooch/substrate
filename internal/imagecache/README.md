@@ -79,13 +79,18 @@ listing layer diffIDs in order — layers shared by N images exist once.
    pkg.dev registries get the configured GCP authenticator.
 2. **Cache check**: if the manifest record exists and every layer dir is
    present, return with no network I/O. Missing layers (only) are re-pulled.
-3. **Pull** by resolved digest: layers download in parallel (bounded at 4),
+3. **Record**: the image config + diffID list (known from the config
+   before any unpack) is written under the requested digest — and the
+   per-platform child digest for multi-arch refs — **before unpacking
+   begins**, so every layer the pull produces is referenced before it can
+   exist. See "What is protected" below.
+4. **Pull** by resolved digest: layers download in parallel (bounded at 4),
    each streamed download → decompress → untar directly into the pool.
    Concurrent pulls of the same image or layer are collapsed with
    singleflight, so simultaneous actor starts never duplicate work — and
-   each completed layer lands individually, so an interrupted pull makes
-   incremental progress across retries.
-4. **Unpack** (`unpackLayer`) is the repo's hardened untar: `os.Root`
+   each completed layer lands individually (touching the record each time),
+   so an interrupted pull makes incremental progress across retries.
+5. **Unpack** (`unpackLayer`) is the repo's hardened untar: `os.Root`
    confinement (path traversal and symlink/hardlink escapes are refused),
    "later entry wins" within a layer, read-only-dir handling that works
    without `CAP_DAC_OVERRIDE`, and creation of parent directories that the
@@ -93,8 +98,9 @@ listing layer diffIDs in order — layers shared by N images exist once.
    (`.wh.*`) are **not** written into the tree — overlayfs whiteouts are
    char devices atelet cannot create — they are recorded in
    `whiteouts.json` for the consumer to materialize.
-5. **Record**: the image config + diffID list is written under the
-   requested digest (and the per-platform child digest for multi-arch refs).
+6. **Re-verify**: before returning, the pull re-stats every layer dir it
+   is about to hand out (mirroring the cache-hit path), so callers never
+   receive paths that are not on disk.
 
 `prepareOCIDirectory` in atelet then writes `rootfs-overlay.json`
 (`OverlaySpec`) into the bundle next to `config.json`, listing the layer
@@ -171,12 +177,11 @@ default 5m; `0` disables it). Each pass:
 3. **Builds the root set** by scanning every bundle's `rootfs-overlay.json`
    (see below), and **refcounts** layers across all image records.
 4. **Evicts** LRU-first by image last-use (the record's mtime, refreshed on
-   every cache hit), subject to three vetoes: rooted, pinned, or younger
-   than `--image-cache-min-age` (default 2m).
-5. **Sweeps orphans** — layer dirs no surviving record references — every
-   pass, even when no eviction is needed. Interrupted pulls leave these
-   (layers land individually, the record is written last), and nothing else
-   can reclaim them.
+   every cache hit and on every completed layer of an in-flight pull),
+   subject to two vetoes: rooted, or younger than `--image-cache-min-age`
+   (default 2m). The pass reaches layers **only through records**: a layer
+   is deleted exactly when its last referencing record goes, never by an
+   independent scan.
 
 `--image-cache-gc-dry-run` computes and logs every decision while mutating
 nothing: the recommended way to soak the policy on a live fleet.
@@ -185,10 +190,21 @@ nothing: the recommended way to soak the policy on a live fleet.
 mount namespaces, atelet cannot see them in its own `/proc/mounts`. The
 root set instead comes from the bundle specs atelet itself writes — before
 any ateom is asked to mount, and removed only after unmount — so an image
-referenced by any bundle on the node is never evicted. Expiring pins under
-`pins/` cover the remaining window: every pull holds one, so a partially
-pulled image survives an atelet crash, and Phase 3's `PreloadImage` will
-use the same mechanism.
+referenced by any bundle on the node is never evicted. In-flight pulls
+need no separate protection: `EnsureImage` writes the image record
+**before** unpacking (the way Go allocates black during GC and containerd
+creates its ingest record before the bytes land), so every layer a pull
+produces is referenced — and refreshed by a per-layer progress touch — from
+before it exists. An interrupted pull's record is resumable progress, not
+garbage: the next pull of that digest re-fetches only the missing layers,
+and a pull that never resumes ages out through ordinary LRU.
+
+**Startup recovery.** A layer no record references can only be crash
+debris (eviction interrupted between record-delete and layer-rename) or
+operator damage; `New` reclaims such orphans once, at startup, when no
+pull can be racing the scan — and skips the scan entirely, conservatively,
+if any record fails to read. There is no online whole-pool scan (ext4's
+split: bounded recovery at mount, fsck offline).
 
 **Deletion is two-phase.** A layer is atomically renamed to `.rm-<rand>`
 inside the layer's singleflight (one `rename(2)` — eviction can never stall

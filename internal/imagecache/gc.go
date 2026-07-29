@@ -25,12 +25,22 @@ package imagecache
 //
 //  1. the root set — bundle overlay specs under the actors dir (actors
 //     placed on this node; the same authority that hands out mounts, since
-//     atelet cannot see the ateoms' mount namespaces) and unexpired pins
-//     (in-flight pulls now, Phase 3 preloads later);
+//     atelet cannot see the ateoms' mount namespaces);
 //  2. min-age — records/layers younger than minAge are never touched,
 //     covering the pull→spec-write→mount window;
 //  3. per-victim re-checks immediately before acting (the kubelet's
 //     lastUsed-vs-freeTime double check, adapted).
+//
+// The periodic pass reaches layers ONLY through records: pull writes the
+// image record before unpacking (see Store.pull), so every layer is
+// referenced — and thereby protected — before it can exist, the way Go
+// allocates black during GC, containerd creates the ingest record in the
+// transaction that opens the writer, and ext4 journals the orphan entry
+// with the O_TMPFILE allocation. Unexplained layers can therefore only be
+// crash debris, reclaimed once at startup by RecoverOrphans; there is no
+// online whole-pool scan (ext4's split: bounded recovery at mount, fsck
+// offline). Pins return in Phase 3 for preloads, where the record their
+// digest resolves through always exists.
 //
 // Deletion is two-phase (containerd's shape): the only steps that contend
 // with the pull path are one os.Remove of a record and one rename(2) of a
@@ -53,7 +63,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
@@ -73,46 +82,6 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// --- in-flight pull tracking ---
-
-// holdInFlight marks every diffID as being produced by a live pull and
-// returns the release function. Eviction refuses to retire a held layer.
-// See Store.inFlightLayers for why this cannot be left to min-age.
-func (s *Store) holdInFlight(diffIDs []v1.Hash) func() {
-	held := make([]string, 0, len(diffIDs))
-	s.inFlightMu.Lock()
-	if s.inFlightLayers == nil {
-		s.inFlightLayers = make(map[string]int, len(diffIDs))
-	}
-	for _, d := range diffIDs {
-		s.inFlightLayers[d.Hex]++
-		held = append(held, d.Hex)
-	}
-	s.inFlightMu.Unlock()
-
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			s.inFlightMu.Lock()
-			defer s.inFlightMu.Unlock()
-			for _, hex := range held {
-				if s.inFlightLayers[hex] <= 1 {
-					delete(s.inFlightLayers, hex)
-					continue
-				}
-				s.inFlightLayers[hex]--
-			}
-		})
-	}
-}
-
-// inFlight reports whether a live pull is producing this layer.
-func (s *Store) inFlight(hex string) bool {
-	s.inFlightMu.Lock()
-	defer s.inFlightMu.Unlock()
-	return s.inFlightLayers[hex] > 0
-}
-
 // isLayerDirName reports whether name is a well-formed sha256 layer
 // directory name. The orphan sweep enumerates the pool directly, so it can
 // encounter anything an operator left there; only conforming names are
@@ -128,205 +97,6 @@ func isLayerDirName(name string) bool {
 		}
 	}
 	return true
-}
-
-// --- pins ---
-
-const (
-	pinReasonPull    = "pull"
-	pinReasonPreload = "preload" // written by Phase 3's PreloadImage
-)
-
-// pinRecord is the persisted form of a digest's pins, stored under
-// pins/<algorithm>/<hex>.json. Expiry is lazy: nothing fires when a pin
-// lapses; readers skip and eviction deletes pins past their timestamp.
-//
-// Holders is keyed by reason, so independent holders of the same digest do
-// not clobber each other. That matters because a pull's fixed 15m TTL can
-// be *longer* than an operator's preload TTL: with a single expiry+reason
-// the pull would overwrite the preload holder and then delete it outright
-// on completion, silently un-pinning an image the control plane asked to
-// keep. Phase 3 depends on this separation.
-type pinRecord struct {
-	Version int                  `json:"version"`
-	Holders map[string]time.Time `json:"holders"`
-
-	// Legacy single-holder fields, read for compatibility with pins written
-	// by earlier builds and never written. Normalized into Holders on read.
-	Reason  string    `json:"reason,omitempty"`
-	Expires time.Time `json:"expires,omitempty"`
-}
-
-// live returns the holders that have not expired.
-func (p *pinRecord) live(now time.Time) map[string]time.Time {
-	out := make(map[string]time.Time, len(p.Holders))
-	for reason, exp := range p.Holders {
-		if now.Before(exp) {
-			out[reason] = exp
-		}
-	}
-	return out
-}
-
-func (s *Store) pinPath(digest v1.Hash) string {
-	return filepath.Join(s.root, "pins", digest.Algorithm, digest.Hex+".json")
-}
-
-// readPin returns the digest's pin record, or (nil, nil) if there is none.
-// Any other error is returned; callers must treat an error as "pinned"
-// (fail toward retention) rather than assume the digest is unprotected.
-func (s *Store) readPin(digest v1.Hash) (*pinRecord, error) {
-	b, err := os.ReadFile(s.pinPath(digest))
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	} else if err != nil {
-		return nil, err
-	}
-	var p pinRecord
-	if err := json.Unmarshal(b, &p); err != nil {
-		return nil, fmt.Errorf("while decoding pin for %s: %w", digest, err)
-	}
-	if p.Holders == nil {
-		p.Holders = map[string]time.Time{}
-	}
-	if p.Reason != "" && !p.Expires.IsZero() {
-		if cur, ok := p.Holders[p.Reason]; !ok || p.Expires.After(cur) {
-			p.Holders[p.Reason] = p.Expires
-		}
-	}
-	return &p, nil
-}
-
-// writePin adds or extends this holder's pin on digest, leaving other
-// holders untouched. An existing holder's expiry is only ever pushed out,
-// never pulled in.
-func (s *Store) writePin(digest v1.Hash, reason string, ttl time.Duration) error {
-	expires := time.Now().Add(ttl)
-	holders := map[string]time.Time{}
-	if cur, err := s.readPin(digest); err == nil && cur != nil {
-		holders = cur.live(time.Now())
-	}
-	if existing, ok := holders[reason]; !ok || expires.After(existing) {
-		holders[reason] = expires
-	}
-	if err := s.writePinRecord(digest, holders); err != nil {
-		return err
-	}
-	slog.Info("Image cache pin written",
-		slog.String("digest", digest.String()),
-		slog.String("reason", reason),
-		slog.Duration("ttl", ttl))
-	return nil
-}
-
-// writePinRecord atomically persists holders, removing the file when no
-// holder remains.
-func (s *Store) writePinRecord(digest v1.Hash, holders map[string]time.Time) error {
-	path := s.pinPath(digest)
-	if len(holders) == 0 {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("while removing empty pin: %w", err)
-		}
-		return nil
-	}
-	b, err := json.Marshal(pinRecord{Version: 1, Holders: holders})
-	if err != nil {
-		return fmt.Errorf("while encoding pin: %w", err)
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
-	if err != nil {
-		return fmt.Errorf("while creating pin temp file: %w", err)
-	}
-	defer os.Remove(tmp.Name()) // no-op once the rename succeeds
-	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		return fmt.Errorf("while writing pin: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("while closing pin: %w", err)
-	}
-	if err := os.Rename(tmp.Name(), path); err != nil {
-		return fmt.Errorf("while moving pin into place: %w", err)
-	}
-	return nil
-}
-
-// removePin releases only this holder's pin; other holders survive.
-func (s *Store) removePin(digest v1.Hash, reason string) {
-	cur, err := s.readPin(digest)
-	if err != nil || cur == nil {
-		return
-	}
-	holders := cur.live(time.Now())
-	if _, held := holders[reason]; !held {
-		return
-	}
-	delete(holders, reason)
-	if err := s.writePinRecord(digest, holders); err != nil {
-		slog.Warn("Failed to release pin", slog.String("digest", digest.String()),
-			slog.String("reason", reason), slog.Any("err", err))
-		return
-	}
-	slog.Info("Image cache pin removed", slog.String("digest", digest.String()), slog.String("reason", reason))
-}
-
-// pinnedNow reports whether digest has any unexpired holder right now.
-// Used both for the candidate list and re-checked per victim immediately
-// before deletion, so a pin written after the list was built still vetoes.
-// Read errors count as pinned: an unreadable pin must not be read as
-// permission to delete.
-func (s *Store) pinnedNow(digest v1.Hash) bool {
-	cur, err := s.readPin(digest)
-	if err != nil {
-		return true
-	}
-	if cur == nil {
-		return false
-	}
-	return len(cur.live(time.Now())) > 0
-}
-
-// sweepExpiredPins drops expired holders (and pin files left with none),
-// plus orphaned pin temp files. Called at startup and at the end of every
-// eviction pass.
-func (s *Store) sweepExpiredPins() error {
-	entries, err := os.ReadDir(s.pinsDir())
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return fmt.Errorf("while listing pins: %w", err)
-	}
-	now := time.Now()
-	for _, e := range entries {
-		p := filepath.Join(s.pinsDir(), e.Name())
-		if strings.HasPrefix(e.Name(), ".") {
-			if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("while sweeping orphaned pin temp file %q: %w", p, err)
-			}
-			continue
-		}
-		hex, ok := strings.CutSuffix(e.Name(), ".json")
-		if !ok {
-			continue
-		}
-		digest := v1.Hash{Algorithm: "sha256", Hex: hex}
-		cur, err := s.readPin(digest)
-		if err != nil || cur == nil {
-			continue // unreadable: retained (see pinnedNow)
-		}
-		live := cur.live(now)
-		if len(live) == len(cur.Holders) {
-			continue
-		}
-		if err := s.writePinRecord(digest, live); err != nil {
-			return fmt.Errorf("while pruning expired pin %q: %w", p, err)
-		}
-		slog.Info("Image cache pruned expired pin holders",
-			slog.String("digest", digest.String()),
-			slog.Int("remaining", len(live)))
-	}
-	return nil
 }
 
 // --- sizes and last-use ---
@@ -541,13 +311,16 @@ type EvictStats struct {
 	// RootedImages counts image records excluded because a bundle overlay
 	// spec roots them (the "actively placed" protection).
 	RootedImages int
-	// SkippedRooted / SkippedFresh / SkippedPinned count vetoes at listing
-	// time and during the pass (a veto can fire in either place; the
-	// double-check re-runs them against current disk state).
-	SkippedRooted, SkippedFresh, SkippedPinned int
-	// OrphanLayers counts layer dirs reclaimed by the orphan sweep: layers
-	// no surviving image record references, which the record-driven pass
-	// can never reach. Their bytes are included in FreedBytes.
+	// SkippedRooted / SkippedFresh count vetoes at listing time and during
+	// the pass (a veto can fire in either place; the double-check re-runs
+	// them against current disk state).
+	SkippedRooted, SkippedFresh int
+	// OrphanLayers counts layer dirs reclaimed by the STARTUP orphan scan
+	// (RecoverOrphans): layers no record references, which the record-driven
+	// pass can never reach. Always zero for periodic passes — a live process
+	// cannot create orphans now that pull writes the record before
+	// unpacking, so the scan runs only at startup (ext4's shape: bounded
+	// recovery at mount, no online fsck). Bytes are included in FreedBytes.
 	OrphanLayers int
 }
 
@@ -587,7 +360,7 @@ func (s *Store) EvictUnused(ctx context.Context, targetBytes int64, dryRun bool)
 	roots := s.InUse()
 	cutoff := time.Now().Add(-s.minAge)
 
-	candidates, refcount, complete, listErr := s.listEviction(roots, cutoff, &stats)
+	candidates, refcount, _, listErr := s.listEviction(roots, cutoff, &stats)
 	// listErr is deferred, not fatal: evict what was listed, report at the end.
 	stats.Candidates = len(candidates)
 
@@ -621,9 +394,6 @@ func (s *Store) EvictUnused(ctx context.Context, targetBytes int64, dryRun bool)
 		skip, err := func() (skip string, err error) {
 			s.hitMu.Lock()
 			defer s.hitMu.Unlock()
-			if s.pinnedNow(cand.digest) {
-				return "pinned", nil
-			}
 			fi, err := os.Stat(s.recordPath(cand.digest))
 			if errors.Is(err, os.ErrNotExist) {
 				return "gone", nil // already gone (e.g. its multi-arch twin's pass)
@@ -645,16 +415,12 @@ func (s *Store) EvictUnused(ctx context.Context, targetBytes int64, dryRun bool)
 			continue
 		}
 		switch skip {
-		case "pinned", "fresh":
+		case "fresh":
 			slog.InfoContext(ctx, "Image cache eviction skipped image",
 				slog.String("digest", cand.digest.String()),
 				slog.String("reason", skip),
 				slog.Time("last_used", cand.modTime))
-			if skip == "pinned" {
-				stats.SkippedPinned++
-			} else {
-				stats.SkippedFresh++
-			}
+			stats.SkippedFresh++
 			continue
 		case "gone":
 			continue
@@ -706,19 +472,6 @@ func (s *Store) EvictUnused(ctx context.Context, targetBytes int64, dryRun bool)
 	// apply — the latter is what keeps a concurrent pull's freshly unpacked
 	// layers (whose record isn't written yet) out of the sweep, reusing the
 	// same singleflight + mtime interlock as retireLayer.
-	// Only when the record enumeration was complete: a layer looks
-	// unreferenced both when it truly is and when we failed to read the
-	// record that references it. Deferring orphan collection by a pass
-	// costs nothing — orphans are not urgent — whereas sweeping on partial
-	// data deletes a live cache.
-	if complete {
-		orphans, orphanErrs := s.sweepOrphanLayers(ctx, roots, refcount, cutoff, dryRun, &stats)
-		retired = append(retired, orphans...)
-		errs = append(errs, orphanErrs...)
-	} else {
-		slog.WarnContext(ctx, "Image cache skipping orphan sweep: image records could not be fully enumerated")
-	}
-
 	// The slow half, outside every lock: the retired dirs are unreachable by
 	// diffid, so this contends with nothing. A crash before completion
 	// leaves ".rm-*" dirs for the startup sweep.
@@ -742,10 +495,50 @@ func (s *Store) EvictUnused(ctx context.Context, targetBytes int64, dryRun bool)
 			slog.Duration("took", time.Since(tRemove)))
 	}
 
-	if !dryRun {
-		if err := s.sweepExpiredPins(); err != nil {
-			errs = append(errs, err)
+	return stats, errors.Join(errs...)
+}
+
+// RecoverOrphans reclaims layer dirs that no image record references. It
+// is called once, from New, before the store serves any request — the one
+// moment the scan is structurally race-free: no pull can be in flight, so
+// a layer without a record is definitionally garbage, not work in
+// progress. (During normal operation orphans cannot arise: pull writes the
+// record before unpacking, and eviction retires layers in the same pass
+// that drops their records. What this scan reaps is crash debris — a
+// crash between record-delete and layer-rename — and operator damage.
+// A retireLayer failure while the process lives therefore leaks until the
+// next restart: rare, logged, bounded, and the accepted trade for not
+// running an fsck against a live pool every pass.)
+//
+// Conservative by construction: if the record enumeration is not complete
+// (unreadable dir, undecodable record), the scan is skipped entirely and
+// logged at ERROR — refcounts from partial data make referenced layers
+// look like garbage. Bundle-spec roots and min-age still veto, covering
+// actors running across the restart and any near-boundary mtimes.
+func (s *Store) RecoverOrphans(ctx context.Context) (EvictStats, error) {
+	var stats EvictStats
+	s.evictMu.Lock()
+	defer s.evictMu.Unlock()
+
+	roots := s.InUse()
+	cutoff := time.Now().Add(-s.minAge)
+	_, refcount, complete, listErr := s.listEviction(roots, cutoff, &stats)
+	if !complete {
+		slog.ErrorContext(ctx, "Image cache startup orphan scan skipped: image records could not be fully enumerated; orphaned layers (if any) will persist until the records are repaired",
+			slog.Any("err", listErr))
+		return stats, listErr
+	}
+
+	retired, errs := s.sweepOrphanLayers(ctx, roots, refcount, cutoff, false, &stats)
+	for _, dir := range retired {
+		if err := RemoveAllWritable(dir); err != nil {
+			errs = append(errs, fmt.Errorf("while removing retired orphan %q: %w", dir, err))
 		}
+	}
+	if stats.OrphanLayers > 0 {
+		slog.InfoContext(ctx, "Image cache startup scan reclaimed orphan layers",
+			slog.Int("count", stats.OrphanLayers),
+			slog.Int64("freed_bytes", stats.FreedBytes))
 	}
 	return stats, errors.Join(errs...)
 }
@@ -879,10 +672,6 @@ func (s *Store) listEviction(roots RootSet, cutoff time.Time, stats *EvictStats)
 			stats.SkippedFresh++
 			continue
 		}
-		if s.pinnedNow(digest) {
-			stats.SkippedPinned++
-			continue
-		}
 		candidates = append(candidates, evictionCandidate{digest: digest, modTime: fi.ModTime(), diffIDs: unique})
 	}
 
@@ -925,16 +714,6 @@ func (s *Store) retireLayer(hex string, cutoff time.Time, dryRun bool) (int64, s
 
 	var retired string
 	_, err, _ = s.layerSF.Do(v1.Hash{Algorithm: "sha256", Hex: hex}.String(), func() (any, error) {
-		// A live pull is producing this layer: its record does not exist
-		// yet, so neither refcounts nor pins can speak for it. Checked
-		// inside the flight so it cannot go stale between here and the
-		// rename, and applied to both callers — the record-driven path can
-		// hit the same window when an evicted image shares a layer with an
-		// image being pulled.
-		if s.inFlight(hex) {
-			slog.Info(logMsgLayerRetireVetoed+" (in-flight pull)", slog.String("diffid", hex))
-			return nil, nil
-		}
 		fi, err := os.Stat(dir)
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil

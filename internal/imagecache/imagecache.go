@@ -89,8 +89,7 @@ const (
 	// so diffid-named dirs can never collide with it.
 	retiredPrefix = ".rm-"
 
-	defaultMinAge     = 2 * time.Minute
-	defaultPullPinTTL = 15 * time.Minute
+	defaultMinAge = 2 * time.Minute
 
 	// layerPullConcurrency bounds concurrent layer download+unpack streams per
 	// image pull. Memory use is O(stream buffers) per slot, independent of
@@ -116,7 +115,7 @@ type Store struct {
 	platform *v1.Platform
 
 	// actorsDir is scanned by InUse for bundle overlay specs; empty disables
-	// the scan (the root set is then pins only).
+	// the scan (the root set is then empty).
 	actorsDir string
 
 	// minAge vetoes eviction of any layer or image record younger than this,
@@ -124,38 +123,12 @@ type Store struct {
 	// spec write / ateom mount that roots it.
 	minAge time.Duration
 
-	// pullPinTTL bounds the expiring pin EnsureImage writes around a pull. In
-	// the happy path the pin is deleted as soon as the image record is
-	// durable; the TTL only matters if atelet dies mid-pull, where it keeps
-	// the partial layers from being evicted out from under the retry.
-	pullPinTTL time.Duration
-
 	imageSF singleflight.Group
 	layerSF singleflight.Group
 
 	// evictMu serializes EvictUnused passes (concurrent passes would fight
 	// over the same candidates for no benefit).
 	evictMu sync.Mutex
-
-	// inFlightMu guards inFlightLayers.
-	inFlightMu sync.Mutex
-	// inFlightLayers counts the pulls currently producing each diffID.
-	// Eviction treats a counted layer as rooted.
-	//
-	// This is load-bearing, not belt-and-braces: a pull unpacks its layers
-	// individually and writes the image record last, so between the first
-	// layer landing and the record appearing, an already-unpacked layer has
-	// no record, no bundle spec, and no pin covering it (pins root a
-	// *digest*, and eviction resolves pins through records). Its only other
-	// protection is the min-age veto, which is measured from unpack — a
-	// fixed window, not the pull's duration — so any pull slower than
-	// --image-cache-min-age would otherwise have its finished layers
-	// reclaimed underneath it. Multi-GB images make that routine.
-	//
-	// In-process state is the right scope: after a crash there is no live
-	// pull, and those layers genuinely are orphans for the startup sweep
-	// and the next pass to reclaim.
-	inFlightLayers map[string]int
 
 	// hitMu closes the last hit-vs-evict window: the cache-hit path holds it
 	// shared across its record read, layer stats, and last-use touch, and
@@ -203,12 +176,6 @@ func WithMinAge(d time.Duration) Option {
 	return func(s *Store) { s.minAge = d }
 }
 
-// WithPullPinTTL overrides the TTL of the expiring pin held around each pull
-// (default 15m).
-func WithPullPinTTL(d time.Duration) Option {
-	return func(s *Store) { s.pullPinTTL = d }
-}
-
 // Image describes one cached, ready-to-compose image.
 type Image struct {
 	// Digest is the manifest digest the caller's ref resolved to (for a
@@ -234,12 +201,12 @@ type imageRecord struct {
 // startup recovery: verifying the layout version and sweeping temp dirs left
 // by unpacks that were in flight when a previous atelet died.
 func New(root string, opts ...Option) (*Store, error) {
-	s := &Store{root: root, minAge: defaultMinAge, pullPinTTL: defaultPullPinTTL}
+	s := &Store{root: root, minAge: defaultMinAge}
 	for _, o := range opts {
 		o(s)
 	}
 
-	for _, d := range []string{s.layersDir(), s.manifestsDir(), s.pinsDir()} {
+	for _, d := range []string{s.layersDir(), s.manifestsDir()} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return nil, fmt.Errorf("while creating image cache dir %q: %w", d, err)
 		}
@@ -264,12 +231,17 @@ func New(root string, opts ...Option) (*Store, error) {
 	if err := s.sweepTempDirs(); err != nil {
 		return nil, err
 	}
+	// Startup-only orphan recovery (see RecoverOrphans for why it must not
+	// run during normal operation). Failure is logged inside, never fatal:
+	// a corrupt record must not keep atelet from serving actors.
+	if _, err := s.RecoverOrphans(context.Background()); err != nil {
+		slog.Warn("Image cache startup orphan recovery incomplete", slog.Any("err", err))
+	}
 	return s, nil
 }
 
 func (s *Store) layersDir() string    { return filepath.Join(s.root, "layers", "sha256") }
 func (s *Store) manifestsDir() string { return filepath.Join(s.root, "manifests", "sha256") }
-func (s *Store) pinsDir() string      { return filepath.Join(s.root, "pins", "sha256") }
 
 func (s *Store) layerDir(diffID v1.Hash) string {
 	return filepath.Join(s.root, "layers", diffID.Algorithm, diffID.Hex)
@@ -305,10 +277,6 @@ func (s *Store) sweepTempDirs() error {
 	}
 	if swept > 0 {
 		slog.Info("Image cache startup sweep removed orphaned layer dirs", slog.Int("count", swept))
-	}
-
-	if err := s.sweepExpiredPins(); err != nil {
-		return err
 	}
 
 	// writeRecord's temp files are ".<hex>.json.tmp-<rand>"; finished records
@@ -375,13 +343,9 @@ func (s *Store) EnsureImage(ctx context.Context, ref string) (*Image, error) {
 	}
 	slog.InfoContext(ctx, "Image cache miss", slog.String("ref", ref), slog.String("digest", digest.String()))
 
-	// An expiring pin covers the pull: deleted as soon as the image record is
-	// durable, and if we die mid-pull it shields the partial layers from
-	// eviction until the retry (or until it lapses — mispulls can't leak disk
-	// past the TTL).
-	if err := s.writePin(digest, pinReasonPull, s.pullPinTTL); err != nil {
-		slog.WarnContext(ctx, "Failed to write pull pin", slog.String("digest", digest.String()), slog.Any("err", err))
-	}
+	// No pin, no in-flight bookkeeping: pull writes the image record before
+	// unpacking (see pull), so everything this miss produces is referenced —
+	// and thereby protected from eviction — before it exists on disk.
 
 	// Collapse concurrent pulls of the same digest (e.g. several containers of
 	// one actor, or several actors landing at once). The winning call's ctx
@@ -391,11 +355,8 @@ func (s *Store) EnsureImage(ctx context.Context, ref string) (*Image, error) {
 		return s.pull(ctx, parsedRef, digest)
 	})
 	if err != nil {
-		// Leave the pin to protect partial progress for the retry; it expires
-		// on its own.
 		return nil, err
 	}
-	s.removePin(digest, pinReasonPull)
 	return v.(*Image), nil
 }
 
@@ -430,8 +391,25 @@ func (s *Store) cachedImage(digest v1.Hash) (*Image, error) {
 }
 
 // pull fetches the image (by its resolved digest, so what is unpacked is
-// exactly what was recorded), unpacks every missing layer into the pool, and
-// writes the image record.
+// exactly what was recorded), writes the image record, and then unpacks
+// every missing layer into the pool.
+//
+// The record is deliberately written BEFORE unpacking (this inverts Phase
+// 1's incidental ordering): from the moment a layer can exist in the pool,
+// the record's diffID list holds it at refcount >= 1 through the ordinary
+// path eviction trusts. This is how the reference systems close the
+// "object exists before the thing that explains it" gap — Go marks new
+// objects live at allocation (gcmarknewobject), containerd creates the
+// ingest record in the same transaction that opens the content writer,
+// ext4 journals the orphan-list entry with the O_TMPFILE allocation. It
+// replaces three v1 mechanisms (pull pins, the in-flight diffID set, and
+// the per-pass orphan sweep) with the one mechanism that already exists.
+//
+// A record therefore means "known image, possibly partially present" —
+// which is what it always meant to readers: cachedImage verifies every
+// layer and re-pulls only what is missing, so an interrupted pull's
+// record is not a lie, it is resumable progress that ages out through
+// ordinary LRU if never finished.
 func (s *Store) pull(ctx context.Context, parsedRef name.Reference, digest v1.Hash) (*Image, error) {
 	// Re-check under the flight lock: a racing EnsureImage may have completed
 	// the pull between our cache miss and winning the singleflight slot.
@@ -457,33 +435,16 @@ func (s *Store) pull(ctx context.Context, parsedRef name.Reference, digest v1.Ha
 	if err != nil {
 		return nil, fmt.Errorf("while listing image layers: %w", err)
 	}
-
-	// Shield every layer this pull will produce from eviction until the
-	// record that references them is durable. See Store.inFlightLayers.
-	defer s.holdInFlight(cfgFile.RootFS.DiffIDs)()
-
-	layerDirs := make([]string, len(layers))
+	if len(cfgFile.RootFS.DiffIDs) != len(layers) {
+		return nil, fmt.Errorf("image %s config lists %d diffIDs but manifest has %d layers", digest, len(cfgFile.RootFS.DiffIDs), len(layers))
+	}
 	diffIDs := make([]string, len(layers))
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(layerPullConcurrency)
-	for i, layer := range layers {
-		g.Go(func() error {
-			diffID, err := layer.DiffID()
-			if err != nil {
-				return fmt.Errorf("while reading layer diffID: %w", err)
-			}
-			dir, err := s.ensureLayer(gctx, diffID, layer)
-			if err != nil {
-				return fmt.Errorf("while unpacking layer %s: %w", diffID, err)
-			}
-			layerDirs[i], diffIDs[i] = dir, diffID.String()
-			return nil
-		})
-	}
-	if err := g.Wait(); err != nil {
-		return nil, err
+	for i, d := range cfgFile.RootFS.DiffIDs {
+		diffIDs[i] = d.String()
 	}
 
+	// The full diffID list is known from the config before any unpack; make
+	// every layer of this pull referenced before it can exist.
 	rec := imageRecord{Version: 1, Config: cfgFile.Config, DiffIDs: diffIDs}
 	if err := s.writeRecord(digest, rec); err != nil {
 		return nil, err
@@ -495,6 +456,47 @@ func (s *Store) pull(ctx context.Context, parsedRef name.Reference, digest v1.Ha
 		if err := s.writeRecord(actual, rec); err != nil {
 			slog.WarnContext(ctx, "Failed to record image under platform manifest digest",
 				slog.String("digest", actual.String()), slog.Any("err", err))
+		}
+	}
+
+	layerDirs := make([]string, len(layers))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(layerPullConcurrency)
+	for i, layer := range layers {
+		g.Go(func() error {
+			diffID, err := layer.DiffID()
+			if err != nil {
+				return fmt.Errorf("while reading layer diffID: %w", err)
+			}
+			if diffID.String() != diffIDs[i] {
+				// The record must reference exactly what lands on disk.
+				return fmt.Errorf("layer %d diffID %s does not match config rootfs diffID %s", i, diffID, diffIDs[i])
+			}
+			dir, err := s.ensureLayer(gctx, diffID, layer)
+			if err != nil {
+				return fmt.Errorf("while unpacking layer %s: %w", diffID, err)
+			}
+			layerDirs[i] = dir
+			// Progress-based liveness (containerd's updatedat): each completed
+			// layer refreshes the record's last-use mtime, so a pull that is
+			// making progress keeps its record fresher than min-age no matter
+			// how long it runs, while a wedged pull ages out and its partial
+			// work is reclaimed as an ordinary LRU unit.
+			s.touchRecord(digest)
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	// Backstop re-verify, mirroring cachedImage: never return LayerDirs that
+	// are not on disk right now. With the record pre-written this should not
+	// fire; if it somehow does, failing the pull turns the caller's RPC into
+	// a clean retry instead of a bundle spec naming a nonexistent lowerdir.
+	for _, dir := range layerDirs {
+		if _, err := os.Stat(filepath.Join(dir, layerFSDirName)); err != nil {
+			return nil, fmt.Errorf("layer dir vanished during pull (evicted?): %w", err)
 		}
 	}
 

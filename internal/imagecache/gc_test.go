@@ -154,67 +154,6 @@ func TestEnsureImageHitTouchesRecord(t *testing.T) {
 	}
 }
 
-func TestPinsLifecycle(t *testing.T) {
-	store := newTestStore(t)
-	digest := v1.Hash{Algorithm: "sha256", Hex: strings.Repeat("ab", 32)}
-
-	if store.pinnedNow(digest) {
-		t.Fatal("pinnedNow true with no pin")
-	}
-	if err := store.writePin(digest, pinReasonPull, time.Hour); err != nil {
-		t.Fatalf("writePin: %v", err)
-	}
-	if !store.pinnedNow(digest) {
-		t.Fatal("pinnedNow false right after writePin")
-	}
-	// Live pins survive the sweep.
-	if err := store.sweepExpiredPins(); err != nil {
-		t.Fatalf("sweepExpiredPins: %v", err)
-	}
-	if !store.pinnedNow(digest) {
-		t.Fatal("sweep removed a live pin")
-	}
-
-	// A shorter pin never shortens a longer one (a pull must not curtail a
-	// Phase 3 preload pin), so expiring the live pin means releasing it
-	// first.
-	if err := store.writePin(digest, pinReasonPull, time.Minute); err != nil {
-		t.Fatalf("writePin(shorter): %v", err)
-	}
-	p, err := store.readPin(digest)
-	if err != nil || p == nil {
-		t.Fatalf("readPin after shorter write: %v, %v", p, err)
-	}
-	if exp, ok := p.Holders[pinReasonPull]; !ok {
-		t.Fatalf("pull holder missing after write: %+v", p.Holders)
-	} else if time.Until(exp) < 30*time.Minute {
-		t.Errorf("a shorter pin shortened the existing one: expires in %v", time.Until(exp))
-	}
-
-	// Expired pins stop vetoing and are deleted by the sweep.
-	store.removePin(digest, pinReasonPull)
-	if err := store.writePin(digest, pinReasonPull, -time.Second); err != nil {
-		t.Fatalf("writePin(expired): %v", err)
-	}
-	if store.pinnedNow(digest) {
-		t.Fatal("pinnedNow true for expired pin")
-	}
-	if err := store.sweepExpiredPins(); err != nil {
-		t.Fatalf("sweepExpiredPins: %v", err)
-	}
-	if _, err := os.Stat(store.pinPath(digest)); !os.IsNotExist(err) {
-		t.Errorf("expired pin file not swept: %v", err)
-	}
-
-	// An unreadable pin fails toward retention.
-	if err := os.WriteFile(store.pinPath(digest), []byte("not json"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if !store.pinnedNow(digest) {
-		t.Error("corrupt pin should be treated as live")
-	}
-}
-
 func TestEvictUnusedMinAgeVeto(t *testing.T) {
 	_, host := newTestRegistry(t)
 	ref := host + "/test/fresh:latest"
@@ -383,49 +322,6 @@ func TestEvictUnusedRootSet(t *testing.T) {
 	}
 }
 
-func TestEvictUnusedPinVeto(t *testing.T) {
-	_, host := newTestRegistry(t)
-	ref := host + "/test/pinned:latest"
-	pushImage(t, ref, v1.Config{}, layerFromEntries(t, []tarEntry{
-		{name: "f", typeflag: tar.TypeReg, mode: 0o644, body: "hi"},
-	}))
-
-	store := newTestStore(t)
-	img := mustEnsure(t, store, ref)
-	backdateStore(t, store, 3*time.Hour)
-
-	if err := store.writePin(img.Digest, pinReasonPreload, time.Hour); err != nil {
-		t.Fatalf("writePin: %v", err)
-	}
-	stats, err := store.EvictUnused(context.Background(), math.MaxInt64, false)
-	if err != nil {
-		t.Fatalf("EvictUnused: %v", err)
-	}
-	if stats.EvictedImages != 0 {
-		t.Errorf("evicted a pinned image: %+v", stats)
-	}
-	if _, err := os.Stat(store.recordPath(img.Digest)); err != nil {
-		t.Errorf("pinned record evicted: %v", err)
-	}
-
-	// Once the pin expires the image is fair game, and the pass sweeps the
-	// pin file itself. (Release first: writePin refuses to shorten a live
-	// pin — see TestPullPinPreservesPreloadPin.)
-	store.removePin(img.Digest, pinReasonPreload)
-	if err := store.writePin(img.Digest, pinReasonPreload, -time.Second); err != nil {
-		t.Fatalf("writePin(expired): %v", err)
-	}
-	if _, err := store.EvictUnused(context.Background(), math.MaxInt64, false); err != nil {
-		t.Fatalf("EvictUnused: %v", err)
-	}
-	if _, err := os.Stat(store.recordPath(img.Digest)); !os.IsNotExist(err) {
-		t.Error("image with expired pin survived")
-	}
-	if _, err := os.Stat(store.pinPath(img.Digest)); !os.IsNotExist(err) {
-		t.Error("expired pin file not swept by the pass")
-	}
-}
-
 func TestEvictUnusedDryRun(t *testing.T) {
 	_, host := newTestRegistry(t)
 	ref := host + "/test/dryrun:latest"
@@ -452,7 +348,7 @@ func TestEvictUnusedDryRun(t *testing.T) {
 	}
 }
 
-func TestNewSweepsRetiredDirsAndExpiredPins(t *testing.T) {
+func TestNewSweepsRetiredDirs(t *testing.T) {
 	root := t.TempDir()
 	store, err := New(root)
 	if err != nil {
@@ -471,20 +367,11 @@ func TestNewSweepsRetiredDirsAndExpiredPins(t *testing.T) {
 	if err := os.Chmod(filepath.Join(retired, "fs", "ro"), 0o500); err != nil {
 		t.Fatal(err)
 	}
-	// And an expired pin.
-	digest := v1.Hash{Algorithm: "sha256", Hex: strings.Repeat("cd", 32)}
-	if err := store.writePin(digest, pinReasonPull, -time.Second); err != nil {
-		t.Fatal(err)
-	}
-
 	if _, err := New(root); err != nil {
 		t.Fatalf("New (recovery): %v", err)
 	}
 	if _, err := os.Stat(retired); !os.IsNotExist(err) {
 		t.Errorf("retired dir not swept at startup: %v", err)
-	}
-	if _, err := os.Stat(store.pinPath(digest)); !os.IsNotExist(err) {
-		t.Errorf("expired pin not swept at startup: %v", err)
 	}
 }
 

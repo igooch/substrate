@@ -129,7 +129,6 @@ func main() {
 		imagecache.WithLocalhostRegistryReplacement(*localhostRegistryReplacement),
 		imagecache.WithActorsDir(ateompath.ActorsDir),
 		imagecache.WithMinAge(*imageCacheMinAge),
-		imagecache.WithPullPinTTL(*imageCachePinTTL),
 	)
 	if err != nil {
 		serverboot.Fatal(ctx, "Failed to open image cache", err)
