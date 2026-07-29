@@ -328,6 +328,7 @@ type evictionCandidate struct {
 	digest  v1.Hash
 	modTime time.Time
 	diffIDs []string // unique, in record order
+	raw     []byte   // record file bytes, for restoration if a layer must be kept
 }
 
 // EvictUnused reclaims cache disk in two parts:
@@ -346,7 +347,7 @@ type evictionCandidate struct {
 //     everything eligible" (the urgent path / preload admission check).
 //
 // targetBytes <= 0 runs the orphan sweep alone. With dryRun nothing is
-// deleted or renamed and no pin files are swept; the stats report what the
+// deleted or renamed; the stats report what the
 // pass would have freed.
 //
 // Failed deletions are skipped, not fatal: the error return aggregates
@@ -387,7 +388,7 @@ func (s *Store) EvictUnused(ctx context.Context, targetBytes int64, dryRun bool)
 			break
 		}
 
-		// Double-check every veto against *current* disk state: a pull, pin,
+		// Double-check every veto against *current* disk state: a pull
 		// or bundle placement may have happened since the list was built.
 		// Held exclusive against the cache-hit path (see hitMu) so a hit's
 		// last-use touch and this re-check cannot interleave.
@@ -425,13 +426,20 @@ func (s *Store) EvictUnused(ctx context.Context, targetBytes int64, dryRun bool)
 		case "gone":
 			continue
 		}
-		stats.EvictedImages++
 		slog.InfoContext(ctx, "Image cache evicting image record",
 			slog.String("digest", cand.digest.String()),
 			slog.Time("last_used", cand.modTime),
 			slog.Int("layers", len(cand.diffIDs)),
 			slog.Bool("dry_run", dryRun))
 
+		// The record is gone (in dry-run: would be). Retire the layers its
+		// removal un-references — and track any that must be KEPT. A kept
+		// layer at refcount 0 with no record is unreachable by the runtime
+		// pass until the next restart (review 3, finding 1: the v1 per-pass
+		// sweep was the accidental backstop for exactly this state, and it
+		// no longer runs). If anything is kept, the record is restored below
+		// and the image simply is not evicted this pass.
+		kept := false
 		for _, hex := range cand.diffIDs {
 			refcount[hex]--
 			if refcount[hex] > 0 {
@@ -440,18 +448,27 @@ func (s *Store) EvictUnused(ctx context.Context, targetBytes int64, dryRun bool)
 				continue
 			}
 			if roots.LayerHexes[hex] {
+				// Rooted by a bundle spec (the digestless-spec case). Without
+				// its record this layer would strand the moment that bundle
+				// goes away; keep the record with it.
 				slog.InfoContext(ctx, "Image cache keeping layer: rooted by a bundle spec",
 					slog.String("diffid", hex))
 				stats.SkippedRooted++
+				kept = true
 				continue
 			}
-			size, retiredPath, evicted, err := s.retireLayer(hex, cutoff, dryRun)
+			size, retiredPath, st, err := s.retireLayer(hex, cutoff, dryRun)
 			if err != nil {
 				errs = append(errs, err)
+				kept = true
 				continue
 			}
-			if !evicted {
-				continue // already gone, or vetoed inside the singleflight re-check
+			switch st {
+			case retireGone:
+				continue
+			case retireVetoed:
+				kept = true
+				continue
 			}
 			slog.InfoContext(ctx, "Image cache retiring layer",
 				slog.String("diffid", hex),
@@ -463,15 +480,28 @@ func (s *Store) EvictUnused(ctx context.Context, targetBytes int64, dryRun bool)
 			stats.FreedBytes += size
 			stats.EvictedLayers++
 		}
+		if kept {
+			// Put the reference back: rewrite the record so every kept layer
+			// stays reachable, and restore this candidate's refcounts so
+			// later victims in this pass do not under-count shared layers.
+			// Already-retired layers stay retired — a record with missing
+			// layers re-pulls only the gaps (stale-record-harmless).
+			if !dryRun {
+				if err := s.restoreRecord(cand.digest, cand.raw); err != nil {
+					errs = append(errs, fmt.Errorf("while restoring record %s after kept layer: %w", cand.digest, err))
+				} else {
+					slog.InfoContext(ctx, "Image cache restored image record: some of its layers must be kept",
+						slog.String("digest", cand.digest.String()))
+				}
+			}
+			for _, hex := range cand.diffIDs {
+				refcount[hex]++
+			}
+			continue
+		}
+		stats.EvictedImages++
 	}
 
-	// Orphan sweep: layers no surviving record references. refcount holds
-	// references from every record that existed at listing time, decremented
-	// above for the records this pass deleted, so a zero (or absent) entry
-	// means unreferenced right now. The rooted and min-age vetoes still
-	// apply — the latter is what keeps a concurrent pull's freshly unpacked
-	// layers (whose record isn't written yet) out of the sweep, reusing the
-	// same singleflight + mtime interlock as retireLayer.
 	// The slow half, outside every lock: the retired dirs are unreachable by
 	// diffid, so this contends with nothing. A crash before completion
 	// leaves ".rm-*" dirs for the startup sweep.
@@ -573,12 +603,12 @@ func (s *Store) sweepOrphanLayers(ctx context.Context, roots RootSet, refcount m
 			// these layers.
 			continue
 		}
-		size, retiredPath, evicted, err := s.retireLayer(hex, cutoff, dryRun)
+		size, retiredPath, st, err := s.retireLayer(hex, cutoff, dryRun)
 		if err != nil {
 			errs = append(errs, err)
 			continue
 		}
-		if !evicted {
+		if st != retireRetired {
 			continue // too young, or vanished under us
 		}
 		slog.InfoContext(ctx, "Image cache retiring orphan layer",
@@ -672,7 +702,7 @@ func (s *Store) listEviction(roots RootSet, cutoff time.Time, stats *EvictStats)
 			stats.SkippedFresh++
 			continue
 		}
-		candidates = append(candidates, evictionCandidate{digest: digest, modTime: fi.ModTime(), diffIDs: unique})
+		candidates = append(candidates, evictionCandidate{digest: digest, modTime: fi.ModTime(), diffIDs: unique, raw: b})
 	}
 
 	// LRU by last use, ties broken by name for determinism.
@@ -685,6 +715,48 @@ func (s *Store) listEviction(roots RootSet, cutoff time.Time, stats *EvictStats)
 	return candidates, refcount, complete, errors.Join(errs...)
 }
 
+// restoreRecord atomically rewrites a record from the bytes captured at
+// listing time. Used when eviction deleted a record but then had to keep
+// one of its layers: without the record the kept layer is unreachable by
+// the runtime pass. The rewrite bumps the record's mtime, so min-age keeps
+// it off the next pass's candidate list — the retry happens once the kept
+// layer is itself old enough to go.
+func (s *Store) restoreRecord(digest v1.Hash, raw []byte) error {
+	path := s.recordPath(digest)
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("while creating record temp file: %w", err)
+	}
+	defer os.Remove(tmp.Name()) // no-op once the rename succeeds
+	if _, err := tmp.Write(raw); err != nil {
+		tmp.Close()
+		return fmt.Errorf("while writing record: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("while closing record: %w", err)
+	}
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return fmt.Errorf("while moving record into place: %w", err)
+	}
+	return nil
+}
+
+// retireStatus reports what retireLayer did with a layer.
+type retireStatus int
+
+const (
+	// retireGone: no dir under the layer's final name — already removed, or
+	// mid-unpack (only the commit rename creates the final name, and the
+	// pre-written record already references it). Nothing stranded.
+	retireGone retireStatus = iota
+	// retireVetoed: the layer stays — fresh mtime, in-flight reuse, or a
+	// failed rename. If its record was already deleted, the caller must
+	// restore it, or the layer is unreachable until the next startup scan.
+	retireVetoed
+	// retireRetired: renamed aside for asynchronous removal.
+	retireRetired
+)
+
 // Logged vetoes inside retireLayer's singleflight use this message so an
 // e2e can grep for the exact race being exercised.
 const logMsgLayerRetireVetoed = "Image cache layer retirement vetoed: recently used"
@@ -696,35 +768,55 @@ const logMsgLayerRetireVetoed = "Image cache layer retirement vetoed: recently u
 // happens first (and the re-check here vetoes). Returns the layer's
 // recorded size, the renamed-aside path ("" on dry-run), and whether the
 // layer was (or, dry-run, would be) evicted.
-func (s *Store) retireLayer(hex string, cutoff time.Time, dryRun bool) (int64, string, bool, error) {
+func (s *Store) retireLayer(hex string, cutoff time.Time, dryRun bool) (int64, string, retireStatus, error) {
 	dir := filepath.Join(s.layersDir(), hex)
+
+	// Pre-flight, outside the singleflight: a missing dir means a
+	// mid-unpack layer (its final name appears only at the commit rename;
+	// the pre-written record already references it) or an already-removed
+	// one — either way nothing to do, and crucially no reason to enter the
+	// flight and block behind an in-progress download (review 3, finding
+	// 4: the pass used to wait out a concurrent unpack here, holding
+	// evictMu the whole time). A fresh mtime is a veto for the same
+	// non-blocking reason; both checks are re-run inside the flight before
+	// the rename, so this is a fast path, not the correctness path.
+	fi, err := os.Stat(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, "", retireGone, nil
+	} else if err != nil {
+		return 0, "", retireVetoed, err
+	}
+	if fi.ModTime().After(cutoff) {
+		slog.Info(logMsgLayerRetireVetoed, slog.String("diffid", hex), slog.Time("last_used", fi.ModTime()))
+		return 0, "", retireVetoed, nil
+	}
+
 	size, err := s.layerSize(dir)
 	if errors.Is(err, os.ErrNotExist) {
-		return 0, "", false, nil // already gone
+		return 0, "", retireGone, nil
 	} else if err != nil {
 		size = 0 // unknown size: still evict, credit nothing
 	}
 	if dryRun {
-		fi, err := os.Stat(dir)
-		if err != nil || fi.ModTime().After(cutoff) {
-			return 0, "", false, nil
-		}
-		return size, "", true, nil
+		return size, "", retireRetired, nil
 	}
 
 	var retired string
+	status := retireGone
 	_, err, _ = s.layerSF.Do(v1.Hash{Algorithm: "sha256", Hex: hex}.String(), func() (any, error) {
 		fi, err := os.Stat(dir)
 		if errors.Is(err, os.ErrNotExist) {
+			status = retireGone
 			return nil, nil
 		} else if err != nil {
+			status = retireVetoed
 			return nil, err
 		}
-		// In-flight re-check: a concurrent ensureLayer touched the dir if it
-		// reused this layer since the pass began.
+		// Re-check inside the flight: a concurrent ensureLayer touched the
+		// dir if it reused this layer since the pre-flight stat.
 		if fi.ModTime().After(cutoff) {
-			slog.Info(logMsgLayerRetireVetoed,
-				slog.String("diffid", hex), slog.Time("last_used", fi.ModTime()))
+			slog.Info(logMsgLayerRetireVetoed, slog.String("diffid", hex), slog.Time("last_used", fi.ModTime()))
+			status = retireVetoed
 			return nil, nil
 		}
 		short := hex
@@ -733,13 +825,15 @@ func (s *Store) retireLayer(hex string, cutoff time.Time, dryRun bool) (int64, s
 		}
 		dst := filepath.Join(s.layersDir(), fmt.Sprintf("%s%s-%d", retiredPrefix, short, time.Now().UnixNano()))
 		if err := os.Rename(dir, dst); err != nil {
+			status = retireVetoed
 			return nil, fmt.Errorf("while retiring layer %s: %w", hex, err)
 		}
 		retired = dst
+		status = retireRetired
 		return nil, nil
 	})
 	if err != nil {
-		return 0, "", false, err
+		return 0, "", status, err
 	}
-	return size, retired, retired != "", nil
+	return size, retired, status, nil
 }

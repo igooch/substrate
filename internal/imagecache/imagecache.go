@@ -252,7 +252,7 @@ func (s *Store) recordPath(digest v1.Hash) string {
 }
 
 // sweepTempDirs removes unpack temp dirs, retired layer dirs, manifest-record
-// temp files, and expired pins orphaned by a crash. A layer dir without the
+// temp files orphaned by a crash. A layer dir without the
 // temp/retired prefix and a record without a leading dot are always complete
 // (both are moved into place with a single rename), so this is the only
 // recovery the pool needs.
@@ -452,7 +452,9 @@ func (s *Store) pull(ctx context.Context, parsedRef name.Reference, digest v1.Ha
 	// For a multi-arch ref the requested digest is the index digest, but the
 	// layers unpacked belong to the per-platform child manifest. Record the
 	// image under the child digest too, so refs pinned either way hit.
+	var actualDigest *v1.Hash
 	if actual, err := img.Digest(); err == nil && actual != digest {
+		actualDigest = &actual
 		if err := s.writeRecord(actual, rec); err != nil {
 			slog.WarnContext(ctx, "Failed to record image under platform manifest digest",
 				slog.String("digest", actual.String()), slog.Any("err", err))
@@ -490,10 +492,29 @@ func (s *Store) pull(ctx context.Context, parsedRef name.Reference, digest v1.Ha
 		return nil, err
 	}
 
+	// Rewrite the record now that every layer has landed. The pre-written
+	// record is the pull's only protection, and eviction may legitimately
+	// have removed it mid-pull (a pull that made no progress for min-age is
+	// treated as wedged); without this, such a pull would return success
+	// while its freshly-unpacked layers sit unreferenced — exactly the
+	// stranded state record-first exists to prevent. Rewriting is idempotent
+	// in the common case and restores the invariant in the rare one.
+	if err := s.writeRecord(digest, rec); err != nil {
+		return nil, fmt.Errorf("while rewriting image record after unpack: %w", err)
+	}
+	if actualDigest != nil {
+		if err := s.writeRecord(*actualDigest, rec); err != nil {
+			slog.WarnContext(ctx, "Failed to rewrite platform manifest record after unpack",
+				slog.String("digest", actualDigest.String()), slog.Any("err", err))
+		}
+	}
+
 	// Backstop re-verify, mirroring cachedImage: never return LayerDirs that
-	// are not on disk right now. With the record pre-written this should not
-	// fire; if it somehow does, failing the pull turns the caller's RPC into
-	// a clean retry instead of a bundle spec naming a nonexistent lowerdir.
+	// are not on disk right now. With the record pre-written (and just
+	// rewritten) this should not fire; if it somehow does, failing the pull
+	// turns the caller's RPC into a clean retry instead of a bundle spec
+	// naming a nonexistent lowerdir. Ordering: rewrite first, so even the
+	// failure path leaves the surviving layers referenced for the retry.
 	for _, dir := range layerDirs {
 		if _, err := os.Stat(filepath.Join(dir, layerFSDirName)); err != nil {
 			return nil, fmt.Errorf("layer dir vanished during pull (evicted?): %w", err)

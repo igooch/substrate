@@ -205,16 +205,13 @@ func TestDigestlessSpecLayersReclaimedAfterBundleGone(t *testing.T) {
 // Review 2, CRITICAL: layers of an in-flight pull must survive eviction.
 // v1 patched this with an in-memory in-flight set; v2 makes it structural —
 // pull writes the record before unpacking, so a mid-pull layer is held by
-// (a) the record's refcount and (b) the record's freshness, which the
-// per-layer progress touch renews for as long as the pull advances. The
-// wedged-pull disposal is also pinned here: a record with no progress for
-// longer than min-age is evicted together with its partial layers, as an
-// ordinary LRU unit.
+// the record's refcount, renewed by the per-layer progress touch for as
+// long as the pull advances. Phase here: a fresh record protecting even an
+// OLD layer (the layer may have been in the pool for months from another
+// image).
 func TestRecordFirstProtectsInFlightPull(t *testing.T) {
 	store := newTestStore(t) // default min-age: 2m
 
-	// Simulate mid-pull under record-first: record written (fresh), first
-	// layer landed, remaining layers still downloading.
 	diffID := v1.Hash{Algorithm: "sha256", Hex: strings.Repeat("5c", 32)}
 	pending := v1.Hash{Algorithm: "sha256", Hex: strings.Repeat("6d", 32)}
 	digest := v1.Hash{Algorithm: "sha256", Hex: strings.Repeat("7e", 32)}
@@ -226,8 +223,6 @@ func TestRecordFirstProtectsInFlightPull(t *testing.T) {
 	if err := store.writeRecord(digest, rec); err != nil {
 		t.Fatal(err)
 	}
-	// Even if the layer itself is old (it may have been in the pool for
-	// months from another image), the fresh record must hold it.
 	backdate(t, dir, 3*time.Hour)
 
 	if _, err := store.EvictUnused(context.Background(), math.MaxInt64, false); err != nil {
@@ -239,18 +234,105 @@ func TestRecordFirstProtectsInFlightPull(t *testing.T) {
 	if _, err := os.Stat(store.recordPath(digest)); err != nil {
 		t.Fatalf("eviction removed a fresh (in-flight) record: %v", err)
 	}
+}
 
-	// Wedged pull: no progress touch for longer than min-age. The record and
-	// its partial layers are evicted together — reclaimed, not leaked.
+// Review 3, findings 1+3: the wedged-pull disposal, with the partial layer
+// FRESH — the realistic state, since a wedged pull's landed layers are
+// seconds old. (Review 3 caught the earlier version of this test carrying a
+// 3-hour backdate into this phase, which made it assert the impossible
+// "record and fresh layers evicted together" and pass vacuously.) The
+// correct contract: the stale record may be selected, but because min-age
+// vetoes the fresh layer, the record is RESTORED — nothing is stranded, and
+// the whole unit becomes evictable together once the layer ages.
+func TestWedgedPullFreshLayersNotStranded(t *testing.T) {
+	store := newTestStore(t) // default min-age: 2m
+
+	diffID := v1.Hash{Algorithm: "sha256", Hex: strings.Repeat("5c", 32)}
+	digest := v1.Hash{Algorithm: "sha256", Hex: strings.Repeat("7e", 32)}
+	dir := store.layerDir(diffID)
+	if err := os.MkdirAll(filepath.Join(dir, layerFSDirName), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rec := imageRecord{Version: 1, DiffIDs: []string{diffID.String()}}
+	if err := store.writeRecord(digest, rec); err != nil {
+		t.Fatal(err)
+	}
+	// Wedged: the record has seen no progress touch for > min-age, but the
+	// layer itself landed moments ago.
 	backdate(t, store.recordPath(digest), 3*time.Hour)
+
+	for i := 0; i < 4; i++ {
+		if _, err := store.EvictUnused(context.Background(), math.MaxInt64, false); err != nil {
+			t.Fatalf("EvictUnused pass %d: %v", i, err)
+		}
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("fresh partial layer was evicted: %v", err)
+	}
+	// The layer must not be stranded: its record must still exist (restored
+	// after the min-age veto fired), keeping it reachable by the runtime
+	// pass.
+	if _, err := os.Stat(store.recordPath(digest)); err != nil {
+		t.Fatalf("record gone while its fresh layer survives: the layer is stranded until restart: %v", err)
+	}
+
+	// Once the layer ages past min-age (and the restored record does too),
+	// the unit is evicted together — reclaimed, not leaked.
+	backdate(t, store.recordPath(digest), 3*time.Hour)
+	backdate(t, dir, 3*time.Hour)
 	if _, err := store.EvictUnused(context.Background(), math.MaxInt64, false); err != nil {
 		t.Fatalf("EvictUnused: %v", err)
 	}
 	if _, err := os.Stat(store.recordPath(digest)); !os.IsNotExist(err) {
-		t.Errorf("wedged-pull record survived: %v", err)
+		t.Errorf("aged wedged-pull record survived: %v", err)
 	}
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
-		t.Errorf("wedged-pull partial layer survived: %v", err)
+		t.Errorf("aged wedged-pull layer survived: %v", err)
+	}
+}
+
+// Review 3, finding 1 (direct shape): a record whose deletion would strand
+// a kept layer must be restored. Here the keep is caused by a rooted layer
+// from a digestless bundle spec whose layer set does NOT exactly match the
+// record (so LayerSets does not root the record itself).
+func TestEvictionRestoresRecordWhenLayerRooted(t *testing.T) {
+	actorsDir := t.TempDir()
+	store := newTestStore(t, WithActorsDir(actorsDir))
+
+	shared := v1.Hash{Algorithm: "sha256", Hex: strings.Repeat("1a", 32)}
+	private := v1.Hash{Algorithm: "sha256", Hex: strings.Repeat("2b", 32)}
+	digest := v1.Hash{Algorithm: "sha256", Hex: strings.Repeat("3c", 32)}
+	for _, d := range []v1.Hash{shared, private} {
+		if err := os.MkdirAll(filepath.Join(store.layerDir(d), layerFSDirName), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rec := imageRecord{Version: 1, DiffIDs: []string{shared.String(), private.String()}}
+	if err := store.writeRecord(digest, rec); err != nil {
+		t.Fatal(err)
+	}
+	// A digestless spec roots ONLY the shared layer (subset — LayerSets
+	// cannot root the record).
+	bundle := filepath.Join(actorsDir, "actor-x", "bundles", "main")
+	if err := os.MkdirAll(bundle, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteSpec(bundle, &OverlaySpec{Layers: []string{store.layerDir(shared)}}); err != nil {
+		t.Fatal(err)
+	}
+	backdateStore(t, store, 3*time.Hour)
+
+	if _, err := store.EvictUnused(context.Background(), math.MaxInt64, false); err != nil {
+		t.Fatalf("EvictUnused: %v", err)
+	}
+	// The private layer may go; the rooted layer stays — and therefore the
+	// record must have been restored, or the rooted layer is stranded the
+	// moment the bundle disappears.
+	if _, err := os.Stat(store.layerDir(shared)); err != nil {
+		t.Fatalf("rooted layer evicted: %v", err)
+	}
+	if _, err := os.Stat(store.recordPath(digest)); err != nil {
+		t.Fatalf("record gone while its rooted layer survives (stranded once the bundle goes): %v", err)
 	}
 }
 
