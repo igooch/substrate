@@ -29,8 +29,11 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
+	"strings"
 	"time"
 
+	"github.com/agent-substrate/substrate/internal/ateompath"
 	"github.com/agent-substrate/substrate/internal/imagecache"
 	"github.com/spf13/pflag"
 	"golang.org/x/sys/unix"
@@ -46,6 +49,15 @@ var (
 	imageCacheGCDryRun = pflag.Bool("image-cache-gc-dry-run", false, "Compute and log eviction decisions without deleting anything.")
 )
 
+const (
+	// shortfallWarnLimit is how many consecutive shortfalls warn before the
+	// loop backs off to shortfallReminderEvery.
+	shortfallWarnLimit = 3
+	// shortfallReminderEvery keeps a persistent shortfall visible without a
+	// line per tick (at the 5m default: roughly hourly).
+	shortfallReminderEvery = 12
+)
+
 func validateImageCacheGCFlags() error {
 	if *imageCacheHighPct < 1 || *imageCacheHighPct > 100 {
 		return fmt.Errorf("--image-cache-high-percent %d out of range [1,100]", *imageCacheHighPct)
@@ -53,13 +65,39 @@ func validateImageCacheGCFlags() error {
 	if *imageCacheLowPct < 0 || *imageCacheLowPct >= *imageCacheHighPct {
 		return fmt.Errorf("--image-cache-low-percent %d must be in [0,%d)", *imageCacheLowPct, *imageCacheHighPct)
 	}
+	// The watermark is measured on the cache dir's filesystem while the root
+	// set is read from the actors dir. If an operator points the cache at a
+	// different volume than BasePath, those are different filesystems: the
+	// pass would evict based on disk pressure the cache doesn't contribute
+	// to. Warn rather than fail — a separate cache volume is a legitimate
+	// (and recommended, for IOPS) configuration, it just wants its own
+	// watermarks.
+	if !strings.HasPrefix(*imageCacheDir, ateompath.BasePath+string(os.PathSeparator)) {
+		slog.Warn("Image cache dir is outside the ateom base path; its volume watermarks are measured separately from actor state",
+			slog.String("image_cache_dir", *imageCacheDir),
+			slog.String("actors_dir", ateompath.ActorsDir))
+	}
 	return nil
 }
 
 // imageCacheGCTarget computes the bytes an eviction pass should free.
-// Watermark half (kubelet's formula): when usage is at or above the high
-// watermark, free down to the low one. Cap half: when the pool's recorded
-// size exceeds maxBytes, free the difference. The pass frees the larger.
+//
+// Watermark half (kubelet's formula): when volume usage is at or above the
+// high watermark, free down to the low one. Cap half: when the pool's
+// recorded size exceeds maxBytes, free the difference. The pass pursues the
+// larger — but never more than the cache actually holds.
+//
+// That clamp is the important difference from kubelet, which owns its
+// imagefs and can therefore assume the whole shortfall is its to free. Our
+// cache is one tenant of a volume it shares with containerd's image store,
+// kubelet, logs, actor uppers and local snapshots, so an unclamped
+// watermark target asks the cache to free far more than it holds (measured:
+// a 105 GiB volume at 98% yields an 18.9 GiB target against an 11 MiB
+// cache). The pass would then evict every unrooted image on every tick —
+// a permanent 0% hit rate, turning every actor start back into a full
+// re-pull — while barely moving disk usage. Clamped, the cache gives back
+// everything it can and no more; the residual shortfall is reported (it is
+// someone else's disk), not chased.
 func imageCacheGCTarget(capacity, available uint64, cacheSize, maxBytes int64, highPct, lowPct int) int64 {
 	var target int64
 	if capacity > 0 {
@@ -74,6 +112,12 @@ func imageCacheGCTarget(capacity, available uint64, cacheSize, maxBytes int64, h
 		if over := cacheSize - maxBytes; over > target {
 			target = over
 		}
+	}
+	if target > cacheSize {
+		target = cacheSize
+	}
+	if target < 0 {
+		target = 0
 	}
 	return target
 }
@@ -101,17 +145,18 @@ func runImageCacheGC(ctx context.Context, store *imagecache.Store, cacheDir stri
 		capacity := st.Blocks * uint64(st.Bsize)
 		available := st.Bavail * uint64(st.Bsize)
 
+		// A sizing error is not fatal to the pass: the watermark half needs
+		// only statfs, and the orphan sweep runs regardless of target.
 		cacheSize, err := store.CacheSize()
 		if err != nil {
-			slog.WarnContext(ctx, "Image cache GC: sizing the pool failed", slog.Any("err", err))
-			continue
+			slog.WarnContext(ctx, "Image cache GC: sizing the pool failed; continuing with the orphan sweep",
+				slog.Any("err", err))
+			cacheSize = 0
 		}
 
+		// Runs every tick even at target 0: the orphan sweep reclaims layers
+		// no record references, which nothing else can free.
 		target := imageCacheGCTarget(capacity, available, cacheSize, *imageCacheMaxBytes, *imageCacheHighPct, *imageCacheLowPct)
-		if target <= 0 {
-			consecutiveShortfalls = 0
-			continue
-		}
 
 		tStart := time.Now()
 		stats, err := store.EvictUnused(ctx, target, *imageCacheGCDryRun)
@@ -122,6 +167,7 @@ func runImageCacheGC(ctx context.Context, store *imagecache.Store, cacheDir stri
 			slog.Int("evicted_layers", stats.EvictedLayers),
 			slog.Int("candidates", stats.Candidates),
 			slog.Int("rooted_images", stats.RootedImages),
+			slog.Int("orphan_layers", stats.OrphanLayers),
 			slog.Int("skipped_rooted", stats.SkippedRooted),
 			slog.Int("skipped_fresh", stats.SkippedFresh),
 			slog.Int("skipped_pinned", stats.SkippedPinned),
@@ -134,19 +180,34 @@ func runImageCacheGC(ctx context.Context, store *imagecache.Store, cacheDir stri
 			// aggregate and let the next pass retry.
 			slog.WarnContext(ctx, "Image cache GC pass finished with errors", append(attrs, slog.Any("err", err))...)
 		}
-		if stats.FreedBytes < target {
+		switch {
+		case target > 0 && stats.FreedBytes < target:
 			// Everything eligible was evicted and the target still wasn't
-			// met: the remainder is rooted, pinned, fresh, or not ours (other
-			// state on the shared volume). Escalate only when persistent.
+			// met: the remainder is rooted, pinned, or fresh. Now that the
+			// target is clamped to the cache's own size, a shortfall means
+			// the cache genuinely cannot give back more — which on a volume
+			// under foreign pressure is the steady state, so this must not
+			// log at ERROR every tick. Warn on the first few, then drop to a
+			// periodic reminder.
 			consecutiveShortfalls++
-			if consecutiveShortfalls > 1 {
-				slog.ErrorContext(ctx, "Image cache GC repeatedly unable to reach target; volume pressure is from protected images or non-cache data", attrs...)
-			} else {
-				slog.WarnContext(ctx, "Image cache GC could not reach target", attrs...)
+			switch {
+			case consecutiveShortfalls <= shortfallWarnLimit:
+				slog.WarnContext(ctx, "Image cache GC could not reach target",
+					append(attrs, slog.Int("consecutive", consecutiveShortfalls))...)
+			case consecutiveShortfalls%shortfallReminderEvery == 0:
+				slog.WarnContext(ctx, "Image cache GC still short of target; the remaining pressure is not the image cache's to free",
+					append(attrs, slog.Int("consecutive", consecutiveShortfalls))...)
 			}
-		} else {
+		case target > 0:
 			consecutiveShortfalls = 0
 			slog.InfoContext(ctx, "Image cache GC pass complete", attrs...)
+		case stats.OrphanLayers > 0:
+			consecutiveShortfalls = 0
+			slog.InfoContext(ctx, "Image cache GC reclaimed orphan layers", attrs...)
+		default:
+			// No disk pressure and no orphans: stay quiet. The gauges are
+			// the "GC is alive" signal, not a log line per tick.
+			consecutiveShortfalls = 0
 		}
 	}
 }

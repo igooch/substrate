@@ -93,9 +93,17 @@ func (s *Store) pinPath(digest v1.Hash) string {
 	return filepath.Join(s.root, "pins", digest.Algorithm, digest.Hex+".json")
 }
 
-// writePin creates or refreshes the expiring pin for digest.
+// writePin creates or refreshes the expiring pin for digest. Pins of
+// different reasons share one file, so a shorter-lived pin never shortens a
+// longer-lived one: a pull (15m) landing on top of an unexpired preload pin
+// (Phase 3, operator-chosen TTL) leaves the preload pin in place.
 func (s *Store) writePin(digest v1.Hash, reason string, ttl time.Duration) error {
-	b, err := json.Marshal(pinRecord{Version: 1, Reason: reason, Expires: time.Now().Add(ttl)})
+	expires := time.Now().Add(ttl)
+	if cur, err := s.readPin(digest); err == nil && cur != nil && cur.Expires.After(expires) {
+		// An existing pin outlives the one we would write; keep it.
+		return nil
+	}
+	b, err := json.Marshal(pinRecord{Version: 1, Reason: reason, Expires: expires})
 	if err != nil {
 		return fmt.Errorf("while encoding pin: %w", err)
 	}
@@ -122,14 +130,41 @@ func (s *Store) writePin(digest v1.Hash, reason string, ttl time.Duration) error
 	return nil
 }
 
-func (s *Store) removePin(digest v1.Hash) {
+// readPin returns the digest's pin record, or (nil, nil) if there is none.
+// An undecodable pin surfaces as an error; callers treat that as "pinned"
+// (fail toward retention).
+func (s *Store) readPin(digest v1.Hash) (*pinRecord, error) {
+	b, err := os.ReadFile(s.pinPath(digest))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+	var p pinRecord
+	if err := json.Unmarshal(b, &p); err != nil {
+		return nil, fmt.Errorf("while decoding pin for %s: %w", digest, err)
+	}
+	return &p, nil
+}
+
+// removePin releases the pin this caller wrote. It is a no-op when the
+// on-disk pin belongs to a different holder (e.g. a pull completing while a
+// Phase 3 preload pin is live) — that pin lapses on its own TTL instead.
+func (s *Store) removePin(digest v1.Hash, reason string) {
+	cur, err := s.readPin(digest)
+	if err != nil || cur == nil {
+		return
+	}
+	if cur.Reason != reason {
+		return
+	}
 	if err := os.Remove(s.pinPath(digest)); err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			slog.Warn("Failed to remove pin", slog.String("digest", digest.String()), slog.Any("err", err))
 		}
 		return
 	}
-	slog.Info("Image cache pin removed", slog.String("digest", digest.String()))
+	slog.Info("Image cache pin removed", slog.String("digest", digest.String()), slog.String("reason", reason))
 }
 
 // pinnedNow reports whether digest has an unexpired pin on disk right now.
@@ -215,9 +250,17 @@ func (s *Store) layerSize(layerDir string) (int64, error) {
 	}
 
 	var total int64
-	err = filepath.WalkDir(filepath.Join(layerDir, layerFSDirName), func(p string, d fs.DirEntry, err error) error {
+	fsRoot := filepath.Join(layerDir, layerFSDirName)
+	err = filepath.WalkDir(fsRoot, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return err
+			// Images legitimately ship unreadable directories (0111, 0000)
+			// and unpack preserves their modes, so a walk error is expected,
+			// not fatal: skip that subtree and keep counting. Under-counting
+			// is consistent with the optimistic accounting everywhere else.
+			if p != fsRoot && d != nil && d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
 		}
 		if d.Type().IsRegular() {
 			if info, err := d.Info(); err == nil {
@@ -310,6 +353,9 @@ func (s *Store) InUse() RootSet {
 			if !bundle.IsDir() {
 				continue
 			}
+			// WriteSpec renames its temp file into place, so a spec read here
+			// is always whole; a partial read would under-report an actor's
+			// layers and fail toward deleting them.
 			spec, err := ReadSpec(filepath.Join(bundlesDir, bundle.Name()))
 			if err != nil {
 				slog.Warn("Unreadable bundle overlay spec during image-cache root-set scan",
@@ -359,6 +405,10 @@ type EvictStats struct {
 	// time and during the pass (a veto can fire in either place; the
 	// double-check re-runs them against current disk state).
 	SkippedRooted, SkippedFresh, SkippedPinned int
+	// OrphanLayers counts layer dirs reclaimed by the orphan sweep: layers
+	// no surviving image record references, which the record-driven pass
+	// can never reach. Their bytes are included in FreedBytes.
+	OrphanLayers int
 }
 
 type evictionCandidate struct {
@@ -367,20 +417,30 @@ type evictionCandidate struct {
 	diffIDs []string // unique, in record order
 }
 
-// EvictUnused deletes least-recently-used unprotected images (and any
-// layers left unreferenced) until ~targetBytes of recorded layer size has
-// been freed or candidates run out. Passing math.MaxInt64 means "free
-// everything eligible" (the urgent path / preload admission check). With
-// dryRun it only reports what would be freed.
+// EvictUnused reclaims cache disk in two parts:
+//
+//   - an **orphan sweep**, which runs on every pass regardless of
+//     targetBytes: layer dirs that no surviving image record references are
+//     unreachable garbage (interrupted pulls leave them, since layers land
+//     individually and the record is written last; so do digestless bundle
+//     specs, whose layers outlive their record). Nothing else can ever
+//     reclaim them — the record-driven pass below only reaches layers via a
+//     record's diffID list — and they count against --image-cache-max-bytes
+//     until it does.
+//   - **targeted eviction** of least-recently-used unprotected images (and
+//     the layers their removal leaves unreferenced) until ~targetBytes has
+//     been freed or candidates run out. Passing math.MaxInt64 means "free
+//     everything eligible" (the urgent path / preload admission check).
+//
+// targetBytes <= 0 runs the orphan sweep alone. With dryRun nothing is
+// deleted or renamed and no pin files are swept; the stats report what the
+// pass would have freed.
 //
 // Failed deletions are skipped, not fatal: the error return aggregates
 // them, but the pass continues to the next candidate (each retries next
 // pass). Concurrent passes are serialized.
 func (s *Store) EvictUnused(ctx context.Context, targetBytes int64, dryRun bool) (EvictStats, error) {
 	var stats EvictStats
-	if targetBytes <= 0 {
-		return stats, nil
-	}
 	s.evictMu.Lock()
 	defer s.evictMu.Unlock()
 
@@ -406,7 +466,7 @@ func (s *Store) EvictUnused(ctx context.Context, targetBytes int64, dryRun bool)
 	var retired []string // renamed-aside dirs awaiting RemoveAll
 
 	for _, cand := range candidates {
-		if stats.FreedBytes >= targetBytes {
+		if targetBytes <= 0 || stats.FreedBytes >= targetBytes {
 			break
 		}
 		if err := ctx.Err(); err != nil {
@@ -499,6 +559,17 @@ func (s *Store) EvictUnused(ctx context.Context, targetBytes int64, dryRun bool)
 		}
 	}
 
+	// Orphan sweep: layers no surviving record references. refcount holds
+	// references from every record that existed at listing time, decremented
+	// above for the records this pass deleted, so a zero (or absent) entry
+	// means unreferenced right now. The rooted and min-age vetoes still
+	// apply — the latter is what keeps a concurrent pull's freshly unpacked
+	// layers (whose record isn't written yet) out of the sweep, reusing the
+	// same singleflight + mtime interlock as retireLayer.
+	orphans, orphanErrs := s.sweepOrphanLayers(ctx, roots, refcount, cutoff, dryRun, &stats)
+	retired = append(retired, orphans...)
+	errs = append(errs, orphanErrs...)
+
 	// The slow half, outside every lock: the retired dirs are unreachable by
 	// diffid, so this contends with nothing. A crash before completion
 	// leaves ".rm-*" dirs for the startup sweep.
@@ -522,10 +593,60 @@ func (s *Store) EvictUnused(ctx context.Context, targetBytes int64, dryRun bool)
 			slog.Duration("took", time.Since(tRemove)))
 	}
 
-	if err := s.sweepExpiredPins(); err != nil {
-		errs = append(errs, err)
+	if !dryRun {
+		if err := s.sweepExpiredPins(); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	return stats, errors.Join(errs...)
+}
+
+// sweepOrphanLayers retires layer dirs that no surviving image record
+// references. Returns the renamed-aside paths for the caller's async
+// removal batch, plus any per-layer errors (never fatal).
+func (s *Store) sweepOrphanLayers(ctx context.Context, roots RootSet, refcount map[string]int, cutoff time.Time, dryRun bool, stats *EvictStats) ([]string, []error) {
+	entries, err := os.ReadDir(s.layersDir())
+	if err != nil {
+		return nil, []error{fmt.Errorf("while listing layer pool for orphan sweep: %w", err)}
+	}
+
+	var retired []string
+	var errs []error
+	for _, e := range entries {
+		hex := e.Name()
+		// Dot-prefixed dirs are in-flight unpacks (".tmp-") or already
+		// retired (".rm-"); both are handled elsewhere.
+		if strings.HasPrefix(hex, ".") || !e.IsDir() {
+			continue
+		}
+		if refcount[hex] > 0 {
+			continue // referenced by a surviving record
+		}
+		if roots.LayerHexes[hex] {
+			// A bundle spec references it directly — the digestless-spec
+			// case, where the record is gone but an actor is still using
+			// these layers.
+			continue
+		}
+		size, retiredPath, evicted, err := s.retireLayer(hex, cutoff, dryRun)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if !evicted {
+			continue // too young, or vanished under us
+		}
+		slog.InfoContext(ctx, "Image cache retiring orphan layer",
+			slog.String("diffid", hex),
+			slog.Int64("size_bytes", size),
+			slog.Bool("dry_run", dryRun))
+		if retiredPath != "" {
+			retired = append(retired, retiredPath)
+		}
+		stats.FreedBytes += size
+		stats.OrphanLayers++
+	}
+	return retired, errs
 }
 
 // listEviction builds the LRU-ordered candidate list and the layer
@@ -582,7 +703,14 @@ func (s *Store) listEviction(roots RootSet, cutoff time.Time, stats *EvictStats)
 		if err != nil {
 			continue
 		}
-		if roots.ImageDigests[digest.String()] {
+		// A record is rooted either by digest (a bundle spec naming it) or
+		// because every layer it lists is rooted. The latter covers the
+		// multi-arch twin — Phase 1 records an image under both the index
+		// and per-platform child digest, but a bundle spec carries only the
+		// requested one — and digestless (pre-Phase-2) specs. Without it the
+		// twin is evicted and rewritten on every pull of a rooted image:
+		// harmless but pure churn, and it inflates the eviction counters.
+		if roots.ImageDigests[digest.String()] || allLayersRooted(unique, roots) {
 			stats.RootedImages++
 			continue
 		}
@@ -610,6 +738,20 @@ func (s *Store) listEviction(roots RootSet, cutoff time.Time, stats *EvictStats)
 // Logged vetoes inside retireLayer's singleflight use this message so an
 // e2e can grep for the exact race being exercised.
 const logMsgLayerRetireVetoed = "Image cache layer retirement vetoed: recently used"
+
+// allLayersRooted reports whether every layer of a record is rooted by some
+// bundle spec. Empty layer lists are not rooted (nothing protects them).
+func allLayersRooted(diffIDs []string, roots RootSet) bool {
+	if len(diffIDs) == 0 {
+		return false
+	}
+	for _, hex := range diffIDs {
+		if !roots.LayerHexes[hex] {
+			return false
+		}
+	}
+	return true
+}
 
 // retireLayer renames the layer dir aside for asynchronous removal,
 // serialized against the pull path via the layer singleflight: ensureLayer

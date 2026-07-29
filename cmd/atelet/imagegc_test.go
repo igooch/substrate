@@ -34,15 +34,36 @@ func TestImageCacheGCTarget(t *testing.T) {
 		{
 			name:     "at high watermark: free down to low",
 			capacity: 100 * uint64(gib), available: 10 * uint64(gib), // 90% used
-			highPct: 85, lowPct: 80,
+			cacheSize: 50 * gib, // cache is big enough to cover the shortfall
+			highPct:   85, lowPct: 80,
 			// available must climb to 20% of capacity: free 20GiB - 10GiB.
 			want: 10 * gib,
 		},
 		{
 			name:     "exactly high watermark triggers",
 			capacity: 100 * uint64(gib), available: 15 * uint64(gib), // 85% used
-			highPct: 85, lowPct: 80,
+			cacheSize: 50 * gib,
+			highPct:   85, lowPct: 80,
 			want: 5 * gib,
+		},
+		{
+			// The kubelet formula assumes it owns the filesystem; we don't.
+			// A near-full boot disk shared with containerd/kubelet/logs must
+			// not ask an 11 MiB cache to free 18.9 GiB — unclamped, that
+			// evicts the entire cache on every tick forever (0% hit rate)
+			// without materially moving disk usage.
+			name:     "watermark target clamped to what the cache holds",
+			capacity: 105 * uint64(gib), available: 2 * uint64(gib), // ~98% used
+			cacheSize: 11 << 20,
+			highPct:   85, lowPct: 80,
+			want: 11 << 20,
+		},
+		{
+			name:     "empty cache under volume pressure: nothing to free",
+			capacity: 100 * uint64(gib), available: 1 * uint64(gib),
+			cacheSize: 0,
+			highPct:   85, lowPct: 80,
+			want: 0,
 		},
 		{
 			name:     "max-bytes cap independent of watermarks",
@@ -66,7 +87,7 @@ func TestImageCacheGCTarget(t *testing.T) {
 			want: 0,
 		},
 		{
-			name: "zero capacity: watermark half disabled",
+			name:     "zero capacity: watermark half disabled",
 			capacity: 0, available: 0,
 			cacheSize: 2 * gib, maxBytes: gib,
 			highPct: 85, lowPct: 80,

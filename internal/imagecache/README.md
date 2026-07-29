@@ -155,27 +155,56 @@ an actor's bundle directory (via `/proc/self/mountinfo`) before atelet wipes
 it — called from the checkpoint cleanup path in ateom-gvisor and
 `teardownActor` in ateom-microvm.
 
-## Not implemented yet: garbage collection
+## Garbage collection
 
-**There is no eviction. Layers and manifest records, once cached, are never
-deleted from the node VM.** Disk usage grows monotonically with the set of
-distinct layers ever pulled on the node, bounded only by the size of the
-volume backing the cache root. Operators should size the
-`--image-cache-dir` volume accordingly (and note that on GKE, disk size also
-gates IOPS, which directly bounds unpack throughput). If a node fills up,
-deleting the cache root entirely (or any individual
-`layers/sha256/<diffid>` directory plus the `manifests/` records) while no
-actors are starting is safe — the store re-pulls whatever is missing.
+Eviction runs in atelet as a periodic pass (`--image-cache-gc-period`,
+default 5m; `0` disables it). Each pass:
 
-This is Phase 2 of [#463](https://github.com/agent-substrate/substrate/issues/463):
-watermark-driven eviction (start evicting at a disk high-watermark, stop at
-the low-watermark) with a protection hierarchy — layers referenced by
-actively mounted images are never evicted, then preload-pinned images, then
-LRU by image last-use — plus cache metrics. Phase 3 adds the control-plane
-surface (reporting cached digests for scheduling affinity, and a
-`PreloadImage` API with expiring pins). The layer-materializer seam is also
-designed so a lazy-pull backend (eStargz/SOCI-style FUSE) can replace the
-untar backend later without restructuring.
+1. **Measures** the cache volume with `statfs` and the pool's own size from
+   the per-layer `size` files (recorded at unpack, never `du`'d).
+2. **Computes a target**: free down to `--image-cache-low-percent` when
+   volume usage reaches `--image-cache-high-percent` (kubelet's hysteresis
+   band), and/or down to `--image-cache-max-bytes`. The target is **clamped
+   to the pool's own size** — unlike the kubelet, which owns its imagefs,
+   this cache is one tenant of a shared volume, and an unclamped target
+   would evict the whole cache trying to fix disk pressure it didn't cause.
+3. **Builds the root set** by scanning every bundle's `rootfs-overlay.json`
+   (see below), and **refcounts** layers across all image records.
+4. **Evicts** LRU-first by image last-use (the record's mtime, refreshed on
+   every cache hit), subject to three vetoes: rooted, pinned, or younger
+   than `--image-cache-min-age` (default 2m).
+5. **Sweeps orphans** — layer dirs no surviving record references — every
+   pass, even when no eviction is needed. Interrupted pulls leave these
+   (layers land individually, the record is written last), and nothing else
+   can reclaim them.
+
+`--image-cache-gc-dry-run` computes and logs every decision while mutating
+nothing: the recommended way to soak the policy on a live fleet.
+
+**What is protected.** Because the overlay mounts live in the ateom pods'
+mount namespaces, atelet cannot see them in its own `/proc/mounts`. The
+root set instead comes from the bundle specs atelet itself writes — before
+any ateom is asked to mount, and removed only after unmount — so an image
+referenced by any bundle on the node is never evicted. Expiring pins under
+`pins/` cover the remaining window: every pull holds one, so a partially
+pulled image survives an atelet crash, and Phase 3's `PreloadImage` will
+use the same mechanism.
+
+**Deletion is two-phase.** A layer is atomically renamed to `.rm-<rand>`
+inside the layer's singleflight (one `rename(2)` — eviction can never stall
+a pull), then removed asynchronously; a crash in between leaves the dir for
+the startup sweep. This matters because the kernel offers no protection
+here: deleting a directory that is a live overlay lowerdir in another mount
+namespace succeeds silently, leaves the overlay's behavior undefined, and
+doesn't even free the space until the mount goes away.
+
+Deleting the cache root by hand (while no actors are starting) remains
+safe — the store re-pulls whatever is missing.
+
+Still to come in Phase 3: reporting cached digests for scheduling affinity
+and the `PreloadImage` API. The layer-materializer seam is also designed so
+a lazy-pull backend (eStargz/SOCI-style FUSE) can replace the untar backend
+later without restructuring.
 
 ## Testing
 

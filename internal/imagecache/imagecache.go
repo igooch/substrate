@@ -375,7 +375,7 @@ func (s *Store) EnsureImage(ctx context.Context, ref string) (*Image, error) {
 		// on its own.
 		return nil, err
 	}
-	s.removePin(digest)
+	s.removePin(digest, pinReasonPull)
 	return v.(*Image), nil
 }
 

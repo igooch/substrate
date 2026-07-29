@@ -175,7 +175,22 @@ func TestPinsLifecycle(t *testing.T) {
 		t.Fatal("sweep removed a live pin")
 	}
 
+	// A shorter pin never shortens a longer one (a pull must not curtail a
+	// Phase 3 preload pin), so expiring the live pin means releasing it
+	// first.
+	if err := store.writePin(digest, pinReasonPull, time.Minute); err != nil {
+		t.Fatalf("writePin(shorter): %v", err)
+	}
+	if p, err := store.readPin(digest); err != nil || p == nil || p.Reason != pinReasonPull {
+		// The 1h pin above was also reason=pull, so the record is unchanged;
+		// what matters is that its expiry was not pulled in.
+		t.Fatalf("readPin after shorter write: %v, %v", p, err)
+	} else if time.Until(p.Expires) < 30*time.Minute {
+		t.Errorf("a shorter pin shortened the existing one: expires in %v", time.Until(p.Expires))
+	}
+
 	// Expired pins stop vetoing and are deleted by the sweep.
+	store.removePin(digest, pinReasonPull)
 	if err := store.writePin(digest, pinReasonPull, -time.Second); err != nil {
 		t.Fatalf("writePin(expired): %v", err)
 	}
@@ -342,12 +357,20 @@ func TestEvictUnusedRootSet(t *testing.T) {
 	if _, err := os.Stat(imgRooted.LayerDirs[0]); err != nil {
 		t.Errorf("digest-rooted image layer evicted: %v", err)
 	}
-	// Layer-rooted (old spec): record may go, layers must stay.
+	// Layer-rooted (old, digestless spec): the layers must stay, and so must
+	// the record — a record all of whose layers are rooted is itself treated
+	// as rooted. Without that rule the record is evicted while its layers
+	// survive, which manufactures an orphan the moment the bundle goes away
+	// (see TestDigestlessSpecLayersReclaimedAfterBundleGone) and churns the
+	// record on every pull.
 	if _, err := os.Stat(imgLayerRooted.LayerDirs[0]); err != nil {
 		t.Errorf("layer-rooted layer evicted: %v", err)
 	}
-	if stats.SkippedRooted == 0 {
-		t.Errorf("expected SkippedRooted > 0 for the digestless spec's layer, got %+v", stats)
+	if _, err := os.Stat(store.recordPath(imgLayerRooted.Digest)); err != nil {
+		t.Errorf("record with all layers rooted was evicted: %v", err)
+	}
+	if stats.RootedImages < 2 {
+		t.Errorf("RootedImages = %d, want >= 2 (digest-rooted + all-layers-rooted), stats %+v", stats.RootedImages, stats)
 	}
 	// The loose image is fully evicted.
 	if _, err := os.Stat(store.recordPath(imgLoose.Digest)); !os.IsNotExist(err) {
@@ -384,7 +407,9 @@ func TestEvictUnusedPinVeto(t *testing.T) {
 	}
 
 	// Once the pin expires the image is fair game, and the pass sweeps the
-	// pin file itself.
+	// pin file itself. (Release first: writePin refuses to shorten a live
+	// pin — see TestPullPinPreservesPreloadPin.)
+	store.removePin(img.Digest, pinReasonPreload)
 	if err := store.writePin(img.Digest, pinReasonPreload, -time.Second); err != nil {
 		t.Fatalf("writePin(expired): %v", err)
 	}
