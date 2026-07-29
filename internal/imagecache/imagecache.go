@@ -137,6 +137,26 @@ type Store struct {
 	// over the same candidates for no benefit).
 	evictMu sync.Mutex
 
+	// inFlightMu guards inFlightLayers.
+	inFlightMu sync.Mutex
+	// inFlightLayers counts the pulls currently producing each diffID.
+	// Eviction treats a counted layer as rooted.
+	//
+	// This is load-bearing, not belt-and-braces: a pull unpacks its layers
+	// individually and writes the image record last, so between the first
+	// layer landing and the record appearing, an already-unpacked layer has
+	// no record, no bundle spec, and no pin covering it (pins root a
+	// *digest*, and eviction resolves pins through records). Its only other
+	// protection is the min-age veto, which is measured from unpack — a
+	// fixed window, not the pull's duration — so any pull slower than
+	// --image-cache-min-age would otherwise have its finished layers
+	// reclaimed underneath it. Multi-GB images make that routine.
+	//
+	// In-process state is the right scope: after a crash there is no live
+	// pull, and those layers genuinely are orphans for the startup sweep
+	// and the next pass to reclaim.
+	inFlightLayers map[string]int
+
 	// hitMu closes the last hit-vs-evict window: the cache-hit path holds it
 	// shared across its record read, layer stats, and last-use touch, and
 	// eviction holds it exclusive across each victim's final veto re-check
@@ -437,6 +457,10 @@ func (s *Store) pull(ctx context.Context, parsedRef name.Reference, digest v1.Ha
 	if err != nil {
 		return nil, fmt.Errorf("while listing image layers: %w", err)
 	}
+
+	// Shield every layer this pull will produce from eviction until the
+	// record that references them is durable. See Store.inFlightLayers.
+	defer s.holdInFlight(cfgFile.RootFS.DiffIDs)()
 
 	layerDirs := make([]string, len(layers))
 	diffIDs := make([]string, len(layers))

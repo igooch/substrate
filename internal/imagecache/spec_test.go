@@ -36,6 +36,7 @@ func TestOverlaySpecRoundTrip(t *testing.T) {
 	}
 	if out == nil {
 		t.Fatalf("ReadSpec returned nil for a bundle with a spec")
+		return // unreachable; makes the non-nil-ness below explicit to static analysis
 	}
 	if !slices.Equal(out.Layers, in.Layers) {
 		t.Errorf("Layers = %v, want %v", out.Layers, in.Layers)

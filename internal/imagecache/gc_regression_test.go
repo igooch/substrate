@@ -245,3 +245,111 @@ func TestDryRunLeavesPinFilesAlone(t *testing.T) {
 		t.Error("dry-run pass deleted an on-disk pin file")
 	}
 }
+
+// A pull unpacks its layers individually and writes the image record last,
+// so a layer that landed early has no record, no bundle spec, and — once it
+// is older than minAge — no age veto either. Nothing may reclaim it while
+// the pull that is producing it is still running: EnsureImage would return
+// LayerDirs pointing at deleted paths (unlike the cache-hit path, pull does
+// not re-verify), and the bundle spec would name a nonexistent lowerdir.
+func TestOrphanSweepSpareseInFlightPullLayers(t *testing.T) {
+	store := newTestStore(t, WithMinAge(0)) // every layer is instantly "old"
+
+	// Simulate the middle of a pull: layer landed, record not yet written.
+	diffID := v1.Hash{Algorithm: "sha256", Hex: strings.Repeat("5c", 32)}
+	dir := store.layerDir(diffID)
+	if err := os.MkdirAll(filepath.Join(dir, layerFSDirName), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	release := store.holdInFlight([]v1.Hash{diffID})
+
+	if _, err := store.EvictUnused(context.Background(), math.MaxInt64, false); err != nil {
+		t.Fatalf("EvictUnused: %v", err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("orphan sweep reclaimed a layer belonging to an in-flight pull: %v", err)
+	}
+
+	// Once the pull finishes without writing a record (i.e. it failed), the
+	// layer is a genuine orphan and the next pass takes it.
+	release()
+	if _, err := store.EvictUnused(context.Background(), math.MaxInt64, false); err != nil {
+		t.Fatalf("EvictUnused: %v", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("layer of a finished pull with no record was not reclaimed: %v", err)
+	}
+}
+
+// A pass that could not enumerate every image record must not run the
+// orphan sweep: refcounts derived from a partial listing make referenced
+// layers look unreferenced, and the sweep would delete a live cache.
+func TestOrphanSweepSkippedWhenEnumerationIncomplete(t *testing.T) {
+	_, host := newTestRegistry(t)
+	ref := host + "/test/enum:latest"
+	pushImage(t, ref, v1.Config{}, layerFromEntries(t, []tarEntry{
+		{name: "f", typeflag: tar.TypeReg, mode: 0o644, body: strings.Repeat("e", 2048)},
+	}))
+	store := newTestStore(t)
+	img := mustEnsure(t, store, ref)
+	backdateStore(t, store, 3*time.Hour)
+
+	// Corrupt one record so its diffIDs contribute no refcounts, while the
+	// record itself survives as a non-candidate.
+	recs, err := os.ReadDir(store.manifestsDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(store.manifestsDir(), recs[0].Name()), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.EvictUnused(context.Background(), 0, false); err == nil {
+		t.Error("expected the pass to report the unreadable record")
+	}
+	for _, d := range img.LayerDirs {
+		if _, err := os.Stat(d); err != nil {
+			t.Errorf("layers were swept after an incomplete record enumeration: %v", err)
+		}
+	}
+}
+
+// A directory name that is not a layer digest must never reach the rename
+// path (which shortens the name) or crash the pass.
+func TestOrphanSweepIgnoresNonLayerDirs(t *testing.T) {
+	store := newTestStore(t, WithMinAge(0))
+	junk := filepath.Join(store.layersDir(), "notadigest")
+	if err := os.MkdirAll(junk, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := store.EvictUnused(context.Background(), math.MaxInt64, false)
+	if err != nil {
+		t.Fatalf("EvictUnused: %v", err)
+	}
+	if stats.OrphanLayers != 0 {
+		t.Errorf("swept a non-layer dir: %+v", stats)
+	}
+	if _, err := os.Stat(junk); err != nil {
+		t.Errorf("non-layer dir was removed: %v", err)
+	}
+}
+
+// A pull pin must not evict a preload pin that expires sooner than the pull
+// TTL: writePin previously kept the later expiry but overwrote the reason,
+// so the pull's completion deleted the preload holder outright.
+func TestShorterPreloadPinSurvivesLongerPullPin(t *testing.T) {
+	store := newTestStore(t)
+	digest := v1.Hash{Algorithm: "sha256", Hex: strings.Repeat("7a", 32)}
+
+	if err := store.writePin(digest, pinReasonPreload, 5*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.writePin(digest, pinReasonPull, 15*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	store.removePin(digest, pinReasonPull) // pull completes
+
+	if !store.pinnedNow(digest) {
+		t.Error("a pull destroyed a preload pin whose TTL was shorter than the pull TTL")
+	}
+}

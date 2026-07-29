@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -137,77 +138,92 @@ func runImageCacheGC(ctx context.Context, store *imagecache.Store, cacheDir stri
 		case <-ticker.C:
 		}
 
-		var st unix.Statfs_t
-		if err := unix.Statfs(cacheDir, &st); err != nil {
-			slog.WarnContext(ctx, "Image cache GC: statfs failed", slog.String("dir", cacheDir), slog.Any("err", err))
-			continue
-		}
-		capacity := st.Blocks * uint64(st.Bsize)
-		available := st.Bavail * uint64(st.Bsize)
+		runImageCacheGCPass(ctx, store, cacheDir, &consecutiveShortfalls)
+	}
+}
 
-		// A sizing error is not fatal to the pass: the watermark half needs
-		// only statfs, and the orphan sweep runs regardless of target.
-		cacheSize, err := store.CacheSize()
-		if err != nil {
-			slog.WarnContext(ctx, "Image cache GC: sizing the pool failed; continuing with the orphan sweep",
-				slog.Any("err", err))
-			cacheSize = 0
+// runImageCacheGCPass performs one pass. It recovers from panics: this is a
+// background janitor, and a bug here (or a malformed directory an operator
+// dropped into the pool) must not take atelet down with it and strand every
+// actor on the node.
+func runImageCacheGCPass(ctx context.Context, store *imagecache.Store, cacheDir string, consecutiveShortfalls *int) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.ErrorContext(ctx, "Image cache GC pass panicked; skipping this pass",
+				slog.Any("panic", r), slog.String("stack", string(debug.Stack())))
 		}
+	}()
 
-		// Runs every tick even at target 0: the orphan sweep reclaims layers
-		// no record references, which nothing else can free.
-		target := imageCacheGCTarget(capacity, available, cacheSize, *imageCacheMaxBytes, *imageCacheHighPct, *imageCacheLowPct)
+	var st unix.Statfs_t
+	if err := unix.Statfs(cacheDir, &st); err != nil {
+		slog.WarnContext(ctx, "Image cache GC: statfs failed", slog.String("dir", cacheDir), slog.Any("err", err))
+		return
+	}
+	capacity := st.Blocks * uint64(st.Bsize)
+	available := st.Bavail * uint64(st.Bsize)
 
-		tStart := time.Now()
-		stats, err := store.EvictUnused(ctx, target, *imageCacheGCDryRun)
-		attrs := []any{
-			slog.Int64("target_bytes", target),
-			slog.Int64("freed_bytes", stats.FreedBytes),
-			slog.Int("evicted_images", stats.EvictedImages),
-			slog.Int("evicted_layers", stats.EvictedLayers),
-			slog.Int("candidates", stats.Candidates),
-			slog.Int("rooted_images", stats.RootedImages),
-			slog.Int("orphan_layers", stats.OrphanLayers),
-			slog.Int("skipped_rooted", stats.SkippedRooted),
-			slog.Int("skipped_fresh", stats.SkippedFresh),
-			slog.Int("skipped_pinned", stats.SkippedPinned),
-			slog.Int64("cache_size_bytes", cacheSize),
-			slog.Bool("dry_run", *imageCacheGCDryRun),
-			slog.Duration("took", time.Since(tStart)),
-		}
-		if err != nil {
-			// Per-item failures were already skipped inside the pass; log the
-			// aggregate and let the next pass retry.
-			slog.WarnContext(ctx, "Image cache GC pass finished with errors", append(attrs, slog.Any("err", err))...)
-		}
+	// A sizing error is not fatal to the pass: the watermark half needs
+	// only statfs, and the orphan sweep runs regardless of target.
+	cacheSize, err := store.CacheSize()
+	if err != nil {
+		slog.WarnContext(ctx, "Image cache GC: sizing the pool failed; continuing with the orphan sweep",
+			slog.Any("err", err))
+		cacheSize = 0
+	}
+
+	// Runs every tick even at target 0: the orphan sweep reclaims layers
+	// no record references, which nothing else can free.
+	target := imageCacheGCTarget(capacity, available, cacheSize, *imageCacheMaxBytes, *imageCacheHighPct, *imageCacheLowPct)
+
+	tStart := time.Now()
+	stats, err := store.EvictUnused(ctx, target, *imageCacheGCDryRun)
+	attrs := []any{
+		slog.Int64("target_bytes", target),
+		slog.Int64("freed_bytes", stats.FreedBytes),
+		slog.Int("evicted_images", stats.EvictedImages),
+		slog.Int("evicted_layers", stats.EvictedLayers),
+		slog.Int("candidates", stats.Candidates),
+		slog.Int("rooted_images", stats.RootedImages),
+		slog.Int("orphan_layers", stats.OrphanLayers),
+		slog.Int("skipped_rooted", stats.SkippedRooted),
+		slog.Int("skipped_fresh", stats.SkippedFresh),
+		slog.Int("skipped_pinned", stats.SkippedPinned),
+		slog.Int64("cache_size_bytes", cacheSize),
+		slog.Bool("dry_run", *imageCacheGCDryRun),
+		slog.Duration("took", time.Since(tStart)),
+	}
+	if err != nil {
+		// Per-item failures were already skipped inside the pass; log the
+		// aggregate and let the next pass retry.
+		slog.WarnContext(ctx, "Image cache GC pass finished with errors", append(attrs, slog.Any("err", err))...)
+	}
+	switch {
+	case target > 0 && stats.FreedBytes < target:
+		// Everything eligible was evicted and the target still wasn't
+		// met: the remainder is rooted, pinned, or fresh. Now that the
+		// target is clamped to the cache's own size, a shortfall means
+		// the cache genuinely cannot give back more — which on a volume
+		// under foreign pressure is the steady state, so this must not
+		// log at ERROR every tick. Warn on the first few, then drop to a
+		// periodic reminder.
+		*consecutiveShortfalls++
 		switch {
-		case target > 0 && stats.FreedBytes < target:
-			// Everything eligible was evicted and the target still wasn't
-			// met: the remainder is rooted, pinned, or fresh. Now that the
-			// target is clamped to the cache's own size, a shortfall means
-			// the cache genuinely cannot give back more — which on a volume
-			// under foreign pressure is the steady state, so this must not
-			// log at ERROR every tick. Warn on the first few, then drop to a
-			// periodic reminder.
-			consecutiveShortfalls++
-			switch {
-			case consecutiveShortfalls <= shortfallWarnLimit:
-				slog.WarnContext(ctx, "Image cache GC could not reach target",
-					append(attrs, slog.Int("consecutive", consecutiveShortfalls))...)
-			case consecutiveShortfalls%shortfallReminderEvery == 0:
-				slog.WarnContext(ctx, "Image cache GC still short of target; the remaining pressure is not the image cache's to free",
-					append(attrs, slog.Int("consecutive", consecutiveShortfalls))...)
-			}
-		case target > 0:
-			consecutiveShortfalls = 0
-			slog.InfoContext(ctx, "Image cache GC pass complete", attrs...)
-		case stats.OrphanLayers > 0:
-			consecutiveShortfalls = 0
-			slog.InfoContext(ctx, "Image cache GC reclaimed orphan layers", attrs...)
-		default:
-			// No disk pressure and no orphans: stay quiet. The gauges are
-			// the "GC is alive" signal, not a log line per tick.
-			consecutiveShortfalls = 0
+		case *consecutiveShortfalls <= shortfallWarnLimit:
+			slog.WarnContext(ctx, "Image cache GC could not reach target",
+				append(attrs, slog.Int("consecutive", *consecutiveShortfalls))...)
+		case *consecutiveShortfalls%shortfallReminderEvery == 0:
+			slog.WarnContext(ctx, "Image cache GC still short of target; the remaining pressure is not the image cache's to free",
+				append(attrs, slog.Int("consecutive", *consecutiveShortfalls))...)
 		}
+	case target > 0:
+		*consecutiveShortfalls = 0
+		slog.InfoContext(ctx, "Image cache GC pass complete", attrs...)
+	case stats.OrphanLayers > 0:
+		*consecutiveShortfalls = 0
+		slog.InfoContext(ctx, "Image cache GC reclaimed orphan layers", attrs...)
+	default:
+		// No disk pressure and no orphans: stay quiet. The gauges are
+		// the "GC is alive" signal, not a log line per tick.
+		*consecutiveShortfalls = 0
 	}
 }

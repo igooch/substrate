@@ -181,12 +181,14 @@ func TestPinsLifecycle(t *testing.T) {
 	if err := store.writePin(digest, pinReasonPull, time.Minute); err != nil {
 		t.Fatalf("writePin(shorter): %v", err)
 	}
-	if p, err := store.readPin(digest); err != nil || p == nil || p.Reason != pinReasonPull {
-		// The 1h pin above was also reason=pull, so the record is unchanged;
-		// what matters is that its expiry was not pulled in.
+	p, err := store.readPin(digest)
+	if err != nil || p == nil {
 		t.Fatalf("readPin after shorter write: %v, %v", p, err)
-	} else if time.Until(p.Expires) < 30*time.Minute {
-		t.Errorf("a shorter pin shortened the existing one: expires in %v", time.Until(p.Expires))
+	}
+	if exp, ok := p.Holders[pinReasonPull]; !ok {
+		t.Fatalf("pull holder missing after write: %+v", p.Holders)
+	} else if time.Until(exp) < 30*time.Minute {
+		t.Errorf("a shorter pin shortened the existing one: expires in %v", time.Until(exp))
 	}
 
 	// Expired pins stop vetoing and are deleted by the sweep.
