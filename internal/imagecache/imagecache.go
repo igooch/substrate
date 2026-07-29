@@ -269,6 +269,7 @@ func (s *Store) sweepTempDirs() error {
 	if err != nil {
 		return fmt.Errorf("while listing layer pool: %w", err)
 	}
+	swept := 0
 	for _, e := range entries {
 		// ".tmp-": an unpack in flight at crash. ".rm-": a layer eviction
 		// renamed aside but not yet removed. Either way, unreferenced garbage.
@@ -276,9 +277,14 @@ func (s *Store) sweepTempDirs() error {
 			continue
 		}
 		p := filepath.Join(s.layersDir(), e.Name())
+		slog.Info("Image cache sweeping orphaned layer dir", slog.String("dir", e.Name()))
 		if err := RemoveAllWritable(p); err != nil {
 			return fmt.Errorf("while sweeping orphaned layer temp dir %q: %w", p, err)
 		}
+		swept++
+	}
+	if swept > 0 {
+		slog.Info("Image cache startup sweep removed orphaned layer dirs", slog.Int("count", swept))
 	}
 
 	if err := s.sweepExpiredPins(); err != nil {

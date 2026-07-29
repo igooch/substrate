@@ -120,6 +120,8 @@ func runImageCacheGC(ctx context.Context, store *imagecache.Store, cacheDir stri
 			slog.Int64("freed_bytes", stats.FreedBytes),
 			slog.Int("evicted_images", stats.EvictedImages),
 			slog.Int("evicted_layers", stats.EvictedLayers),
+			slog.Int("candidates", stats.Candidates),
+			slog.Int("rooted_images", stats.RootedImages),
 			slog.Int("skipped_rooted", stats.SkippedRooted),
 			slog.Int("skipped_fresh", stats.SkippedFresh),
 			slog.Int("skipped_pinned", stats.SkippedPinned),

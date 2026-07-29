@@ -115,13 +115,21 @@ func (s *Store) writePin(digest v1.Hash, reason string, ttl time.Duration) error
 	if err := os.Rename(tmp.Name(), path); err != nil {
 		return fmt.Errorf("while moving pin into place: %w", err)
 	}
+	slog.Info("Image cache pin written",
+		slog.String("digest", digest.String()),
+		slog.String("reason", reason),
+		slog.Duration("ttl", ttl))
 	return nil
 }
 
 func (s *Store) removePin(digest v1.Hash) {
-	if err := os.Remove(s.pinPath(digest)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		slog.Warn("Failed to remove pin", slog.String("digest", digest.String()), slog.Any("err", err))
+	if err := os.Remove(s.pinPath(digest)); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			slog.Warn("Failed to remove pin", slog.String("digest", digest.String()), slog.Any("err", err))
+		}
+		return
 	}
+	slog.Info("Image cache pin removed", slog.String("digest", digest.String()))
 }
 
 // pinnedNow reports whether digest has an unexpired pin on disk right now.
@@ -170,6 +178,10 @@ func (s *Store) sweepExpiredPins() error {
 			if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return fmt.Errorf("while sweeping expired pin %q: %w", p, err)
 			}
+			slog.Info("Image cache removed expired pin",
+				slog.String("pin", e.Name()),
+				slog.String("reason", pin.Reason),
+				slog.Time("expired", pin.Expires))
 		}
 	}
 	return nil
@@ -309,6 +321,14 @@ func (s *Store) InUse() RootSet {
 			}
 			if spec.ImageDigest != "" {
 				rs.ImageDigests[spec.ImageDigest] = true
+				slog.Info("Image cache root-set: bundle roots image",
+					slog.String("bundle", filepath.Join(actor.Name(), "bundles", bundle.Name())),
+					slog.String("digest", spec.ImageDigest),
+					slog.Int("layers", len(spec.Layers)))
+			} else if len(spec.Layers) > 0 {
+				slog.Info("Image cache root-set: digestless bundle roots layers only",
+					slog.String("bundle", filepath.Join(actor.Name(), "bundles", bundle.Name())),
+					slog.Int("layers", len(spec.Layers)))
 			}
 			for _, layerDir := range spec.Layers {
 				rs.LayerHexes[filepath.Base(layerDir)] = true
@@ -329,8 +349,15 @@ type EvictStats struct {
 	// EvictedImages / EvictedLayers count deleted records and retired layer
 	// dirs.
 	EvictedImages, EvictedLayers int
-	// SkippedRooted / SkippedFresh / SkippedPinned count candidates vetoed
-	// during the pass (after the candidate list was built), for logging.
+	// Candidates is the number of LRU-ordered eviction candidates after all
+	// listing-stage vetoes.
+	Candidates int
+	// RootedImages counts image records excluded because a bundle overlay
+	// spec roots them (the "actively placed" protection).
+	RootedImages int
+	// SkippedRooted / SkippedFresh / SkippedPinned count vetoes at listing
+	// time and during the pass (a veto can fire in either place; the
+	// double-check re-runs them against current disk state).
 	SkippedRooted, SkippedFresh, SkippedPinned int
 }
 
@@ -360,8 +387,17 @@ func (s *Store) EvictUnused(ctx context.Context, targetBytes int64, dryRun bool)
 	roots := s.InUse()
 	cutoff := time.Now().Add(-s.minAge)
 
-	candidates, refcount, listErr := s.listEviction(roots, cutoff)
+	candidates, refcount, listErr := s.listEviction(roots, cutoff, &stats)
 	// listErr is deferred, not fatal: evict what was listed, report at the end.
+	stats.Candidates = len(candidates)
+
+	slog.InfoContext(ctx, "Image cache eviction pass",
+		slog.Int64("target_bytes", targetBytes),
+		slog.Bool("dry_run", dryRun),
+		slog.Int("rooted_images", stats.RootedImages),
+		slog.Int("rooted_layers", len(roots.LayerHexes)),
+		slog.Int("candidates", len(candidates)),
+		slog.Duration("min_age", s.minAge))
 
 	var errs []error
 	if listErr != nil {
@@ -409,23 +445,37 @@ func (s *Store) EvictUnused(ctx context.Context, targetBytes int64, dryRun bool)
 			continue
 		}
 		switch skip {
-		case "pinned":
-			stats.SkippedPinned++
-			continue
-		case "fresh":
-			stats.SkippedFresh++
+		case "pinned", "fresh":
+			slog.InfoContext(ctx, "Image cache eviction skipped image",
+				slog.String("digest", cand.digest.String()),
+				slog.String("reason", skip),
+				slog.Time("last_used", cand.modTime))
+			if skip == "pinned" {
+				stats.SkippedPinned++
+			} else {
+				stats.SkippedFresh++
+			}
 			continue
 		case "gone":
 			continue
 		}
 		stats.EvictedImages++
+		slog.InfoContext(ctx, "Image cache evicting image record",
+			slog.String("digest", cand.digest.String()),
+			slog.Time("last_used", cand.modTime),
+			slog.Int("layers", len(cand.diffIDs)),
+			slog.Bool("dry_run", dryRun))
 
 		for _, hex := range cand.diffIDs {
 			refcount[hex]--
 			if refcount[hex] > 0 {
-				continue // still referenced by a retained image
+				slog.InfoContext(ctx, "Image cache keeping layer: still referenced",
+					slog.String("diffid", hex), slog.Int("refcount", refcount[hex]))
+				continue
 			}
 			if roots.LayerHexes[hex] {
+				slog.InfoContext(ctx, "Image cache keeping layer: rooted by a bundle spec",
+					slog.String("diffid", hex))
 				stats.SkippedRooted++
 				continue
 			}
@@ -437,6 +487,10 @@ func (s *Store) EvictUnused(ctx context.Context, targetBytes int64, dryRun bool)
 			if !evicted {
 				continue // already gone, or vetoed inside the singleflight re-check
 			}
+			slog.InfoContext(ctx, "Image cache retiring layer",
+				slog.String("diffid", hex),
+				slog.Int64("size_bytes", size),
+				slog.Bool("dry_run", dryRun))
 			if retiredPath != "" {
 				retired = append(retired, retiredPath)
 			}
@@ -449,6 +503,7 @@ func (s *Store) EvictUnused(ctx context.Context, targetBytes int64, dryRun bool)
 	// diffid, so this contends with nothing. A crash before completion
 	// leaves ".rm-*" dirs for the startup sweep.
 	if len(retired) > 0 {
+		tRemove := time.Now()
 		g := new(errgroup.Group)
 		g.SetLimit(4)
 		for _, dir := range retired {
@@ -462,6 +517,9 @@ func (s *Store) EvictUnused(ctx context.Context, targetBytes int64, dryRun bool)
 		if err := g.Wait(); err != nil {
 			errs = append(errs, err)
 		}
+		slog.InfoContext(ctx, "Image cache removed retired layer dirs",
+			slog.Int("count", len(retired)),
+			slog.Duration("took", time.Since(tRemove)))
 	}
 
 	if err := s.sweepExpiredPins(); err != nil {
@@ -472,8 +530,9 @@ func (s *Store) EvictUnused(ctx context.Context, targetBytes int64, dryRun bool)
 
 // listEviction builds the LRU-ordered candidate list and the layer
 // refcounts over ALL image records (rooted and fresh ones included — their
-// references are what keep shared layers alive).
-func (s *Store) listEviction(roots RootSet, cutoff time.Time) ([]evictionCandidate, map[string]int, error) {
+// references are what keep shared layers alive), counting listing-stage
+// vetoes into stats.
+func (s *Store) listEviction(roots RootSet, cutoff time.Time, stats *EvictStats) ([]evictionCandidate, map[string]int, error) {
 	entries, err := os.ReadDir(s.manifestsDir())
 	if err != nil {
 		return nil, nil, fmt.Errorf("while listing manifest records: %w", err)
@@ -524,12 +583,15 @@ func (s *Store) listEviction(roots RootSet, cutoff time.Time) ([]evictionCandida
 			continue
 		}
 		if roots.ImageDigests[digest.String()] {
+			stats.RootedImages++
 			continue
 		}
 		if fi.ModTime().After(cutoff) {
+			stats.SkippedFresh++
 			continue
 		}
 		if s.pinnedNow(digest) {
+			stats.SkippedPinned++
 			continue
 		}
 		candidates = append(candidates, evictionCandidate{digest: digest, modTime: fi.ModTime(), diffIDs: unique})
@@ -544,6 +606,10 @@ func (s *Store) listEviction(roots RootSet, cutoff time.Time) ([]evictionCandida
 	})
 	return candidates, refcount, errors.Join(errs...)
 }
+
+// Logged vetoes inside retireLayer's singleflight use this message so an
+// e2e can grep for the exact race being exercised.
+const logMsgLayerRetireVetoed = "Image cache layer retirement vetoed: recently used"
 
 // retireLayer renames the layer dir aside for asynchronous removal,
 // serialized against the pull path via the layer singleflight: ensureLayer
@@ -579,6 +645,8 @@ func (s *Store) retireLayer(hex string, cutoff time.Time, dryRun bool) (int64, s
 		// In-flight re-check: a concurrent ensureLayer touched the dir if it
 		// reused this layer since the pass began.
 		if fi.ModTime().After(cutoff) {
+			slog.Info(logMsgLayerRetireVetoed,
+				slog.String("diffid", hex), slog.Time("last_used", fi.ModTime()))
 			return nil, nil
 		}
 		dst := filepath.Join(s.layersDir(), fmt.Sprintf("%s%s-%d", retiredPrefix, hex[:12], time.Now().UnixNano()))
