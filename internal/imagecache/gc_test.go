@@ -1,0 +1,547 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package imagecache
+
+import (
+	"archive/tar"
+	"context"
+	"encoding/json"
+	"math"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	v1 "github.com/google/go-containerregistry/pkg/v1"
+)
+
+// backdate shifts path's mtime age into the past.
+func backdate(t *testing.T, path string, age time.Duration) {
+	t.Helper()
+	past := time.Now().Add(-age)
+	if err := os.Chtimes(path, past, past); err != nil {
+		t.Fatalf("backdating %q: %v", path, err)
+	}
+}
+
+// backdateStore ages every image record and layer dir so the min-age veto
+// no longer applies, making eviction tests deterministic without sleeps.
+func backdateStore(t *testing.T, s *Store, age time.Duration) {
+	t.Helper()
+	for _, dir := range []string{s.manifestsDir(), s.layersDir()} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatalf("listing %q: %v", dir, err)
+		}
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), ".") {
+				continue
+			}
+			backdate(t, filepath.Join(dir, e.Name()), age)
+		}
+	}
+}
+
+func mustEnsure(t *testing.T, s *Store, ref string) *Image {
+	t.Helper()
+	img, err := s.EnsureImage(context.Background(), ref)
+	if err != nil {
+		t.Fatalf("EnsureImage(%q): %v", ref, err)
+	}
+	return img
+}
+
+func layerDirsOnDisk(t *testing.T, s *Store) []string {
+	t.Helper()
+	entries, err := os.ReadDir(s.layersDir())
+	if err != nil {
+		t.Fatalf("listing layer pool: %v", err)
+	}
+	var out []string
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), ".") {
+			out = append(out, e.Name())
+		}
+	}
+	return out
+}
+
+func TestLayerSizeRecordedAndBackfilled(t *testing.T) {
+	_, host := newTestRegistry(t)
+	ref := host + "/test/sized:latest"
+	pushImage(t, ref, v1.Config{}, layerFromEntries(t, []tarEntry{
+		{name: "data", typeflag: tar.TypeReg, mode: 0o644, body: strings.Repeat("x", 4096)},
+	}))
+
+	store := newTestStore(t)
+	img := mustEnsure(t, store, ref)
+
+	sizePath := filepath.Join(img.LayerDirs[0], layerSizeFileName)
+	if _, err := os.Stat(sizePath); err != nil {
+		t.Fatalf("size file not written at unpack: %v", err)
+	}
+	recorded, err := store.layerSize(img.LayerDirs[0])
+	if err != nil {
+		t.Fatalf("layerSize: %v", err)
+	}
+	if recorded < 4096 {
+		t.Errorf("recorded size = %d, want >= 4096 (content bytes)", recorded)
+	}
+
+	// Backfill: delete the size file (simulating a Phase-1 layer), backdate
+	// the dir (the delete itself bumps its mtime), and check the size is
+	// recomputed and rewritten without disturbing the dir mtime — the
+	// eviction age signal. Backfill counts file content bytes, so it may be
+	// smaller than the unpack-time tar-stream count; both are valid
+	// optimistic estimates.
+	if err := os.Remove(sizePath); err != nil {
+		t.Fatal(err)
+	}
+	backdate(t, img.LayerDirs[0], time.Hour)
+	before, _ := os.Stat(img.LayerDirs[0])
+	refilled, err := store.layerSize(img.LayerDirs[0])
+	if err != nil {
+		t.Fatalf("layerSize backfill: %v", err)
+	}
+	if refilled < 4096 {
+		t.Errorf("backfilled size = %d, want >= 4096", refilled)
+	}
+	if _, err := os.Stat(sizePath); err != nil {
+		t.Errorf("backfill did not rewrite the size file: %v", err)
+	}
+	after, _ := os.Stat(img.LayerDirs[0])
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Errorf("backfill changed the layer dir mtime (eviction age signal): %v -> %v", before.ModTime(), after.ModTime())
+	}
+
+	if total, err := store.CacheSize(); err != nil || total < refilled {
+		t.Errorf("CacheSize() = %d, %v; want >= %d", total, err, refilled)
+	}
+}
+
+func TestEnsureImageHitTouchesRecord(t *testing.T) {
+	_, host := newTestRegistry(t)
+	ref := host + "/test/touch:latest"
+	pushImage(t, ref, v1.Config{}, layerFromEntries(t, []tarEntry{
+		{name: "f", typeflag: tar.TypeReg, mode: 0o644, body: "hi"},
+	}))
+
+	store := newTestStore(t)
+	img := mustEnsure(t, store, ref)
+
+	recPath := store.recordPath(img.Digest)
+	backdate(t, recPath, time.Hour)
+	stale, _ := os.Stat(recPath)
+
+	mustEnsure(t, store, ref) // cache hit
+	fresh, _ := os.Stat(recPath)
+	if !fresh.ModTime().After(stale.ModTime()) {
+		t.Errorf("cache hit did not advance record mtime: %v -> %v", stale.ModTime(), fresh.ModTime())
+	}
+}
+
+func TestPinsLifecycle(t *testing.T) {
+	store := newTestStore(t)
+	digest := v1.Hash{Algorithm: "sha256", Hex: strings.Repeat("ab", 32)}
+
+	if store.pinnedNow(digest) {
+		t.Fatal("pinnedNow true with no pin")
+	}
+	if err := store.writePin(digest, pinReasonPull, time.Hour); err != nil {
+		t.Fatalf("writePin: %v", err)
+	}
+	if !store.pinnedNow(digest) {
+		t.Fatal("pinnedNow false right after writePin")
+	}
+	// Live pins survive the sweep.
+	if err := store.sweepExpiredPins(); err != nil {
+		t.Fatalf("sweepExpiredPins: %v", err)
+	}
+	if !store.pinnedNow(digest) {
+		t.Fatal("sweep removed a live pin")
+	}
+
+	// Expired pins stop vetoing and are deleted by the sweep.
+	if err := store.writePin(digest, pinReasonPull, -time.Second); err != nil {
+		t.Fatalf("writePin(expired): %v", err)
+	}
+	if store.pinnedNow(digest) {
+		t.Fatal("pinnedNow true for expired pin")
+	}
+	if err := store.sweepExpiredPins(); err != nil {
+		t.Fatalf("sweepExpiredPins: %v", err)
+	}
+	if _, err := os.Stat(store.pinPath(digest)); !os.IsNotExist(err) {
+		t.Errorf("expired pin file not swept: %v", err)
+	}
+
+	// An unreadable pin fails toward retention.
+	if err := os.WriteFile(store.pinPath(digest), []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !store.pinnedNow(digest) {
+		t.Error("corrupt pin should be treated as live")
+	}
+}
+
+func TestEvictUnusedMinAgeVeto(t *testing.T) {
+	_, host := newTestRegistry(t)
+	ref := host + "/test/fresh:latest"
+	pushImage(t, ref, v1.Config{}, layerFromEntries(t, []tarEntry{
+		{name: "f", typeflag: tar.TypeReg, mode: 0o644, body: "hi"},
+	}))
+
+	store := newTestStore(t) // default minAge = 2m; everything is younger
+	mustEnsure(t, store, ref)
+
+	stats, err := store.EvictUnused(context.Background(), math.MaxInt64, false)
+	if err != nil {
+		t.Fatalf("EvictUnused: %v", err)
+	}
+	if stats.EvictedImages != 0 || stats.EvictedLayers != 0 {
+		t.Errorf("evicted fresh content: %+v", stats)
+	}
+	if got := layerDirsOnDisk(t, store); len(got) == 0 {
+		t.Error("fresh layers were removed")
+	}
+}
+
+func TestEvictUnusedLRUSharedLayersAndRepull(t *testing.T) {
+	_, host := newTestRegistry(t)
+	shared := layerFromEntries(t, []tarEntry{
+		{name: "shared", typeflag: tar.TypeReg, mode: 0o644, body: strings.Repeat("s", 2048)},
+	})
+	onlyA := layerFromEntries(t, []tarEntry{
+		{name: "a", typeflag: tar.TypeReg, mode: 0o644, body: strings.Repeat("a", 2048)},
+	})
+	onlyB := layerFromEntries(t, []tarEntry{
+		{name: "b", typeflag: tar.TypeReg, mode: 0o644, body: strings.Repeat("b", 2048)},
+	})
+	refA := host + "/test/a:latest"
+	refB := host + "/test/b:latest"
+	pushImage(t, refA, v1.Config{}, shared, onlyA)
+	pushImage(t, refB, v1.Config{}, shared, onlyB)
+
+	store := newTestStore(t)
+	imgA := mustEnsure(t, store, refA)
+	imgB := mustEnsure(t, store, refB)
+	if imgA.LayerDirs[0] != imgB.LayerDirs[0] {
+		t.Fatalf("shared layer not deduplicated: %q vs %q", imgA.LayerDirs[0], imgB.LayerDirs[0])
+	}
+
+	backdateStore(t, store, 3*time.Hour)
+	// Make A strictly older than B so LRU picks A first.
+	backdate(t, store.recordPath(imgA.Digest), 4*time.Hour)
+
+	// A small target: only the LRU image (A) should go. Its private layer is
+	// deleted; the shared layer survives via B's reference.
+	stats, err := store.EvictUnused(context.Background(), 1, false)
+	if err != nil {
+		t.Fatalf("EvictUnused(1): %v", err)
+	}
+	if stats.EvictedImages != 1 {
+		t.Fatalf("evicted %d images, want 1 (stats %+v)", stats.EvictedImages, stats)
+	}
+	if stats.FreedBytes <= 0 {
+		t.Errorf("FreedBytes = %d, want > 0", stats.FreedBytes)
+	}
+	if _, err := os.Stat(store.recordPath(imgA.Digest)); !os.IsNotExist(err) {
+		t.Error("LRU image record A still present")
+	}
+	if _, err := os.Stat(store.recordPath(imgB.Digest)); err != nil {
+		t.Errorf("newer image record B missing: %v", err)
+	}
+	if _, err := os.Stat(imgA.LayerDirs[1]); !os.IsNotExist(err) {
+		t.Error("A's private layer not evicted")
+	}
+	if _, err := os.Stat(imgA.LayerDirs[0]); err != nil {
+		t.Errorf("shared layer evicted while B still references it: %v", err)
+	}
+
+	// Free-everything pass: B goes too, and the pool empties.
+	if _, err := store.EvictUnused(context.Background(), math.MaxInt64, false); err != nil {
+		t.Fatalf("EvictUnused(max): %v", err)
+	}
+	if got := layerDirsOnDisk(t, store); len(got) != 0 {
+		t.Errorf("layers remain after free-everything pass: %v", got)
+	}
+
+	// The registry is still up: an evicted image is simply a re-pull away.
+	imgA2 := mustEnsure(t, store, refA)
+	if _, err := os.Stat(filepath.Join(imgA2.LayerDirs[1], layerFSDirName, "a")); err != nil {
+		t.Errorf("re-pulled image content missing: %v", err)
+	}
+}
+
+func TestEvictUnusedRootSet(t *testing.T) {
+	_, host := newTestRegistry(t)
+	refRooted := host + "/test/rooted:latest"
+	refLayerRooted := host + "/test/layer-rooted:latest"
+	refLoose := host + "/test/loose:latest"
+	for _, r := range []string{refRooted, refLayerRooted, refLoose} {
+		pushImage(t, r, v1.Config{}, layerFromEntries(t, []tarEntry{
+			{name: "f-" + r[len(r)-8:], typeflag: tar.TypeReg, mode: 0o644, body: r},
+		}))
+	}
+
+	actorsDir := t.TempDir()
+	store := newTestStore(t, WithActorsDir(actorsDir))
+	imgRooted := mustEnsure(t, store, refRooted)
+	imgLayerRooted := mustEnsure(t, store, refLayerRooted)
+	imgLoose := mustEnsure(t, store, refLoose)
+
+	// A modern bundle spec (with digest) roots imgRooted entirely.
+	bundle1 := filepath.Join(actorsDir, "actor-1", "bundles", "main")
+	if err := os.MkdirAll(bundle1, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteSpec(bundle1, &OverlaySpec{ImageDigest: imgRooted.Digest.String(), Layers: imgRooted.LayerDirs}); err != nil {
+		t.Fatal(err)
+	}
+	// A pre-Phase-2 spec (no digest) roots only imgLayerRooted's layers.
+	bundle2 := filepath.Join(actorsDir, "actor-2", "bundles", "main")
+	if err := os.MkdirAll(bundle2, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteSpec(bundle2, &OverlaySpec{Layers: imgLayerRooted.LayerDirs}); err != nil {
+		t.Fatal(err)
+	}
+
+	rs := store.InUse()
+	if !rs.ImageDigests[imgRooted.Digest.String()] {
+		t.Error("InUse missing digest-rooted image")
+	}
+	if !rs.LayerHexes[filepath.Base(imgLayerRooted.LayerDirs[0])] {
+		t.Error("InUse missing layer-rooted layer")
+	}
+
+	backdateStore(t, store, 3*time.Hour)
+	stats, err := store.EvictUnused(context.Background(), math.MaxInt64, false)
+	if err != nil {
+		t.Fatalf("EvictUnused: %v", err)
+	}
+
+	// Rooted image: record and layers untouched.
+	if _, err := os.Stat(store.recordPath(imgRooted.Digest)); err != nil {
+		t.Errorf("digest-rooted image record evicted: %v", err)
+	}
+	if _, err := os.Stat(imgRooted.LayerDirs[0]); err != nil {
+		t.Errorf("digest-rooted image layer evicted: %v", err)
+	}
+	// Layer-rooted (old spec): record may go, layers must stay.
+	if _, err := os.Stat(imgLayerRooted.LayerDirs[0]); err != nil {
+		t.Errorf("layer-rooted layer evicted: %v", err)
+	}
+	if stats.SkippedRooted == 0 {
+		t.Errorf("expected SkippedRooted > 0 for the digestless spec's layer, got %+v", stats)
+	}
+	// The loose image is fully evicted.
+	if _, err := os.Stat(store.recordPath(imgLoose.Digest)); !os.IsNotExist(err) {
+		t.Error("unrooted image record survived a free-everything pass")
+	}
+	if _, err := os.Stat(imgLoose.LayerDirs[0]); !os.IsNotExist(err) {
+		t.Error("unrooted layer survived a free-everything pass")
+	}
+}
+
+func TestEvictUnusedPinVeto(t *testing.T) {
+	_, host := newTestRegistry(t)
+	ref := host + "/test/pinned:latest"
+	pushImage(t, ref, v1.Config{}, layerFromEntries(t, []tarEntry{
+		{name: "f", typeflag: tar.TypeReg, mode: 0o644, body: "hi"},
+	}))
+
+	store := newTestStore(t)
+	img := mustEnsure(t, store, ref)
+	backdateStore(t, store, 3*time.Hour)
+
+	if err := store.writePin(img.Digest, pinReasonPreload, time.Hour); err != nil {
+		t.Fatalf("writePin: %v", err)
+	}
+	stats, err := store.EvictUnused(context.Background(), math.MaxInt64, false)
+	if err != nil {
+		t.Fatalf("EvictUnused: %v", err)
+	}
+	if stats.EvictedImages != 0 {
+		t.Errorf("evicted a pinned image: %+v", stats)
+	}
+	if _, err := os.Stat(store.recordPath(img.Digest)); err != nil {
+		t.Errorf("pinned record evicted: %v", err)
+	}
+
+	// Once the pin expires the image is fair game, and the pass sweeps the
+	// pin file itself.
+	if err := store.writePin(img.Digest, pinReasonPreload, -time.Second); err != nil {
+		t.Fatalf("writePin(expired): %v", err)
+	}
+	if _, err := store.EvictUnused(context.Background(), math.MaxInt64, false); err != nil {
+		t.Fatalf("EvictUnused: %v", err)
+	}
+	if _, err := os.Stat(store.recordPath(img.Digest)); !os.IsNotExist(err) {
+		t.Error("image with expired pin survived")
+	}
+	if _, err := os.Stat(store.pinPath(img.Digest)); !os.IsNotExist(err) {
+		t.Error("expired pin file not swept by the pass")
+	}
+}
+
+func TestEvictUnusedDryRun(t *testing.T) {
+	_, host := newTestRegistry(t)
+	ref := host + "/test/dryrun:latest"
+	pushImage(t, ref, v1.Config{}, layerFromEntries(t, []tarEntry{
+		{name: "f", typeflag: tar.TypeReg, mode: 0o644, body: strings.Repeat("d", 1024)},
+	}))
+
+	store := newTestStore(t)
+	img := mustEnsure(t, store, ref)
+	backdateStore(t, store, 3*time.Hour)
+
+	stats, err := store.EvictUnused(context.Background(), math.MaxInt64, true)
+	if err != nil {
+		t.Fatalf("EvictUnused(dry): %v", err)
+	}
+	if stats.EvictedImages != 1 || stats.EvictedLayers != 1 || stats.FreedBytes <= 0 {
+		t.Errorf("dry-run stats = %+v, want 1 image / 1 layer / >0 bytes", stats)
+	}
+	if _, err := os.Stat(store.recordPath(img.Digest)); err != nil {
+		t.Errorf("dry run deleted the record: %v", err)
+	}
+	if _, err := os.Stat(img.LayerDirs[0]); err != nil {
+		t.Errorf("dry run deleted the layer: %v", err)
+	}
+}
+
+func TestNewSweepsRetiredDirsAndExpiredPins(t *testing.T) {
+	root := t.TempDir()
+	store, err := New(root)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Plant a retired dir (crash between rename and RemoveAll) with a
+	// read-only subdir, which plain RemoveAll cannot delete.
+	retired := filepath.Join(store.layersDir(), retiredPrefix+"deadbeef-1")
+	if err := os.MkdirAll(filepath.Join(retired, "fs", "ro"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(retired, "fs", "ro", "f"), []byte("x"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(retired, "fs", "ro"), 0o500); err != nil {
+		t.Fatal(err)
+	}
+	// And an expired pin.
+	digest := v1.Hash{Algorithm: "sha256", Hex: strings.Repeat("cd", 32)}
+	if err := store.writePin(digest, pinReasonPull, -time.Second); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := New(root); err != nil {
+		t.Fatalf("New (recovery): %v", err)
+	}
+	if _, err := os.Stat(retired); !os.IsNotExist(err) {
+		t.Errorf("retired dir not swept at startup: %v", err)
+	}
+	if _, err := os.Stat(store.pinPath(digest)); !os.IsNotExist(err) {
+		t.Errorf("expired pin not swept at startup: %v", err)
+	}
+}
+
+func TestSpecImageDigestCompat(t *testing.T) {
+	dir := t.TempDir()
+	// Round trip with the new field.
+	if err := WriteSpec(dir, &OverlaySpec{ImageDigest: "sha256:" + strings.Repeat("ef", 32), Layers: []string{"/pool/layers/sha256/aa"}}); err != nil {
+		t.Fatalf("WriteSpec: %v", err)
+	}
+	spec, err := ReadSpec(dir)
+	if err != nil || spec == nil {
+		t.Fatalf("ReadSpec: %v, %v", spec, err)
+	}
+	if spec.ImageDigest == "" {
+		t.Error("ImageDigest lost in round trip")
+	}
+
+	// A spec written by a pre-Phase-2 atelet (no imageDigest) still parses.
+	old, err := json.Marshal(map[string]any{"version": 1, "layers": []string{"/pool/layers/sha256/bb"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, OverlaySpecFileName), old, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	spec, err = ReadSpec(dir)
+	if err != nil || spec == nil {
+		t.Fatalf("ReadSpec(old): %v, %v", spec, err)
+	}
+	if spec.ImageDigest != "" {
+		t.Errorf("old spec ImageDigest = %q, want empty", spec.ImageDigest)
+	}
+}
+
+// TestConcurrentEnsureImageAndEvict races cache hits, re-pulls, and
+// free-everything eviction passes. The invariant under test: whatever
+// interleaving happens, EnsureImage never returns an Image whose layer
+// dirs have been (or will be) retired — either its touch/pin wins and the
+// evictor skips, or the evictor wins and EnsureImage re-pulls fresh dirs.
+// Run with -race.
+func TestConcurrentEnsureImageAndEvict(t *testing.T) {
+	_, host := newTestRegistry(t)
+	ref := host + "/test/race:latest"
+	pushImage(t, ref, v1.Config{}, layerFromEntries(t, []tarEntry{
+		{name: "f", typeflag: tar.TypeReg, mode: 0o644, body: strings.Repeat("r", 512)},
+	}))
+
+	store := newTestStore(t)
+	digestRef := host + "/test/race@" + mustEnsure(t, store, ref).Digest.String()
+
+	for i := 0; i < 25; i++ {
+		backdateStore(t, store, 3*time.Hour)
+
+		var wg sync.WaitGroup
+		var img *Image
+		var ensureErr error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			img, ensureErr = store.EnsureImage(context.Background(), digestRef)
+		}()
+		go func() {
+			defer wg.Done()
+			if _, err := store.EvictUnused(context.Background(), math.MaxInt64, false); err != nil {
+				t.Errorf("EvictUnused: %v", err)
+			}
+		}()
+		wg.Wait()
+
+		if ensureErr != nil {
+			t.Fatalf("iteration %d: EnsureImage: %v", i, ensureErr)
+		}
+		// The returned image must reference live, complete layer dirs. Its
+		// record must be fresh (either the hit's touch or the re-pull wrote
+		// it), which is what protects it until an ateom would mount it.
+		for _, dir := range img.LayerDirs {
+			if _, err := os.Stat(filepath.Join(dir, layerFSDirName, "f")); err != nil {
+				t.Fatalf("iteration %d: returned layer dir unusable: %v", i, err)
+			}
+		}
+		if fi, err := os.Stat(store.recordPath(img.Digest)); err != nil {
+			t.Fatalf("iteration %d: record of returned image missing: %v", i, err)
+		} else if time.Since(fi.ModTime()) > time.Minute {
+			t.Fatalf("iteration %d: returned image's record is stale (mtime %v)", i, fi.ModTime())
+		}
+	}
+}

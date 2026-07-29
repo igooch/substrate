@@ -34,6 +34,11 @@ var (
 	// directories are visible at the same path in atelet (which writes them)
 	// and in every ateom pod (which mounts them as overlay lowerdirs).
 	ImageCacheDir = filepath.Join(BasePath, "image-cache")
+
+	// ActorsDir holds the per-actor state directories (see ActorPath). The
+	// image cache's eviction root-set scan reads the bundle overlay specs
+	// under it.
+	ActorsDir = filepath.Join(BasePath, "actors")
 )
 
 func RunSCBinaryPath(sha256 string) string {
@@ -68,8 +73,7 @@ func AteomNetNSPath(podUID string) string {
 
 func ActorPath(actorUID string) string {
 	return filepath.Join(
-		BasePath,
-		"actors",
+		ActorsDir,
 		actorUID,
 	)
 }

@@ -56,7 +56,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
@@ -74,6 +76,21 @@ const (
 	layerFSDirName           = "fs"
 	layerWhiteoutsFileName   = "whiteouts.json"
 	layerFinalizedMarkerName = "finalized"
+	// layerSizeFileName holds the layer's decimal byte count, recorded at
+	// unpack time so eviction never has to walk a tree to size it. Written
+	// into the temp dir before the atomic rename; absent for layers unpacked
+	// by older atelets (backfilled lazily, see layerSize).
+	layerSizeFileName = "size"
+
+	// retiredPrefix marks a layer dir that eviction has atomically renamed
+	// aside and no longer exists by diffid. The slow RemoveAll happens after
+	// the rename, outside all locks; a crash in between leaves the dir for
+	// sweepTempDirs. The prefix shares the dot-hidden namespace with ".tmp-"
+	// so diffid-named dirs can never collide with it.
+	retiredPrefix = ".rm-"
+
+	defaultMinAge     = 2 * time.Minute
+	defaultPullPinTTL = 15 * time.Minute
 
 	// layerPullConcurrency bounds concurrent layer download+unpack streams per
 	// image pull. Memory use is O(stream buffers) per slot, independent of
@@ -98,8 +115,37 @@ type Store struct {
 	// nodes it validates for.
 	platform *v1.Platform
 
+	// actorsDir is scanned by InUse for bundle overlay specs; empty disables
+	// the scan (the root set is then pins only).
+	actorsDir string
+
+	// minAge vetoes eviction of any layer or image record younger than this,
+	// covering the window between a pull (or cache-hit stat) and the bundle
+	// spec write / ateom mount that roots it.
+	minAge time.Duration
+
+	// pullPinTTL bounds the expiring pin EnsureImage writes around a pull. In
+	// the happy path the pin is deleted as soon as the image record is
+	// durable; the TTL only matters if atelet dies mid-pull, where it keeps
+	// the partial layers from being evicted out from under the retry.
+	pullPinTTL time.Duration
+
 	imageSF singleflight.Group
 	layerSF singleflight.Group
+
+	// evictMu serializes EvictUnused passes (concurrent passes would fight
+	// over the same candidates for no benefit).
+	evictMu sync.Mutex
+
+	// hitMu closes the last hit-vs-evict window: the cache-hit path holds it
+	// shared across its record read, layer stats, and last-use touch, and
+	// eviction holds it exclusive across each victim's final veto re-check
+	// and record removal. Either the hit's touch lands first (the re-check
+	// sees a fresh mtime and skips the image, layers included) or the
+	// removal lands first (the hit sees no record and falls into the pull
+	// path, which is fully serialized by the layer singleflight). Uncontended
+	// except during an eviction pass.
+	hitMu sync.RWMutex
 }
 
 // Option configures a Store.
@@ -121,6 +167,26 @@ func WithLocalhostRegistryReplacement(replacement string) Option {
 // WithPlatform overrides the pull platform (default: linux/GOARCH).
 func WithPlatform(p v1.Platform) Option {
 	return func(s *Store) { s.platform = &p }
+}
+
+// WithActorsDir points the eviction root-set scan at the node's actors
+// directory (ateompath.ActorsDir in production). Each
+// <actorsDir>/<actorUID>/bundles/<container>/rootfs-overlay.json roots its
+// image and layers against eviction. Empty disables the scan.
+func WithActorsDir(dir string) Option {
+	return func(s *Store) { s.actorsDir = dir }
+}
+
+// WithMinAge overrides the eviction minimum age (default 2m): layers and
+// image records younger than this are never evicted.
+func WithMinAge(d time.Duration) Option {
+	return func(s *Store) { s.minAge = d }
+}
+
+// WithPullPinTTL overrides the TTL of the expiring pin held around each pull
+// (default 15m).
+func WithPullPinTTL(d time.Duration) Option {
+	return func(s *Store) { s.pullPinTTL = d }
 }
 
 // Image describes one cached, ready-to-compose image.
@@ -148,12 +214,12 @@ type imageRecord struct {
 // startup recovery: verifying the layout version and sweeping temp dirs left
 // by unpacks that were in flight when a previous atelet died.
 func New(root string, opts ...Option) (*Store, error) {
-	s := &Store{root: root}
+	s := &Store{root: root, minAge: defaultMinAge, pullPinTTL: defaultPullPinTTL}
 	for _, o := range opts {
 		o(s)
 	}
 
-	for _, d := range []string{s.layersDir(), s.manifestsDir()} {
+	for _, d := range []string{s.layersDir(), s.manifestsDir(), s.pinsDir()} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return nil, fmt.Errorf("while creating image cache dir %q: %w", d, err)
 		}
@@ -183,6 +249,7 @@ func New(root string, opts ...Option) (*Store, error) {
 
 func (s *Store) layersDir() string    { return filepath.Join(s.root, "layers", "sha256") }
 func (s *Store) manifestsDir() string { return filepath.Join(s.root, "manifests", "sha256") }
+func (s *Store) pinsDir() string      { return filepath.Join(s.root, "pins", "sha256") }
 
 func (s *Store) layerDir(diffID v1.Hash) string {
 	return filepath.Join(s.root, "layers", diffID.Algorithm, diffID.Hex)
@@ -192,23 +259,30 @@ func (s *Store) recordPath(digest v1.Hash) string {
 	return filepath.Join(s.root, "manifests", digest.Algorithm, digest.Hex+".json")
 }
 
-// sweepTempDirs removes unpack temp dirs and manifest-record temp files
-// orphaned by a crash. A layer dir without the temp prefix and a record
-// without a leading dot are always complete (both are moved into place with
-// a single rename), so this is the only recovery the pool needs.
+// sweepTempDirs removes unpack temp dirs, retired layer dirs, manifest-record
+// temp files, and expired pins orphaned by a crash. A layer dir without the
+// temp/retired prefix and a record without a leading dot are always complete
+// (both are moved into place with a single rename), so this is the only
+// recovery the pool needs.
 func (s *Store) sweepTempDirs() error {
 	entries, err := os.ReadDir(s.layersDir())
 	if err != nil {
 		return fmt.Errorf("while listing layer pool: %w", err)
 	}
 	for _, e := range entries {
-		if !strings.HasPrefix(e.Name(), ".tmp-") {
+		// ".tmp-": an unpack in flight at crash. ".rm-": a layer eviction
+		// renamed aside but not yet removed. Either way, unreferenced garbage.
+		if !strings.HasPrefix(e.Name(), ".tmp-") && !strings.HasPrefix(e.Name(), retiredPrefix) {
 			continue
 		}
 		p := filepath.Join(s.layersDir(), e.Name())
 		if err := RemoveAllWritable(p); err != nil {
 			return fmt.Errorf("while sweeping orphaned layer temp dir %q: %w", p, err)
 		}
+	}
+
+	if err := s.sweepExpiredPins(); err != nil {
+		return err
 	}
 
 	// writeRecord's temp files are ".<hex>.json.tmp-<rand>"; finished records
@@ -256,13 +330,32 @@ func (s *Store) EnsureImage(ctx context.Context, ref string) (*Image, error) {
 		digest = desc.Digest
 	}
 
-	if img, err := s.cachedImage(digest); err != nil {
+	s.hitMu.RLock()
+	img, err := s.cachedImage(digest)
+	if err == nil && img != nil {
+		// Record last-use for eviction's LRU ordering. Refreshing the mtime
+		// also renews the min-age veto, so an image in active use can never
+		// age into eviction between this stat and the ateom's mount (see
+		// hitMu for why this ordering is airtight, not just probabilistic).
+		s.touchRecord(digest)
+	}
+	s.hitMu.RUnlock()
+	if err != nil {
 		return nil, err
-	} else if img != nil {
+	}
+	if img != nil {
 		slog.InfoContext(ctx, "Image cache hit", slog.String("ref", ref), slog.String("digest", digest.String()))
 		return img, nil
 	}
 	slog.InfoContext(ctx, "Image cache miss", slog.String("ref", ref), slog.String("digest", digest.String()))
+
+	// An expiring pin covers the pull: deleted as soon as the image record is
+	// durable, and if we die mid-pull it shields the partial layers from
+	// eviction until the retry (or until it lapses — mispulls can't leak disk
+	// past the TTL).
+	if err := s.writePin(digest, pinReasonPull, s.pullPinTTL); err != nil {
+		slog.WarnContext(ctx, "Failed to write pull pin", slog.String("digest", digest.String()), slog.Any("err", err))
+	}
 
 	// Collapse concurrent pulls of the same digest (e.g. several containers of
 	// one actor, or several actors landing at once). The winning call's ctx
@@ -272,8 +365,11 @@ func (s *Store) EnsureImage(ctx context.Context, ref string) (*Image, error) {
 		return s.pull(ctx, parsedRef, digest)
 	})
 	if err != nil {
+		// Leave the pin to protect partial progress for the retry; it expires
+		// on its own.
 		return nil, err
 	}
+	s.removePin(digest)
 	return v.(*Image), nil
 }
 
@@ -386,6 +482,13 @@ func (s *Store) ensureLayer(ctx context.Context, diffID v1.Hash, layer v1.Layer)
 	dir := s.layerDir(diffID)
 	_, err, _ := s.layerSF.Do(diffID.String(), func() (any, error) {
 		if _, err := os.Stat(filepath.Join(dir, layerFSDirName)); err == nil {
+			// Refresh the dir mtime inside the flight: eviction's retire step
+			// runs in this same singleflight and re-checks the mtime against
+			// its min-age cutoff, so a layer reused here can never be renamed
+			// away between this stat and the image record that will
+			// re-reference it.
+			now := time.Now()
+			_ = os.Chtimes(dir, now, now)
 			return nil, nil
 		}
 		return nil, s.unpackLayerToPool(ctx, diffID, layer)
@@ -430,9 +533,18 @@ func (s *Store) unpackLayerToPool(ctx context.Context, diffID v1.Hash, layer v1.
 	}
 	defer root.Close()
 
-	wh, err := unpackLayer(ctx, rc, root)
+	// Count the uncompressed tar stream as the layer's recorded size. It
+	// differs from on-disk usage by tar framing vs. block rounding, but
+	// eviction's byte accounting is optimistic anyway (the next pass's
+	// statfs self-corrects), and recording here means eviction never has
+	// to walk a tree to size it.
+	cr := &countingReader{r: rc}
+	wh, err := unpackLayer(ctx, cr, root)
 	if err != nil {
 		return err
+	}
+	if err := os.WriteFile(filepath.Join(tmp, layerSizeFileName), []byte(strconv.FormatInt(cr.n, 10)+"\n"), 0o600); err != nil {
+		return fmt.Errorf("while writing layer size: %w", err)
 	}
 
 	whBytes, err := json.Marshal(wh)

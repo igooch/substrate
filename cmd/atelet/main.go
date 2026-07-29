@@ -121,12 +121,21 @@ func main() {
 		}
 	}
 
+	if err := validateImageCacheGCFlags(); err != nil {
+		serverboot.Fatal(ctx, "Invalid image cache GC flags", err)
+	}
 	imageCache, err := imagecache.New(*imageCacheDir,
 		imagecache.WithAuthenticator(gcpRegistryAuthn),
 		imagecache.WithLocalhostRegistryReplacement(*localhostRegistryReplacement),
+		imagecache.WithActorsDir(ateompath.ActorsDir),
+		imagecache.WithMinAge(*imageCacheMinAge),
+		imagecache.WithPullPinTTL(*imageCachePinTTL),
 	)
 	if err != nil {
 		serverboot.Fatal(ctx, "Failed to open image cache", err)
+	}
+	if *imageCacheGCPeriod > 0 {
+		go runImageCacheGC(ctx, imageCache, *imageCacheDir)
 	}
 
 	anonGCSClient, err := storage.NewClient(ctx, option.WithoutAuthentication())
