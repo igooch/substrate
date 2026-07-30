@@ -170,9 +170,9 @@ default 5m; `0` disables it). Each pass:
    the per-layer `size` files (recorded at unpack, never `du`'d).
 2. **Computes a target**: free down to `--image-cache-low-percent` when
    volume usage reaches `--image-cache-high-percent` (kubelet's hysteresis
-   band), and/or down to `--image-cache-max-bytes`. The target is **clamped
-   to the pool's own size** — unlike the kubelet, which owns its imagefs,
-   this cache is one tenant of a shared volume, and an unclamped target
+   band), and/or down to `--image-cache-max-bytes`. The target is **capped
+   at the pool's own size** — unlike the kubelet, which owns its imagefs,
+   this cache is one tenant of a shared volume, and an uncapped target
    would evict the whole cache trying to fix disk pressure it didn't cause.
 3. **Builds the root set** by scanning every bundle's `rootfs-overlay.json`
    (see below), and **refcounts** layers across all image records.

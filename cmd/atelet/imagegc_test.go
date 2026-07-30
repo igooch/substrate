@@ -49,10 +49,10 @@ func TestImageCacheGCTarget(t *testing.T) {
 		{
 			// The kubelet formula assumes it owns the filesystem; we don't.
 			// A near-full boot disk shared with containerd/kubelet/logs must
-			// not ask an 11 MiB cache to free 18.9 GiB — unclamped, that
+			// not ask an 11 MiB cache to free 18.9 GiB — uncapped, that
 			// evicts the entire cache on every tick forever (0% hit rate)
 			// without materially moving disk usage.
-			name:     "watermark target clamped to what the cache holds",
+			name:     "watermark target capped at what the cache holds",
 			capacity: 105 * uint64(gib), available: 2 * uint64(gib), // ~98% used
 			cacheSize: 11 << 20,
 			highPct:   85, lowPct: 80,

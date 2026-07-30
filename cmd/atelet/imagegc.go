@@ -87,17 +87,17 @@ func validateImageCacheGCFlags() error {
 // recorded size exceeds maxBytes, free the difference. The pass pursues the
 // larger — but never more than the cache actually holds.
 //
-// That clamp is the important difference from kubelet, which owns its
-// imagefs and can therefore assume the whole shortfall is its to free. Our
-// cache is one tenant of a volume it shares with containerd's image store,
-// kubelet, logs, actor uppers and local snapshots, so an unclamped
+// That cache-size ceiling is the important difference from kubelet, which
+// owns its imagefs and can therefore assume the whole shortfall is its to
+// free. Our cache is one tenant of a volume it shares with containerd's
+// image store, kubelet, logs, actor uppers and local snapshots, so the raw
 // watermark target asks the cache to free far more than it holds (measured:
 // a 105 GiB volume at 98% yields an 18.9 GiB target against an 11 MiB
 // cache). The pass would then evict every unrooted image on every tick —
 // a permanent 0% hit rate, turning every actor start back into a full
-// re-pull — while barely moving disk usage. Clamped, the cache gives back
-// everything it can and no more; the residual shortfall is reported (it is
-// someone else's disk), not chased.
+// re-pull — while barely moving disk usage. Capped at its own size, the
+// cache gives back everything it can and no more; the residual shortfall
+// is reported (it is someone else's disk), not chased.
 func imageCacheGCTarget(capacity, available uint64, cacheSize, maxBytes int64, highPct, lowPct int) int64 {
 	var target int64
 	if capacity > 0 {
@@ -199,7 +199,7 @@ func runImageCacheGCPass(ctx context.Context, store *imagecache.Store, cacheDir 
 	case target > 0 && stats.FreedBytes < target:
 		// Everything eligible was evicted and the target still wasn't
 		// met: the remainder is rooted, pinned, or fresh. Now that the
-		// target is clamped to the cache's own size, a shortfall means
+		// target is capped at the cache's own size, a shortfall means
 		// the cache genuinely cannot give back more — which on a volume
 		// under foreign pressure is the steady state, so this must not
 		// log at ERROR every tick. Warn on the first few, then drop to a
