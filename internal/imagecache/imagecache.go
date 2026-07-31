@@ -76,10 +76,12 @@ const (
 	layerFSDirName           = "fs"
 	layerWhiteoutsFileName   = "whiteouts.json"
 	layerFinalizedMarkerName = "finalized"
-	// layerSizeFileName holds the layer's decimal byte count, recorded at
-	// unpack time so eviction never has to walk a tree to size it. Written
-	// into the temp dir before the atomic rename; absent for layers unpacked
-	// by older atelets (backfilled lazily, see layerSize).
+	// layerSizeFileName holds the layer's byte count, recorded at unpack so
+	// sizing the pool never walks a tree. Absent for layers unpacked by
+	// older atelets (backfilled lazily, see layerSize). An estimate: the
+	// value is the tar-stream length when written at unpack, or the summed
+	// file sizes when backfilled, so it may differ from disk usage and
+	// across nodes.
 	layerSizeFileName = "size"
 
 	// retiredPrefix marks a layer dir that eviction has atomically renamed
@@ -586,18 +588,18 @@ func (s *Store) unpackLayerToPool(ctx context.Context, diffID v1.Hash, layer v1.
 	}
 	defer root.Close()
 
-	// Count the uncompressed tar stream as the layer's recorded size. It
-	// differs from on-disk usage by tar framing vs. block rounding, but
-	// eviction's byte accounting is optimistic anyway (the next pass's
-	// statfs self-corrects), and recording here means eviction never has
-	// to walk a tree to size it.
+	// The uncompressed tar stream is the recorded size: an optimistic
+	// estimate (tar framing vs. block rounding), cheap to capture here.
 	cr := &countingReader{r: rc}
 	wh, err := unpackLayer(ctx, cr, root)
 	if err != nil {
 		return err
 	}
+	// Non-fatal: a missing size file is recovered by layerSize's backfill,
+	// so a metadata write must not discard a successful unpack.
 	if err := os.WriteFile(filepath.Join(tmp, layerSizeFileName), []byte(strconv.FormatInt(cr.n, 10)+"\n"), 0o600); err != nil {
-		return fmt.Errorf("while writing layer size: %w", err)
+		slog.WarnContext(ctx, "Failed to record layer size; will backfill lazily",
+			slog.String("diffid", diffID.String()), slog.Any("err", err))
 	}
 
 	whBytes, err := json.Marshal(wh)

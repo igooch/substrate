@@ -21,6 +21,7 @@ package ateattr
 import (
 	"go.opentelemetry.io/otel/attribute"
 
+	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 )
 
@@ -48,10 +49,13 @@ const (
 // name/uid, atespace) is absent by design; it belongs on spans and logs.
 // WorkerStateKey stays worker-rooted rather than nesting under the pool so it
 // can grow siblings.
+// WorkerPoolNamespaceKey pairs with WorkerPoolNameKey: a WorkerPool is
+// namespaced, so the name alone does not identify one.
 const (
-	WorkerPoolNameKey = attribute.Key("ate.workerpool.name")
-	WorkerStateKey    = attribute.Key("ate.worker.state")
-	SandboxClassKey   = attribute.Key("ate.sandbox.class")
+	WorkerPoolNamespaceKey = attribute.Key("ate.workerpool.namespace")
+	WorkerPoolNameKey      = attribute.Key("ate.workerpool.name")
+	WorkerStateKey         = attribute.Key("ate.worker.state")
+	SandboxClassKey        = attribute.Key("ate.sandbox.class")
 )
 
 // Values for WorkerStateKey. Only idle and assigned are representable today;
@@ -64,10 +68,10 @@ const (
 // ActorRefAttributes returns the subset knowable before the Actor record
 // resolves: only the (atespace, name) the request addresses. The uid and version
 // are server-assigned and unknown until the record loads, so they are omitted.
-func ActorRefAttributes(atespace, name string) []attribute.KeyValue {
+func ActorRefAttributes(actorRef resources.ActorRef) []attribute.KeyValue {
 	return []attribute.KeyValue{
-		AtespaceKey.String(atespace),
-		ActorNameKey.String(name),
+		AtespaceKey.String(actorRef.Atespace),
+		ActorNameKey.String(actorRef.Name),
 	}
 }
 

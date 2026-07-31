@@ -87,68 +87,6 @@ func TestOrphanLayerReclaimedAtStartup(t *testing.T) {
 	}
 }
 
-// PROBE 3: layerSize's backfill walk aborts on the first unreadable
-// directory. Images legitimately ship search-only (0o111) or 0o000
-// directories, and unpackLayer preserves those modes, so a Phase-1 layer
-// containing one can never be sized — it is credited 0 bytes forever, which
-// makes GC永 undercount and log "could not reach target".
-func TestLayerSizeBackfillSkipsUnreadableDirs(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("root with CAP_DAC_READ_SEARCH can list mode-0111 dirs")
-	}
-	store := newTestStore(t)
-
-	dir := filepath.Join(store.layersDir(), strings.Repeat("11", 32))
-	fsDir := filepath.Join(dir, layerFSDirName)
-	readable := filepath.Join(fsDir, "usr")
-	inner := filepath.Join(fsDir, "opt", "secret")
-	for _, d := range []string{readable, inner} {
-		if err := os.MkdirAll(d, 0o700); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := os.WriteFile(filepath.Join(readable, "blob"), make([]byte, 4096), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(inner, "blob"), make([]byte, 8192), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// A layer that ships a search-only dir, as some distro images do.
-	if err := os.Chmod(inner, 0o111); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(inner, 0o700) })
-
-	// The contract is "never abort, count what is countable". Content under
-	// a dir the image made unlistable cannot be enumerated by a process
-	// without CAP_DAC_READ_SEARCH (atelet drops it), and the alternative —
-	// chmod'ing the shared pool — would change the metadata overlayfs shows
-	// running actors. So that content is under-counted, deliberately: an
-	// under-count is consistent with the optimistic accounting elsewhere,
-	// whereas the original abort returned 0 bytes *and* an error, which made
-	// CacheSize skip the layer entirely and eviction credit it nothing.
-	got, err := store.layerSize(dir)
-	if err != nil {
-		t.Errorf("layerSize aborted on a layer with an unreadable subdir: %v", err)
-	}
-	if got < 4096 {
-		t.Errorf("layerSize = %d, want >= 4096: readable content was not counted", got)
-	}
-
-	// The size file must still be written, so the walk happens once ever.
-	if _, err := os.Stat(filepath.Join(dir, layerSizeFileName)); err != nil {
-		t.Errorf("backfill did not persist a size file: %v", err)
-	}
-	// And CacheSize must include the layer rather than skipping it.
-	total, err := store.CacheSize()
-	if err != nil {
-		t.Fatalf("CacheSize: %v", err)
-	}
-	if total < 4096 {
-		t.Errorf("CacheSize = %d, want >= 4096: layer omitted from the pool total", total)
-	}
-}
-
 // PROBE 4 (review 1): a digestless bundle spec (written by a pre-Phase-2
 // atelet, i.e. every actor running across the upgrade) must not strand its
 // layers. In v2 the exact-layer-set rooting rule keeps the RECORD alive

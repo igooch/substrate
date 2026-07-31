@@ -55,13 +55,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -69,24 +66,8 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// countingReader counts bytes read through it; used to record a layer's
-// size from the uncompressed tar stream at unpack time.
-type countingReader struct {
-	r io.Reader
-	n int64
-}
-
-func (c *countingReader) Read(p []byte) (int, error) {
-	n, err := c.r.Read(p)
-	c.n += int64(n)
-	return n, err
-}
-
 // isLayerDirName reports whether name is a well-formed sha256 layer
-// directory name. The orphan sweep enumerates the pool directly, so it can
-// encounter anything an operator left there; only conforming names are
-// treated as layers (and only they are safe to abbreviate when renaming
-// aside).
+// directory name.
 func isLayerDirName(name string) bool {
 	if len(name) != 64 {
 		return false
@@ -97,89 +78,6 @@ func isLayerDirName(name string) bool {
 		}
 	}
 	return true
-}
-
-// --- sizes and last-use ---
-
-// touchRecord refreshes the manifest record's mtime, the persisted
-// last-use timestamp eviction sorts by. Best-effort: a failed touch only
-// costs LRU accuracy, never correctness.
-func (s *Store) touchRecord(digest v1.Hash) {
-	now := time.Now()
-	if err := os.Chtimes(s.recordPath(digest), now, now); err != nil && !errors.Is(err, os.ErrNotExist) {
-		slog.Warn("Failed to touch image record", slog.String("digest", digest.String()), slog.Any("err", err))
-	}
-}
-
-// layerSize returns the layer's recorded byte count, backfilling the size
-// file (one tree walk, once ever) for layers unpacked before sizes were
-// recorded.
-func (s *Store) layerSize(layerDir string) (int64, error) {
-	b, err := os.ReadFile(filepath.Join(layerDir, layerSizeFileName))
-	if err == nil {
-		n, perr := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
-		if perr == nil {
-			return n, nil
-		}
-		// Fall through to backfill on a corrupt size file.
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return 0, fmt.Errorf("while reading layer size: %w", err)
-	}
-
-	var total int64
-	fsRoot := filepath.Join(layerDir, layerFSDirName)
-	err = filepath.WalkDir(fsRoot, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			// Images legitimately ship unreadable directories (0111, 0000)
-			// and unpack preserves their modes, so a walk error is expected,
-			// not fatal: skip that subtree and keep counting. Under-counting
-			// is consistent with the optimistic accounting everywhere else.
-			if p != fsRoot && d != nil && d.IsDir() {
-				return fs.SkipDir
-			}
-			return nil
-		}
-		if d.Type().IsRegular() {
-			if info, err := d.Info(); err == nil {
-				total += info.Size()
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return 0, fmt.Errorf("while backfilling size of %q: %w", layerDir, err)
-	}
-	// Best-effort: the write failing just means we backfill again next time.
-	// Preserve the dir mtime (our eviction age signal) across the write.
-	if fi, statErr := os.Stat(layerDir); statErr == nil {
-		if err := os.WriteFile(filepath.Join(layerDir, layerSizeFileName), []byte(strconv.FormatInt(total, 10)+"\n"), 0o600); err == nil {
-			_ = os.Chtimes(layerDir, fi.ModTime(), fi.ModTime())
-		}
-	}
-	return total, nil
-}
-
-// CacheSize returns the sum of recorded sizes of every layer in the pool.
-// It is the cache's own accounting (for --image-cache-max-bytes), distinct
-// from the volume usage the watermarks run on.
-func (s *Store) CacheSize() (int64, error) {
-	entries, err := os.ReadDir(s.layersDir())
-	if err != nil {
-		return 0, fmt.Errorf("while listing layer pool: %w", err)
-	}
-	var total int64
-	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), ".") || !e.IsDir() {
-			continue
-		}
-		n, err := s.layerSize(filepath.Join(s.layersDir(), e.Name()))
-		if err != nil {
-			slog.Warn("Failed to size layer", slog.String("layer", e.Name()), slog.Any("err", err))
-			continue
-		}
-		total += n
-	}
-	return total, nil
 }
 
 // --- root set ---

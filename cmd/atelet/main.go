@@ -247,7 +247,8 @@ func (s *AteomHerder) Run(ctx context.Context, req *ateletpb.RunRequest) (resp *
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	actorUID, atespace, actorName := req.GetActorUid(), req.GetAtespace(), req.GetActorName()
+	actorUID := req.GetActorUid()
+	actorRef := resources.ActorRef{Atespace: req.GetAtespace(), Name: req.GetActorName()}
 
 	sandboxRec, err := recordFromRequest(req.GetSandboxAssets())
 	if err != nil {
@@ -279,7 +280,7 @@ func (s *AteomHerder) Run(ctx context.Context, req *ateletpb.RunRequest) (resp *
 		return nil, fmt.Errorf("while recording sandbox assets: %w", err)
 	}
 
-	if err := s.prepareOCIBundles(ctx, actorUID, actorName,
+	if err := s.prepareOCIBundles(ctx, actorUID, actorRef.Name,
 		req.GetSpec(), req.GetTargetAteomUid(),
 	); err != nil {
 		return nil, ateerrors.CrashIfReason(ctx, err, ateerrors.ReasonInvalidContainerConfig)
@@ -293,8 +294,8 @@ func (s *AteomHerder) Run(ctx context.Context, req *ateletpb.RunRequest) (resp *
 	// Tell ateom to start the workload. gVisor uses RunscPath; the micro-VM
 	// runtime uses the full RuntimeAssetPaths set.
 	if _, err := client.RunWorkload(ctx, &ateompb.RunWorkloadRequest{
-		Atespace:               atespace,
-		ActorName:              actorName,
+		Atespace:               actorRef.Atespace,
+		ActorName:              actorRef.Name,
 		ActorTemplateNamespace: req.GetActorTemplateNamespace(),
 		ActorTemplateName:      req.GetActorTemplateName(),
 		RunscPath:              runscPathFor(assetPaths),
@@ -349,7 +350,8 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	actorUID, atespace, actorName := req.GetActorUid(), req.GetAtespace(), req.GetActorName()
+	actorUID := req.GetActorUid()
+	actorRef := resources.ActorRef{Atespace: req.GetAtespace(), Name: req.GetActorName()}
 
 	// Checkpoint requests no longer carry the sandbox config; recover the
 	// version this actor was started with from the on-node record and re-fetch
@@ -375,8 +377,8 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 	// exact files it wrote so we ship precisely that set (gVisor's image files,
 	// cloud-hypervisor's snapshot set, ...) rather than a hardcoded list.
 	resp, err := client.CheckpointWorkload(ctx, &ateompb.CheckpointWorkloadRequest{
-		Atespace:               atespace,
-		ActorName:              actorName,
+		Atespace:               actorRef.Atespace,
+		ActorName:              actorRef.Name,
 		ActorTemplateNamespace: req.GetActorTemplateNamespace(),
 		ActorTemplateName:      req.GetActorTemplateName(),
 		RunscPath:              runscPathFor(assetPaths),
@@ -395,6 +397,11 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 	if len(sandboxRec.SnapshotFiles) == 0 {
 		return nil, ateerrors.NewGRPCError(ctx, codes.DataLoss, ateerrors.ReasonInvalidCheckpointResult, ateerrors.ActorCrashedMetadata(), errors.New("ateom reported no snapshot files for checkpoint"))
 	}
+	sandboxRec.Atespace = req.GetAtespace()
+	sandboxRec.ActorName = req.GetActorName()
+	sandboxRec.ActorUID = req.GetActorUid()
+	sandboxRec.ActorTemplateNamespace = req.GetActorTemplateNamespace()
+	sandboxRec.ActorTemplateName = req.GetActorTemplateName()
 
 	switch req.GetType() {
 	case ateletpb.CheckpointType_CHECKPOINT_TYPE_EXTERNAL:
@@ -448,8 +455,7 @@ func (s *AteomHerder) moveLocalCheckpoint(ctx context.Context, req *ateletpb.Che
 		}
 	}
 
-	// Pin the sandbox binaries + snapshot file list into a manifest beside the
-	// images so a later Restore is self-describing.
+	// Write the self-describing snapshot manifest beside the images.
 	manifest, err := json.Marshal(rec)
 	if err != nil {
 		return fmt.Errorf("while marshaling snapshot manifest: %w", err)
@@ -481,8 +487,7 @@ func (s *AteomHerder) uploadExternalCheckpoint(ctx context.Context, req *ateletp
 		return err
 	}
 
-	// Pin the sandbox binaries + snapshot file list into a manifest beside the
-	// images, written last, so a Restore on any node is self-describing.
+	// Write the self-describing snapshot manifest last.
 	manifest, err := json.Marshal(rec)
 	if err != nil {
 		return fmt.Errorf("while marshaling snapshot manifest: %w", err)
@@ -498,7 +503,8 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	actorUID, atespace, actorName := req.GetActorUid(), req.GetAtespace(), req.GetActorName()
+	actorUID := req.GetActorUid()
+	actorRef := resources.ActorRef{Atespace: req.GetAtespace(), Name: req.GetActorName()}
 
 	// Not crashing the actor, because terminal errors here indicate problems with atelet,
 	// node or the disk itself.
@@ -585,7 +591,7 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 			return ateerrors.CrashIfReason(ctx, err, ateerrors.ReasonFailedGetExternalObject, ateerrors.ReasonInvalidObjectURL, ateerrors.ReasonTerminalFileSystemError, ateerrors.ReasonInvalidSandboxAsset)
 		}
 		t := time.Now()
-		if err := s.prepareOCIBundles(gctx, actorUID, actorName, req.GetSpec(), req.GetTargetAteomUid()); err != nil {
+		if err := s.prepareOCIBundles(gctx, actorUID, actorRef.Name, req.GetSpec(), req.GetTargetAteomUid()); err != nil {
 			return ateerrors.CrashIfReason(ctx, err, ateerrors.ReasonTerminalFileSystemError, ateerrors.ReasonInvalidContainerConfig)
 		}
 		dBundles = time.Since(t)
@@ -604,8 +610,8 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 	// all application containers.
 	tAteom := time.Now()
 	if _, err := client.RestoreWorkload(ctx, &ateompb.RestoreWorkloadRequest{
-		Atespace:               atespace,
-		ActorName:              actorName,
+		Atespace:               actorRef.Atespace,
+		ActorName:              actorRef.Name,
 		ActorTemplateNamespace: req.GetActorTemplateNamespace(),
 		ActorTemplateName:      req.GetActorTemplateName(),
 		RunscPath:              runscPathFor(assetPaths),
@@ -626,7 +632,7 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 		return nil, ateerrors.CrashIfReason(ctx, err, ateerrors.ReasonTerminalFileSystemError)
 	}
 
-	slog.InfoContext(ctx, "Restore timing breakdown", slog.String("actor", actorName),
+	slog.InfoContext(ctx, "Restore timing breakdown", slog.Any("actor", actorRef),
 		slog.Duration("download", dDownload),   // rustfs/GCS fetch + decompress (or local copy)
 		slog.Duration("oci_unpack", dBundles),  // prepareOCIBundles: unpack the OCI image to the bundle
 		slog.Duration("ateom_restore", dAteom), // ateom.RestoreWorkload (see its own breakdown)

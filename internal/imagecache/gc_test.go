@@ -29,15 +29,6 @@ import (
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 )
 
-// backdate shifts path's mtime age into the past.
-func backdate(t *testing.T, path string, age time.Duration) {
-	t.Helper()
-	past := time.Now().Add(-age)
-	if err := os.Chtimes(path, past, past); err != nil {
-		t.Fatalf("backdating %q: %v", path, err)
-	}
-}
-
 // backdateStore ages every image record and layer dir so the min-age veto
 // no longer applies, making eviction tests deterministic without sleeps.
 func backdateStore(t *testing.T, s *Store, age time.Duration) {
@@ -56,15 +47,6 @@ func backdateStore(t *testing.T, s *Store, age time.Duration) {
 	}
 }
 
-func mustEnsure(t *testing.T, s *Store, ref string) *Image {
-	t.Helper()
-	img, err := s.EnsureImage(context.Background(), ref)
-	if err != nil {
-		t.Fatalf("EnsureImage(%q): %v", ref, err)
-	}
-	return img
-}
-
 func layerDirsOnDisk(t *testing.T, s *Store) []string {
 	t.Helper()
 	entries, err := os.ReadDir(s.layersDir())
@@ -78,80 +60,6 @@ func layerDirsOnDisk(t *testing.T, s *Store) []string {
 		}
 	}
 	return out
-}
-
-func TestLayerSizeRecordedAndBackfilled(t *testing.T) {
-	_, host := newTestRegistry(t)
-	ref := host + "/test/sized:latest"
-	pushImage(t, ref, v1.Config{}, layerFromEntries(t, []tarEntry{
-		{name: "data", typeflag: tar.TypeReg, mode: 0o644, body: strings.Repeat("x", 4096)},
-	}))
-
-	store := newTestStore(t)
-	img := mustEnsure(t, store, ref)
-
-	sizePath := filepath.Join(img.LayerDirs[0], layerSizeFileName)
-	if _, err := os.Stat(sizePath); err != nil {
-		t.Fatalf("size file not written at unpack: %v", err)
-	}
-	recorded, err := store.layerSize(img.LayerDirs[0])
-	if err != nil {
-		t.Fatalf("layerSize: %v", err)
-	}
-	if recorded < 4096 {
-		t.Errorf("recorded size = %d, want >= 4096 (content bytes)", recorded)
-	}
-
-	// Backfill: delete the size file (simulating a Phase-1 layer), backdate
-	// the dir (the delete itself bumps its mtime), and check the size is
-	// recomputed and rewritten without disturbing the dir mtime — the
-	// eviction age signal. Backfill counts file content bytes, so it may be
-	// smaller than the unpack-time tar-stream count; both are valid
-	// optimistic estimates.
-	if err := os.Remove(sizePath); err != nil {
-		t.Fatal(err)
-	}
-	backdate(t, img.LayerDirs[0], time.Hour)
-	before, _ := os.Stat(img.LayerDirs[0])
-	refilled, err := store.layerSize(img.LayerDirs[0])
-	if err != nil {
-		t.Fatalf("layerSize backfill: %v", err)
-	}
-	if refilled < 4096 {
-		t.Errorf("backfilled size = %d, want >= 4096", refilled)
-	}
-	if _, err := os.Stat(sizePath); err != nil {
-		t.Errorf("backfill did not rewrite the size file: %v", err)
-	}
-	after, _ := os.Stat(img.LayerDirs[0])
-	if !after.ModTime().Equal(before.ModTime()) {
-		t.Errorf("backfill changed the layer dir mtime (eviction age signal): %v -> %v", before.ModTime(), after.ModTime())
-	}
-
-	if total, err := store.CacheSize(); err != nil || total < refilled {
-		t.Errorf("CacheSize() = %d, %v; want >= %d", total, err, refilled)
-	}
-}
-
-func TestEnsureImageHitTouchesRecord(t *testing.T) {
-	_, host := newTestRegistry(t)
-	ref := host + "/test/touch:latest"
-	pushImage(t, ref, v1.Config{}, layerFromEntries(t, []tarEntry{
-		{name: "f", typeflag: tar.TypeReg, mode: 0o644, body: "hi"},
-	}))
-
-	store := newTestStore(t)
-	img := mustEnsure(t, store, ref)
-
-	recPath := store.recordPath(img.Digest)
-	backdate(t, recPath, time.Hour)
-	stale, _ := os.Stat(recPath)
-
-	mustEnsure(t, store, ref) // cache hit
-	fresh, _ := os.Stat(recPath)
-	if !fresh.ModTime().After(stale.ModTime()) {
-		t.Errorf("cache hit did not advance record mtime: %v -> %v", stale.ModTime(), fresh.ModTime())
-	}
 }
 
 func TestEvictUnusedMinAgeVeto(t *testing.T) {
