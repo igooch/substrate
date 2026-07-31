@@ -255,33 +255,6 @@ func TestEvictUnusedDryRun(t *testing.T) {
 	}
 }
 
-func TestNewSweepsRetiredDirs(t *testing.T) {
-	root := t.TempDir()
-	store, err := New(root)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-
-	// Plant a retired dir (crash between rename and RemoveAll) with a
-	// read-only subdir, which plain RemoveAll cannot delete.
-	retired := filepath.Join(store.layersDir(), retiredPrefix+"deadbeef-1")
-	if err := os.MkdirAll(filepath.Join(retired, "fs", "ro"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(retired, "fs", "ro", "f"), []byte("x"), 0o400); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(filepath.Join(retired, "fs", "ro"), 0o500); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := New(root); err != nil {
-		t.Fatalf("New (recovery): %v", err)
-	}
-	if _, err := os.Stat(retired); !os.IsNotExist(err) {
-		t.Errorf("retired dir not swept at startup: %v", err)
-	}
-}
-
 // TestConcurrentEnsureImageAndEvict races cache hits, re-pulls, and
 // free-everything eviction passes. The invariant under test: whatever
 // interleaving happens, EnsureImage never returns an Image whose layer

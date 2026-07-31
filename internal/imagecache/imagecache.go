@@ -84,13 +84,6 @@ const (
 	// across nodes.
 	layerSizeFileName = "size"
 
-	// retiredPrefix marks a layer dir that eviction has atomically renamed
-	// aside and no longer exists by diffid. The slow RemoveAll happens after
-	// the rename, outside all locks; a crash in between leaves the dir for
-	// sweepTempDirs. The prefix shares the dot-hidden namespace with ".tmp-"
-	// so diffid-named dirs can never collide with it.
-	retiredPrefix = ".rm-"
-
 	defaultMinAge = 2 * time.Minute
 
 	// layerPullConcurrency bounds concurrent layer download+unpack streams per
@@ -253,11 +246,11 @@ func (s *Store) recordPath(digest v1.Hash) string {
 	return filepath.Join(s.root, "manifests", digest.Algorithm, digest.Hex+".json")
 }
 
-// sweepTempDirs removes unpack temp dirs, retired layer dirs, manifest-record
-// temp files orphaned by a crash. A layer dir without the
-// temp/retired prefix and a record without a leading dot are always complete
-// (both are moved into place with a single rename), so this is the only
-// recovery the pool needs.
+// sweepTempDirs removes unpack temp dirs, retired layer dirs, and
+// manifest-record temp files orphaned by a crash. A layer dir without the
+// temp/retired prefix and a record without a leading dot are always
+// complete (both are moved into place with a single rename), so this is
+// the only recovery the pool needs.
 func (s *Store) sweepTempDirs() error {
 	entries, err := os.ReadDir(s.layersDir())
 	if err != nil {
@@ -265,15 +258,16 @@ func (s *Store) sweepTempDirs() error {
 	}
 	swept := 0
 	for _, e := range entries {
-		// ".tmp-": an unpack in flight at crash. ".rm-": a layer eviction
-		// renamed aside but not yet removed. Either way, unreferenced garbage.
+		// ".tmp-": an unpack in flight at crash. ".rm-": a layer retirement
+		// renamed aside but not yet removed. Either way, unreferenced
+		// garbage.
 		if !strings.HasPrefix(e.Name(), ".tmp-") && !strings.HasPrefix(e.Name(), retiredPrefix) {
 			continue
 		}
 		p := filepath.Join(s.layersDir(), e.Name())
 		slog.Info("Image cache sweeping orphaned layer dir", slog.String("dir", e.Name()))
 		if err := RemoveAllWritable(p); err != nil {
-			return fmt.Errorf("while sweeping orphaned layer temp dir %q: %w", p, err)
+			return fmt.Errorf("while sweeping orphaned layer dir %q: %w", p, err)
 		}
 		swept++
 	}
@@ -535,15 +529,16 @@ func (s *Store) pull(ctx context.Context, parsedRef name.Reference, digest v1.Ha
 // collapsing concurrent requests for the same layer across images.
 func (s *Store) ensureLayer(ctx context.Context, diffID v1.Hash, layer v1.Layer) (string, error) {
 	dir := s.layerDir(diffID)
-	_, err, _ := s.layerSF.Do(diffID.String(), func() (any, error) {
+	_, err, _ := s.layerSF.Do(layerFlightKey(diffID.Hex), func() (any, error) {
 		if _, err := os.Stat(filepath.Join(dir, layerFSDirName)); err == nil {
-			// Refresh the dir mtime inside the flight: eviction's retire step
-			// runs in this same singleflight and re-checks the mtime against
-			// its min-age cutoff, so a layer reused here can never be renamed
-			// away between this stat and the image record that will
-			// re-reference it.
+			// Refresh the dir mtime inside the flight: retireLayer re-checks
+			// the mtime in this same flight, so a layer reused here can
+			// never be renamed away between this stat and the image record
+			// that will re-reference it.
 			now := time.Now()
-			_ = os.Chtimes(dir, now, now)
+			if err := os.Chtimes(dir, now, now); err != nil {
+				slog.WarnContext(ctx, "Failed to refresh layer mtime on reuse", slog.String("diffid", diffID.String()), slog.Any("err", err))
+			}
 			return nil, nil
 		}
 		return nil, s.unpackLayerToPool(ctx, diffID, layer)
