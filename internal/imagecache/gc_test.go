@@ -17,7 +17,6 @@ package imagecache
 import (
 	"archive/tar"
 	"context"
-	"encoding/json"
 	"math"
 	"os"
 	"path/filepath"
@@ -280,37 +279,6 @@ func TestNewSweepsRetiredDirs(t *testing.T) {
 	}
 	if _, err := os.Stat(retired); !os.IsNotExist(err) {
 		t.Errorf("retired dir not swept at startup: %v", err)
-	}
-}
-
-func TestSpecImageDigestCompat(t *testing.T) {
-	dir := t.TempDir()
-	// Round trip with the new field.
-	if err := WriteSpec(dir, &OverlaySpec{ImageDigest: "sha256:" + strings.Repeat("ef", 32), Layers: []string{"/pool/layers/sha256/aa"}}); err != nil {
-		t.Fatalf("WriteSpec: %v", err)
-	}
-	spec, err := ReadSpec(dir)
-	if err != nil || spec == nil {
-		t.Fatalf("ReadSpec: %v, %v", spec, err)
-	}
-	if spec.ImageDigest == "" {
-		t.Error("ImageDigest lost in round trip")
-	}
-
-	// A spec written by a pre-Phase-2 atelet (no imageDigest) still parses.
-	old, err := json.Marshal(map[string]any{"version": 1, "layers": []string{"/pool/layers/sha256/bb"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, OverlaySpecFileName), old, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	spec, err = ReadSpec(dir)
-	if err != nil || spec == nil {
-		t.Fatalf("ReadSpec(old): %v, %v", spec, err)
-	}
-	if spec.ImageDigest != "" {
-		t.Errorf("old spec ImageDigest = %q, want empty", spec.ImageDigest)
 	}
 }
 

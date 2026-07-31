@@ -38,9 +38,11 @@ const OverlaySpecFileName = "rootfs-overlay.json"
 type OverlaySpec struct {
 	Version int `json:"version"`
 	// ImageDigest is the manifest digest the bundle's image ref resolved to
-	// (e.g. "sha256:<hex>"). The cache GC's root-set scan uses it to protect
-	// the whole image record while this bundle exists; consumers ignore it.
-	// Optional: specs written before it existed protect only their Layers.
+	// ("sha256:<hex>"). For a multi-arch ref this is the index digest; the
+	// cache may hold a twin record under the platform-child digest, and GC
+	// must treat the pair as one image. The GC's root-set scan uses it to
+	// protect the image while the bundle exists; consumers ignore it.
+	// Optional: older specs lack it.
 	ImageDigest string `json:"imageDigest,omitempty"`
 	// Layers are the cached layer directories (each holding its tree under
 	// fs/), bottom-most layer first — the order the image manifest lists
@@ -55,11 +57,10 @@ type OverlaySpec struct {
 
 // WriteSpec writes spec into the bundle at bundlePath.
 //
-// The write is atomic (temp file + rename): the cache's eviction root-set
-// scan reads these files concurrently from another goroutine, and a reader
-// that observed a half-written spec would under-report the layers an actor
-// is using — i.e. fail toward deleting them. Readers therefore see either
-// the previous spec or the complete new one.
+// The write is atomic (temp file + rename): concurrent readers — notably
+// the cache GC's root-set scan — must never see a partial spec, which
+// could parse with layers missing and leave them eligible for eviction
+// while the actor is using them.
 func WriteSpec(bundlePath string, spec *OverlaySpec) error {
 	spec.Version = 1
 	b, err := json.MarshalIndent(spec, "", "  ")
