@@ -161,17 +161,15 @@ func runImageCacheGCPass(ctx context.Context, store *imagecache.Store, cacheDir 
 	capacity := st.Blocks * uint64(st.Bsize)
 	available := st.Bavail * uint64(st.Bsize)
 
-	// A sizing error is not fatal to the pass: the watermark half needs
-	// only statfs, and the orphan sweep runs regardless of target.
+	// A sizing error is not fatal to the pass: the watermark half of the
+	// target needs only statfs.
 	cacheSize, err := store.CacheSize()
 	if err != nil {
-		slog.WarnContext(ctx, "Image cache GC: sizing the pool failed; continuing with the orphan sweep",
+		slog.WarnContext(ctx, "Image cache GC: sizing the pool failed; watermark target only this pass",
 			slog.Any("err", err))
 		cacheSize = 0
 	}
 
-	// Runs every tick even at target 0: the orphan sweep reclaims layers
-	// no record references, which nothing else can free.
 	target := imageCacheGCTarget(capacity, available, cacheSize, *imageCacheMaxBytes, *imageCacheHighPct, *imageCacheLowPct)
 
 	tStart := time.Now()
@@ -191,6 +189,13 @@ func runImageCacheGCPass(ctx context.Context, store *imagecache.Store, cacheDir 
 		slog.Duration("took", time.Since(tStart)),
 	}
 	if err != nil {
+		if stats.Candidates == 0 && stats.EvictedImages == 0 {
+			// Enumeration-gated pass: nothing was attempted, so this is a
+			// wedged pass, not a shortfall — the shortfall accounting below
+			// would misread the zero stats as "cache cannot give more".
+			slog.ErrorContext(ctx, "Image cache GC pass skipped", append(attrs, slog.Any("err", err))...)
+			return
+		}
 		// Per-item failures were already skipped inside the pass; log the
 		// aggregate and let the next pass retry.
 		slog.WarnContext(ctx, "Image cache GC pass finished with errors", append(attrs, slog.Any("err", err))...)
