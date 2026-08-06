@@ -43,6 +43,7 @@ type SuspendInput struct {
 type SuspendState struct {
 	Actor         *ateapipb.Actor
 	ActorTemplate *atev1alpha1.ActorTemplate
+	SourceVersion int64
 }
 
 type LoadActorForSuspendStep struct {
@@ -64,6 +65,10 @@ func (s *LoadActorForSuspendStep) Execute(ctx context.Context, input *SuspendInp
 		return err
 	}
 	state.Actor = actor
+	state.SourceVersion = actor.GetMetadata().GetVersion()
+	if actor.GetStatus() == ateapipb.Actor_STATUS_SUSPENDING {
+		state.SourceVersion = actor.GetInProgressSnapshotSourceActorVersion()
+	}
 
 	actorTemplate, err := s.actorTemplateLister.ActorTemplates(actor.GetActorTemplateNamespace()).Get(actor.GetActorTemplateName())
 	if err != nil {
@@ -93,6 +98,7 @@ func (s *MarkSuspendingStep) CheckPrerequisite(ctx context.Context, input *Suspe
 }
 func (s *MarkSuspendingStep) Execute(ctx context.Context, input *SuspendInput, state *SuspendState) error {
 	state.Actor.Status = ateapipb.Actor_STATUS_SUSPENDING
+	state.Actor.InProgressSnapshotSourceActorVersion = state.SourceVersion
 	snapshotID := time.Now().Format(time.RFC3339) + "-" + rand.Text()
 	state.Actor.InProgressSnapshot = strings.TrimSuffix(state.ActorTemplate.Spec.SnapshotsConfig.Location, "/") + "/snapshots/" + snapshotID
 	updatedActor, err := s.store.UpdateActor(ctx, state.Actor, state.Actor.GetMetadata().GetVersion())
@@ -104,6 +110,18 @@ func (s *MarkSuspendingStep) Execute(ctx context.Context, input *SuspendInput, s
 }
 
 func (s *MarkSuspendingStep) RetryBackoff() *wait.Backoff { return nil }
+
+// commitSnapshotScope returns the scope a commit (suspend) snapshot is taken
+// with. Golden actors always commit Full regardless of the template's
+// onCommit: the golden snapshot is the base an OnGolden data resume is
+// combined with at restore, so it must carry the guest memory and filesystem
+// — a data-only golden would leave nothing to restore the guest from.
+func commitSnapshotScope(atespace string, tmpl *atev1alpha1.ActorTemplate) atev1alpha1.SnapshotScope {
+	if atespace == resources.GoldenActorAtespace {
+		return atev1alpha1.SnapshotScopeFull
+	}
+	return tmpl.Spec.SnapshotsConfig.OnCommit
+}
 
 type CallAteletSuspendStep struct {
 	store  store.Interface
@@ -162,7 +180,7 @@ func (s *CallAteletSuspendStep) Execute(ctx context.Context, input *SuspendInput
 				SnapshotUriPrefix: state.Actor.GetInProgressSnapshot(),
 			},
 		},
-		Scope:    toAteletSnapshotScope(state.ActorTemplate.Spec.SnapshotsConfig.OnCommit),
+		Scope:    toAteletSnapshotScope(commitSnapshotScope(state.Actor.GetMetadata().GetAtespace(), state.ActorTemplate)),
 		ActorUid: state.Actor.GetMetadata().Uid,
 	}
 
@@ -246,19 +264,31 @@ func (s *FinalizeSuspendedStep) Execute(ctx context.Context, input *SuspendInput
 		}
 		latestActor.Status = ateapipb.Actor_STATUS_SUSPENDED
 		if latestActor.InProgressSnapshot != "" {
-			latestActor.LatestSnapshotInfo = &ateapipb.SnapshotInfo{
-				Data: &ateapipb.SnapshotInfo_External{
-					External: &ateapipb.ExternalSnapshotInfo{
-						SnapshotUriPrefix: latestActor.InProgressSnapshot,
-					},
-				},
+			location := latestActor.InProgressSnapshot
+			prefix := strings.TrimSuffix(state.ActorTemplate.Spec.SnapshotsConfig.Location, "/") + "/snapshots/"
+			snapshotID := strings.ToLower(strings.NewReplacer(":", "-", "+", "-").Replace(strings.TrimPrefix(location, prefix)))
+			snapshot := &ateapipb.ActorSnapshot{
+				Metadata:               &ateapipb.ResourceMetadata{Atespace: input.ActorRef.Atespace, Name: snapshotID},
+				SourceActor:            input.ActorRef.ToObjectRef(),
+				SourceActorUid:         latestActor.GetMetadata().GetUid(),
+				SourceActorVersion:     state.SourceVersion,
+				ActorTemplateNamespace: latestActor.GetActorTemplateNamespace(),
+				ActorTemplateName:      latestActor.GetActorTemplateName(),
+				ActorTemplateUid:       string(state.ActorTemplate.GetUID()),
+				ContentScope:           toActorSnapshotContentScope(commitSnapshotScope(input.ActorRef.Atespace, state.ActorTemplate)),
 			}
+			if _, err := s.store.CreateActorSnapshot(ctx, snapshot, location); err != nil && !errors.Is(err, store.ErrAlreadyExists) {
+				return err
+			}
+			latestActor.LatestSnapshot = &ateapipb.ObjectRef{Atespace: input.ActorRef.Atespace, Name: snapshotID}
 			latestActor.InProgressSnapshot = ""
+			latestActor.InProgressSnapshotSourceActorVersion = 0
 		}
 		latestActor.AteomPodNamespace = ""
 		latestActor.AteomPodName = ""
 		latestActor.AteomPodIp = ""
 		latestActor.WorkerPoolName = ""
+		latestActor.LocalSnapshotInfo = nil
 		updatedActor, err := s.store.UpdateActor(ctx, latestActor, latestActor.GetMetadata().GetVersion())
 		if err != nil {
 			return err

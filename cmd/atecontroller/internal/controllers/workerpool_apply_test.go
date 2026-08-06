@@ -201,7 +201,7 @@ func TestBuildDeploymentApplyConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := buildDeploymentApplyConfig(tt.wp, "")
+			got := buildDeploymentApplyConfig(tt.wp, ateomOTelSettings{})
 			if diff := cmp.Diff(tt.want, got); diff != "" {
 				t.Fatalf("buildDeploymentApplyConfig() mismatch (-want +got):\n%s", diff)
 			}
@@ -226,7 +226,7 @@ func TestMicroVMPodShape(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			wp := testWorkerPoolApplyConfig(nil)
 			wp.Spec.SandboxClass = tt.class
-			ps := buildDeploymentApplyConfig(wp, "").Spec.Template.Spec
+			ps := buildDeploymentApplyConfig(wp, ateomOTelSettings{}).Spec.Template.Spec
 
 			hasVol := false
 			for _, v := range ps.Volumes {
@@ -325,7 +325,7 @@ func TestTerminationGracePeriodSeconds(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			wp := testWorkerPoolApplyConfig(nil)
 			wp.Spec.TerminationGracePeriodSeconds = tt.set
-			ps := buildDeploymentApplyConfig(wp, "").Spec.Template.Spec
+			ps := buildDeploymentApplyConfig(wp, ateomOTelSettings{}).Spec.Template.Spec
 			if ps.TerminationGracePeriodSeconds == nil {
 				t.Fatalf("TerminationGracePeriodSeconds not set")
 			}
@@ -351,7 +351,7 @@ func TestBuildDeploymentApplyConfigOTelEndpoint(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), tt.endpoint).
+			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), ateomOTelSettings{Endpoint: tt.endpoint}).
 				Spec.Template.Spec.Containers[0]
 			env := envByName(c.Env)
 
@@ -360,7 +360,7 @@ func TestBuildDeploymentApplyConfigOTelEndpoint(t *testing.T) {
 			}
 
 			if !tt.wantTelemetry {
-				for _, k := range []string{"OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_RESOURCE_ATTRIBUTES", "POD_NAME", "POD_NAMESPACE"} {
+				for _, k := range []string{"OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_RESOURCE_ATTRIBUTES", "OTEL_METRIC_EXPORT_INTERVAL", "OTEL_METRIC_EXPORT_TIMEOUT", "POD_NAME", "POD_NAMESPACE"} {
 					if _, ok := env[k]; ok {
 						t.Errorf("%s must be absent without an OTLP endpoint", k)
 					}
@@ -382,6 +382,122 @@ func TestBuildDeploymentApplyConfigOTelEndpoint(t *testing.T) {
 				}
 				if env[ref].index > raIdx {
 					t.Errorf("%s (index %d) must precede OTEL_RESOURCE_ATTRIBUTES (index %d)", ref, env[ref].index, raIdx)
+				}
+			}
+		})
+	}
+}
+
+// TestBuildDeploymentApplyConfigMetricExportTuning asserts the export interval and
+// per-export timeout reach the ateom container only when each is set alongside an
+// endpoint. ateom is invisible to the collector until its first successful export
+// tick, so the kind stack shortens the SDK's 60s interval to keep that gap inside
+// the e2e budget, and its 30s timeout so a failing tick cannot swallow three
+// shortened intervals.
+func TestBuildDeploymentApplyConfigMetricExportTuning(t *testing.T) {
+	const endpoint = "http://collector.otel-system.svc:4317"
+	tests := []struct {
+		name string
+		otel ateomOTelSettings
+		want map[string]string // env name -> value; absent key means must not be set
+	}{
+		{
+			name: "unset keeps SDK defaults",
+			otel: ateomOTelSettings{Endpoint: endpoint},
+			want: nil,
+		},
+		{
+			name: "both set with endpoint",
+			otel: ateomOTelSettings{Endpoint: endpoint, MetricExportInterval: "10000", MetricExportTimeout: "10000"},
+			want: map[string]string{"OTEL_METRIC_EXPORT_INTERVAL": "10000", "OTEL_METRIC_EXPORT_TIMEOUT": "10000"},
+		},
+		{
+			name: "interval alone",
+			otel: ateomOTelSettings{Endpoint: endpoint, MetricExportInterval: "10000"},
+			want: map[string]string{"OTEL_METRIC_EXPORT_INTERVAL": "10000"},
+		},
+		{
+			name: "timeout alone",
+			otel: ateomOTelSettings{Endpoint: endpoint, MetricExportTimeout: "10000"},
+			want: map[string]string{"OTEL_METRIC_EXPORT_TIMEOUT": "10000"},
+		},
+		{
+			name: "ignored without endpoint",
+			otel: ateomOTelSettings{MetricExportInterval: "10000", MetricExportTimeout: "10000"},
+			want: nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), tt.otel).
+				Spec.Template.Spec.Containers[0]
+			env := envByName(c.Env)
+			for _, k := range []string{"OTEL_METRIC_EXPORT_INTERVAL", "OTEL_METRIC_EXPORT_TIMEOUT"} {
+				got, ok := env[k]
+				want, wantSet := tt.want[k]
+				if ok != wantSet {
+					t.Errorf("%s present = %v, want %v", k, ok, wantSet)
+					continue
+				}
+				if ok && got.value != want {
+					t.Errorf("%s = %q, want %q", k, got.value, want)
+				}
+			}
+		})
+	}
+}
+
+// TestBuildDeploymentApplyConfigTracesSamplerPropagation asserts the sampler
+// env pair reaches the ateom container only alongside an endpoint, and the arg
+// only alongside a sampler: an arg without a sampler name is dead config the
+// SDK ignores.
+func TestBuildDeploymentApplyConfigTracesSamplerPropagation(t *testing.T) {
+	const endpoint = "http://collector.otel-system.svc:4317"
+	tests := []struct {
+		name string
+		otel ateomOTelSettings
+		want map[string]string // value by env name; absent key means must not be set
+	}{
+		{
+			name: "unset keeps binary default",
+			otel: ateomOTelSettings{Endpoint: endpoint},
+			want: nil,
+		},
+		{
+			name: "sampler and arg with endpoint",
+			otel: ateomOTelSettings{Endpoint: endpoint, TracesSampler: "parentbased_traceidratio", TracesSamplerArg: "0.25"},
+			want: map[string]string{"OTEL_TRACES_SAMPLER": "parentbased_traceidratio", "OTEL_TRACES_SAMPLER_ARG": "0.25"},
+		},
+		{
+			name: "sampler alone",
+			otel: ateomOTelSettings{Endpoint: endpoint, TracesSampler: "parentbased_always_on"},
+			want: map[string]string{"OTEL_TRACES_SAMPLER": "parentbased_always_on"},
+		},
+		{
+			name: "arg alone stays unset",
+			otel: ateomOTelSettings{Endpoint: endpoint, TracesSamplerArg: "0.25"},
+			want: nil,
+		},
+		{
+			name: "ignored without endpoint",
+			otel: ateomOTelSettings{TracesSampler: "parentbased_traceidratio", TracesSamplerArg: "0.25"},
+			want: nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), tt.otel).
+				Spec.Template.Spec.Containers[0]
+			env := envByName(c.Env)
+			for _, k := range []string{"OTEL_TRACES_SAMPLER", "OTEL_TRACES_SAMPLER_ARG"} {
+				got, ok := env[k]
+				want, wantSet := tt.want[k]
+				if ok != wantSet {
+					t.Errorf("%s present = %v, want %v", k, ok, wantSet)
+					continue
+				}
+				if ok && got.value != want {
+					t.Errorf("%s = %q, want %q", k, got.value, want)
 				}
 			}
 		})
@@ -426,15 +542,57 @@ func expectedDeploymentApplyConfig(mutatePodSpec func(*corev1ac.PodSpecApplyConf
 		WithSecurityContext(corev1ac.PodSecurityContext().
 			WithRunAsUser(0).
 			WithRunAsGroup(0)).
-		WithVolumes(corev1ac.Volume().
-			WithName("run-ateom").
-			WithHostPath(corev1ac.HostPathVolumeSource().
-				WithPath(ateompath.BasePath).
-				WithType(corev1.HostPathDirectoryOrCreate))).
+		WithVolumes(
+			corev1ac.Volume().
+				WithName("run-ateom").
+				WithHostPath(corev1ac.HostPathVolumeSource().
+					WithPath(ateompath.BasePath).
+					WithType(corev1.HostPathDirectoryOrCreate)),
+			corev1ac.Volume().
+				WithName(atunnelIdentityVolume).
+				WithProjected(corev1ac.ProjectedVolumeSource().
+					WithSources(
+						corev1ac.VolumeProjection().
+							WithPodCertificate(corev1ac.PodCertificateProjection().
+								WithSignerName("podidentity.podcert.ate.dev/identity").
+								WithKeyType("ECDSAP256").
+								WithCredentialBundlePath("credential-bundle.pem")),
+						corev1ac.VolumeProjection().
+							WithClusterTrustBundle(corev1ac.ClusterTrustBundleProjection().
+								WithSignerName("podidentity.podcert.ate.dev/identity").
+								WithLabelSelector(metav1ac.LabelSelector().
+									WithMatchLabels(map[string]string{"podcert.ate.dev/canarying": "live"})).
+								WithPath("trust-bundle.pem")),
+					),
+				),
+			corev1ac.Volume().
+				WithName(atunnelEgressTrustVolume).
+				WithProjected(corev1ac.ProjectedVolumeSource().
+					WithSources(
+						corev1ac.VolumeProjection().
+							WithClusterTrustBundle(corev1ac.ClusterTrustBundleProjection().
+								WithSignerName("servicedns.podcert.ate.dev/identity").
+								WithLabelSelector(metav1ac.LabelSelector().
+									WithMatchLabels(map[string]string{"podcert.ate.dev/canarying": "live"})).
+								WithPath("trust-bundle.pem")),
+					),
+				),
+		).
 		WithContainers(corev1ac.Container().
 			WithName("ateom").
 			WithImage(wp.Spec.AteomImage).
-			WithArgs("--pod-uid=$(POD_UID)").
+			WithArgs(
+				"--pod-uid=$(POD_UID)",
+				"--atunnel-listen-address=0.0.0.0:443",
+				"--atunnel-credential-bundle="+atunnelIdentityMountPath+"/credential-bundle.pem",
+				"--atunnel-trust-bundle="+atunnelIdentityMountPath+"/trust-bundle.pem",
+				"--atunnel-egress-listen-address=0.0.0.0:15001",
+				"--atunnel-egress-trust-bundle="+atunnelEgressTrustMountPath+"/trust-bundle.pem",
+			).
+			WithPorts(corev1ac.ContainerPort().
+				WithName("https").
+				WithContainerPort(443).
+				WithProtocol(corev1.ProtocolTCP)).
 			WithSecurityContext(corev1ac.SecurityContext().
 				WithRunAsUser(0).
 				WithRunAsGroup(0).
@@ -449,10 +607,20 @@ func expectedDeploymentApplyConfig(mutatePodSpec func(*corev1ac.PodSpecApplyConf
 				WithValueFrom(corev1ac.EnvVarSource().
 					WithFieldRef(corev1ac.ObjectFieldSelector().
 						WithFieldPath("metadata.uid")))).
-			WithVolumeMounts(corev1ac.VolumeMount().
-				WithName("run-ateom").
-				WithMountPath(ateompath.BasePath).
-				WithMountPropagation(corev1.MountPropagationHostToContainer)).
+			WithVolumeMounts(
+				corev1ac.VolumeMount().
+					WithName("run-ateom").
+					WithMountPath(ateompath.BasePath).
+					WithMountPropagation(corev1.MountPropagationHostToContainer),
+				corev1ac.VolumeMount().
+					WithName(atunnelIdentityVolume).
+					WithMountPath(atunnelIdentityMountPath).
+					WithReadOnly(true),
+				corev1ac.VolumeMount().
+					WithName(atunnelEgressTrustVolume).
+					WithMountPath(atunnelEgressTrustMountPath).
+					WithReadOnly(true),
+			).
 			WithResources(corev1ac.ResourceRequirements()))
 
 	podSpecAC.NodeSelector = map[string]string{}

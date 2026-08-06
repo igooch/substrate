@@ -19,6 +19,13 @@ import (
 	"time"
 )
 
+type atenetRouter string
+
+const (
+	atenetRouterEnvoy        atenetRouter = "envoy"
+	atenetRouterAgentgateway atenetRouter = "agentgateway"
+)
+
 // authConfig holds the router's client-auth settings for dialing ateapi.
 // AteapiCAFile always verifies ateapi's serving cert (the servicedns trust
 // bundle in-cluster). By default the router presents AteapiClientCertPath
@@ -36,6 +43,7 @@ type authConfig struct {
 // routerConfig holds deployment setup and endpoint options for the router node instance.
 type routerConfig struct {
 	Standalone     bool
+	AtenetRouter   string
 	Namespace      string
 	Kubeconfig     string
 	AteapiAddr     string
@@ -49,10 +57,26 @@ type routerConfig struct {
 	HealthInterval time.Duration
 	HttpsPort      int
 	EnvoyCertPath  string
-	LogLevel       string
-	MetricsAddr    string
-	// OtlpCollectorAddress is the host:port of the OTLP gRPC collector that
-	// Envoy reports tracing spans to. Empty disables Envoy-side tracing.
+
+	// UpstreamCredentialBundlePath is the router's podidentity credential bundle
+	// (cert+key) presented as the client cert when dialing the actor's atunnel
+	// ingress server over mTLS. UpstreamTrustBundlePath is the CA bundle used to
+	// validate that server. Empty UpstreamCredentialBundlePath disables upstream mTLS.
+	UpstreamCredentialBundlePath string
+	UpstreamTrustBundlePath      string
+	// UpstreamSpiffePrefix validates the actor's atunnel server cert by its
+	// SPIFFE URI SAN prefix (trust domain) instead of the dialed pod IP.
+	UpstreamSpiffePrefix string
+	LogLevel             string
+	MetricsAddr          string
+	// OtlpCollectorAddress is the OTLP gRPC collector that Envoy reports
+	// tracing spans to, as host:port or an http:// URL. It defaults to
+	// OTEL_EXPORTER_OTLP_ENDPOINT — Envoy gets its whole configuration over
+	// xDS and never reads the router's environment, so the router has to relay
+	// the address on its behalf. Empty disables Envoy-side tracing; the
+	// router's own exporter still reads the env var directly. An address Envoy
+	// cannot use disables Envoy-side tracing rather than failing startup — see
+	// setOtlpCollector.
 	OtlpCollectorAddress string
 
 	Auth authConfig
@@ -68,6 +92,13 @@ type routerConfig struct {
 	// excess is fast-path headroom for requests to already-running actors.
 	// 0 derives it from the parking lot — see extProcMaxRequests.
 	ExtProcMaxRequests int
+}
+
+func (c routerConfig) atenetRouter() atenetRouter {
+	if c.AtenetRouter == "" {
+		return atenetRouterEnvoy
+	}
+	return atenetRouter(c.AtenetRouter)
 }
 
 // extProcMaxRequestsFloor is the minimum derived circuit breaker — Envoy's own
@@ -93,9 +124,15 @@ func (c routerConfig) extProcMaxRequests() int {
 // validate rejects flag combinations that would make the router misbehave
 // rather than merely differ.
 func (c routerConfig) validate() error {
+	switch c.atenetRouter() {
+	case atenetRouterEnvoy, atenetRouterAgentgateway:
+	default:
+		return fmt.Errorf("--atenet-router must be %q or %q, got %q", atenetRouterEnvoy, atenetRouterAgentgateway, c.AtenetRouter)
+	}
 	if err := c.ParkedRequest.validate(); err != nil {
 		return err
 	}
+
 	if c.ExtProcMaxRequests < 0 {
 		return fmt.Errorf("--extproc-max-requests must not be negative, got %d (0 derives it from --parked-request-max)", c.ExtProcMaxRequests)
 	}

@@ -16,6 +16,7 @@ package router
 
 import (
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -41,6 +42,7 @@ func NewRouterCmd() *cobra.Command {
 	cmd.Flags().StringVar(&cfg.LogLevel, "log-level", "info", "Log level: debug, info, warn, error")
 	cmd.Flags().StringVar(&cfg.MetricsAddr, "metrics-listen-addr", ":9090", "Address and port the prometheus metrics server should listen on.")
 	cmd.Flags().BoolVar(&cfg.Standalone, "standalone", false, "Run in standalone mode, bypassing creation of managed deployment and services in Kubernetes cluster")
+	cmd.Flags().StringVar(&cfg.AtenetRouter, "atenet-router", string(atenetRouterEnvoy), "Router dataplane: envoy or agentgateway")
 	cmd.Flags().StringVar(&cfg.Namespace, "namespace", "default", "Target operations namespace")
 	cmd.Flags().StringVar(&cfg.Kubeconfig, "kubeconfig", "", "Absolute path to the kubeconfig configuration file")
 	cmd.Flags().StringVar(&cfg.AteapiAddr, "ateapi-address", "dns:///api.ate-system.svc:443", "gRPC dial target for the cluster ateapi Control instance.")
@@ -54,7 +56,14 @@ func NewRouterCmd() *cobra.Command {
 	cmd.Flags().DurationVar(&cfg.HealthInterval, "health-interval", 1*time.Second, "Interval for checking health of dependent services")
 	cmd.Flags().IntVar(&cfg.HttpsPort, "port-https", 8443, "TCP port for HTTPS workload traffic entering through the Envoy Router")
 	cmd.Flags().StringVar(&cfg.EnvoyCertPath, "envoy-cert-path", "", "Path to the Envoy certificate file.")
-	cmd.Flags().StringVar(&cfg.OtlpCollectorAddress, "otlp-collector-address", "", "host:port of the OTLP gRPC collector that Envoy reports tracing spans to (empty disables Envoy tracing)")
+	cmd.Flags().StringVar(&cfg.UpstreamCredentialBundlePath, "upstream-credential-bundle", "/run/podidentity.podcert.ate.dev/credential-bundle.pem", "PEM credential bundle (cert+key) the router presents as the client cert when dialing the actor's atunnel ingress server over mTLS. Empty disables upstream mTLS (legacy plaintext pod-IP:80).")
+	cmd.Flags().StringVar(&cfg.UpstreamTrustBundlePath, "upstream-trust-bundle", "/run/podidentity.podcert.ate.dev/trust-bundle.pem", "PEM trust bundle used to validate the actor's atunnel ingress server certificate.")
+	cmd.Flags().StringVar(&cfg.UpstreamSpiffePrefix, "upstream-spiffe-prefix", "spiffe://cluster.local/", "SPIFFE URI SAN prefix (trust domain) the actor's atunnel server cert must match. Empty falls back to default SAN check against the dialed pod IP (which SPIFFE-only certs never match).")
+	// Envoy learns the collector over xDS rather than from its own environment,
+	// so the router has to carry the address for it. Defaulting to
+	// OTEL_EXPORTER_OTLP_ENDPOINT — the same variable the router's own exporter
+	// reads — keeps one setting per pod, as in ate-apiserver and atelet.
+	cmd.Flags().StringVar(&cfg.OtlpCollectorAddress, "otlp-collector-address", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"), "OTLP gRPC collector that Envoy reports tracing spans to, as host:port or an http:// URL. Defaults to $OTEL_EXPORTER_OTLP_ENDPOINT. An address Envoy cannot use — an https endpoint, for one, since the tracer cluster is plaintext — disables Envoy-side tracing with a warning rather than failing startup. Pass empty to disable Envoy tracing while leaving the router's own spans enabled")
 	cmd.Flags().StringVar(&cfg.Auth.AteapiCAFile, "ateapi-ca-file", "", "PEM file with CAs trusted to verify the ateapi server cert. Required.")
 	cmd.Flags().StringVar(&cfg.Auth.AteapiClientCertPath, "ateapi-client-cert", "", "Credential bundle presented as the client certificate when dialing ateapi. Required unless --ateapi-use-token-auth is set, ignored otherwise.")
 	cmd.Flags().StringVar(&cfg.Auth.AteapiServerName, "ateapi-server-name", "", "SNI / hostname expected on the ateapi server cert. Optional.")

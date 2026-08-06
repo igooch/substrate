@@ -47,12 +47,20 @@ import (
 //     (restoreFullScope).
 //   - DATA: there is no guest to resume — re-materialize the durable-dir volumes and
 //     cold-boot the actor, which starts its containers afresh from the OCI image.
+//   - DATA_ON_GOLDEN: atelet staged a combined set into RestoreStateDir — the
+//     guest files (memory + VM state) from the template's golden snapshot plus
+//     the durable-dir tar from the actor's own snapshot — so this restores
+//     exactly like FULL: the golden guest resumes over the actor's data.
 //
 // Contract with atelet: the snapshot's files have been downloaded to RestoreStateDir,
 // and the durable-dir volume directories re-created (empty).
 func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.RestoreWorkloadRequest) (*ateompb.RestoreWorkloadResponse, error) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
+
+	if err := s.deactivateActorNetworking(ctx); err != nil {
+		return nil, err
+	}
 
 	p := actorBootParams{
 		actorRef:     resources.ActorRef{Atespace: req.GetAtespace(), Name: req.GetActorName()},
@@ -61,6 +69,9 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 		templateName: req.GetActorTemplateName(),
 		containers:   req.GetSpec().GetContainers(),
 		assetPaths:   req.GetRuntimeAssetPaths(),
+
+		actorVersion:         req.GetActorVersion(),
+		egressGatewayAddress: req.GetEgressGatewayAddress(),
 	}
 	restoreDir := ateompath.RestoreStateDir(p.actorUID)
 	durableDir := ateompath.DurableDirVolumeMountsDir(p.actorUID)
@@ -79,7 +90,12 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	}
 
 	switch scope := req.GetScope(); scope {
-	case ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL:
+	case ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL,
+		ateompb.SnapshotScope_SNAPSHOT_SCOPE_DATA_ON_GOLDEN:
+		// DATA_ON_GOLDEN: the restore dir holds the golden snapshot's guest
+		// files, and the untar above re-materialized the ACTOR's durable-dir
+		// data, so resuming the golden guest picks up the actor's data through
+		// the durable virtio-fs share.
 		if err := s.restoreFullScope(ctx, p, restoreDir, tStart); err != nil {
 			return nil, err
 		}
@@ -87,7 +103,7 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 		// A Data snapshot holds no guest state, so this is a cold boot that
 		// happens to start with the volumes already populated. readyz gating comes
 		// with the cold-boot path, so the actor is serving when we return.
-		if err := s.coldBootActor(ctx, p); err != nil {
+		if err := s.coldBootActorRetrying(ctx, p); err != nil {
 			return nil, err
 		}
 		slog.InfoContext(ctx, "Actor restored (durable-dir volumes, cold boot)",
@@ -187,6 +203,7 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 		InteriorNetNS:      s.interiorNetNS,
 		HostVethHWAddr:     hostVethHWAddr,
 		SweepInteriorLinks: true,
+		EgressRedirectPort: s.egressRedirectPort(p.egressGatewayAddress != ""),
 	}); err != nil {
 		return fmt.Errorf("while setting up actor network: %w", err)
 	}
@@ -281,6 +298,9 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 		}
 	}
 
+	if err := s.activateActorNetworking(p.actorRef.Atespace, p.actorRef.Name, p.actorVersion, p.egressGatewayAddress); err != nil {
+		return err
+	}
 	s.running[actorUID] = ra
 	slog.InfoContext(ctx, "Actor restored (overlay rootfs)",
 		slog.String("id", actorUID), slog.Duration("total", time.Since(tStart)))

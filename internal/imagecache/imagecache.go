@@ -84,6 +84,7 @@ const (
 	// across nodes.
 	layerSizeFileName = "size"
 
+	// defaultMinAge is the default eviction minimum age (see WithMinAge).
 	defaultMinAge = 2 * time.Minute
 
 	// layerPullConcurrency bounds concurrent layer download+unpack streams per
@@ -125,14 +126,10 @@ type Store struct {
 	// over the same candidates for no benefit).
 	evictMu sync.Mutex
 
-	// hitMu closes the last hit-vs-evict window: the cache-hit path holds it
-	// shared across its record read, layer stats, and last-use touch, and
-	// eviction holds it exclusive across each victim's final veto re-check
-	// and record removal. Either the hit's touch lands first (the re-check
-	// sees a fresh mtime and skips the image, layers included) or the
-	// removal lands first (the hit sees no record and falls into the pull
-	// path, which is fully serialized by the layer singleflight). Uncontended
-	// except during an eviction pass.
+	// hitMu closes the hit-vs-evict window: held shared by the hit path
+	// (cachedImageHit), exclusive by eviction's record removal
+	// (removeStaleRecord), so a hit's last-use touch and eviction's final
+	// re-check can never interleave. Uncontended except during a pass.
 	hitMu sync.RWMutex
 }
 
@@ -158,7 +155,7 @@ func WithPlatform(p v1.Platform) Option {
 }
 
 // WithActorsDir points the eviction root-set scan at the node's actors
-// directory (ateompath.ActorsDir in production). Each
+// directory (the per-actor state dirs under ateompath.BasePath). Each
 // <actorsDir>/<actorUID>/bundles/<container>/rootfs-overlay.json roots its
 // image and layers against eviction. Empty disables the scan.
 func WithActorsDir(dir string) Option {
@@ -320,16 +317,7 @@ func (s *Store) EnsureImage(ctx context.Context, ref string) (*Image, error) {
 		digest = desc.Digest
 	}
 
-	s.hitMu.RLock()
-	img, err := s.cachedImage(digest)
-	if err == nil && img != nil {
-		// Record last-use for eviction's LRU ordering. Refreshing the mtime
-		// also renews the min-age veto, so an image in active use can never
-		// age into eviction between this stat and the ateom's mount (see
-		// hitMu for why this ordering is airtight, not just probabilistic).
-		s.touchRecord(digest)
-	}
-	s.hitMu.RUnlock()
+	img, err := s.cachedImageHit(digest)
 	if err != nil {
 		return nil, err
 	}
@@ -338,10 +326,6 @@ func (s *Store) EnsureImage(ctx context.Context, ref string) (*Image, error) {
 		return img, nil
 	}
 	slog.InfoContext(ctx, "Image cache miss", slog.String("ref", ref), slog.String("digest", digest.String()))
-
-	// No pin, no in-flight bookkeeping: pull writes the image record before
-	// unpacking (see pull), so everything this miss produces is referenced —
-	// and thereby protected from eviction — before it exists on disk.
 
 	// Collapse concurrent pulls of the same digest (e.g. several containers of
 	// one actor, or several actors landing at once). The winning call's ctx
@@ -354,6 +338,22 @@ func (s *Store) EnsureImage(ctx context.Context, ref string) (*Image, error) {
 		return nil, err
 	}
 	return v.(*Image), nil
+}
+
+// cachedImageHit is the hit side of the hitMu contract: it verifies the
+// cached image and records last-use for eviction's LRU ordering, atomic
+// with respect to eviction's record removal (removeStaleRecord holds
+// hitMu exclusive). Refreshing the mtime also renews the min-age veto, so
+// an image in active use cannot age into eviction between this stat and
+// the ateom's mount.
+func (s *Store) cachedImageHit(digest v1.Hash) (*Image, error) {
+	s.hitMu.RLock()
+	defer s.hitMu.RUnlock()
+	img, err := s.cachedImage(digest)
+	if err == nil && img != nil {
+		s.touchRecord(digest)
+	}
+	return img, err
 }
 
 // cachedImage returns the cached image for digest, or nil if the record or
@@ -390,22 +390,11 @@ func (s *Store) cachedImage(digest v1.Hash) (*Image, error) {
 // exactly what was recorded), writes the image record, and then unpacks
 // every missing layer into the pool.
 //
-// The record is deliberately written BEFORE unpacking (this inverts Phase
-// 1's incidental ordering): from the moment a layer can exist in the pool,
-// the record's diffID list holds it at refcount >= 1 through the ordinary
-// path eviction trusts. This is how the reference systems close the
-// "object exists before the thing that explains it" gap — Go marks new
-// objects live at allocation (gcmarknewobject), containerd creates the
-// ingest record in the same transaction that opens the content writer,
-// ext4 journals the orphan-list entry with the O_TMPFILE allocation. It
-// replaces three v1 mechanisms (pull pins, the in-flight diffID set, and
-// the per-pass orphan sweep) with the one mechanism that already exists.
-//
-// A record therefore means "known image, possibly partially present" —
-// which is what it always meant to readers: cachedImage verifies every
-// layer and re-pulls only what is missing, so an interrupted pull's
-// record is not a lie, it is resumable progress that ages out through
-// ordinary LRU if never finished.
+// The record comes first so that every layer is referenced — and thereby
+// safe from eviction — before it can exist on disk. A record therefore
+// means "known image, possibly partially present", which readers already
+// handle: cachedImage verifies every layer and re-pulls what is missing,
+// so an interrupted pull's record is just resumable progress.
 func (s *Store) pull(ctx context.Context, parsedRef name.Reference, digest v1.Hash) (*Image, error) {
 	// Re-check under the flight lock: a racing EnsureImage may have completed
 	// the pull between our cache miss and winning the singleflight slot.
@@ -431,6 +420,7 @@ func (s *Store) pull(ctx context.Context, parsedRef name.Reference, digest v1.Ha
 	if err != nil {
 		return nil, fmt.Errorf("while listing image layers: %w", err)
 	}
+
 	if len(cfgFile.RootFS.DiffIDs) != len(layers) {
 		return nil, fmt.Errorf("image %s config lists %d diffIDs but manifest has %d layers", digest, len(cfgFile.RootFS.DiffIDs), len(layers))
 	}
@@ -475,11 +465,11 @@ func (s *Store) pull(ctx context.Context, parsedRef name.Reference, digest v1.Ha
 				return fmt.Errorf("while unpacking layer %s: %w", diffID, err)
 			}
 			layerDirs[i] = dir
-			// Progress-based liveness (containerd's updatedat): each completed
-			// layer refreshes the record's last-use mtime, so a pull that is
-			// making progress keeps its record fresher than min-age no matter
-			// how long it runs, while a wedged pull ages out and its partial
-			// work is reclaimed as an ordinary LRU unit.
+			// Each completed layer refreshes the record's mtime: a pull
+			// making progress stays fresh indefinitely; a wedged one ages
+			// into ordinary LRU eviction. The twin is not touched — the
+			// primary keeps the layers referenced, and the final rewrite
+			// recreates the twin if it ages out mid-pull.
 			s.touchRecord(digest)
 			return nil
 		})
@@ -488,13 +478,9 @@ func (s *Store) pull(ctx context.Context, parsedRef name.Reference, digest v1.Ha
 		return nil, err
 	}
 
-	// Rewrite the record now that every layer has landed. The pre-written
-	// record is the pull's only protection, and eviction may legitimately
-	// have removed it mid-pull (a pull that made no progress for min-age is
-	// treated as wedged); without this, such a pull would return success
-	// while its freshly-unpacked layers sit unreferenced — exactly the
-	// stranded state record-first exists to prevent. Rewriting is idempotent
-	// in the common case and restores the invariant in the rare one.
+	// Rewrite the record: eviction may legitimately remove it mid-pull
+	// (no progress for min-age reads as wedged), and success must never
+	// leave the just-unpacked layers unreferenced.
 	if err := s.writeRecord(digest, rec); err != nil {
 		return nil, fmt.Errorf("while rewriting image record after unpack: %w", err)
 	}
@@ -505,12 +491,10 @@ func (s *Store) pull(ctx context.Context, parsedRef name.Reference, digest v1.Ha
 		}
 	}
 
-	// Backstop re-verify, mirroring cachedImage: never return LayerDirs that
-	// are not on disk right now. With the record pre-written (and just
-	// rewritten) this should not fire; if it somehow does, failing the pull
-	// turns the caller's RPC into a clean retry instead of a bundle spec
-	// naming a nonexistent lowerdir. Ordering: rewrite first, so even the
-	// failure path leaves the surviving layers referenced for the retry.
+	// Never return LayerDirs that are not on disk right now: a vanished
+	// dir fails the pull into a clean RPC retry instead of a bundle spec
+	// naming a missing lowerdir. Ordered after the rewrite so even this
+	// failure path leaves the surviving layers referenced.
 	for _, dir := range layerDirs {
 		if _, err := os.Stat(filepath.Join(dir, layerFSDirName)); err != nil {
 			return nil, fmt.Errorf("layer dir vanished during pull (evicted?): %w", err)

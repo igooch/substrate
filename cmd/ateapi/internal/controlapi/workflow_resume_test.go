@@ -17,6 +17,7 @@ package controlapi
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -27,10 +28,13 @@ import (
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/workercache"
 	"github.com/agent-substrate/substrate/internal/resources"
 	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
+	listersv1alpha1 "github.com/agent-substrate/substrate/pkg/client/listers/api/v1alpha1"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/cache"
 )
 
 func TestAssignWorkerStep_SkipsWorkerAssignedInOtherAtespace(t *testing.T) {
@@ -448,7 +452,7 @@ func TestResumeActorWorkflow_RejectedAndIdempotentPaths(t *testing.T) {
 				a.WorkerPoolName = "pool1"
 			})
 
-			actor, err := w.ResumeActor(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"}, false)
+			actor, resumed, err := w.ResumeActor(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"}, false)
 			if tc.wantErr {
 				if got := status.Code(err); got != codes.FailedPrecondition {
 					t.Fatalf("status.Code(err) = %v, want %v (err: %v)", got, codes.FailedPrecondition, err)
@@ -459,6 +463,15 @@ func TestResumeActorWorkflow_RejectedAndIdempotentPaths(t *testing.T) {
 				}
 				if actor.GetStatus() != tc.wantStatus {
 					t.Errorf("returned status = %v, want %v", actor.GetStatus(), tc.wantStatus)
+				}
+				if tc.seedStatus == ateapipb.Actor_STATUS_RUNNING {
+					if resumed {
+						t.Errorf("expected resumed = false for already running actor, got true")
+					}
+				} else {
+					if !resumed {
+						t.Errorf("expected resumed = true for cold activation, got false")
+					}
 				}
 			}
 
@@ -555,7 +568,7 @@ func TestResumeActor_CrashesOnCorruptWorkerAssignment(t *testing.T) {
 		a.AteomPodName = "worker-1" // AteomPodUid and WorkerPoolName left empty
 	})
 
-	_, err := w.ResumeActor(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"}, false)
+	_, _, err := w.ResumeActor(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"}, false)
 	if got := status.Code(err); got != codes.Aborted {
 		t.Fatalf("status.Code(err) = %v, want %v (err: %v)", got, codes.Aborted, err)
 	}
@@ -688,5 +701,222 @@ func TestCallAteletRestoreStep_CheckPrerequisite_WorkerOwnership(t *testing.T) {
 				t.Errorf("worker version moved %d -> %d, want no write", seeded.GetVersion(), stored.GetVersion())
 			}
 		})
+	}
+}
+
+// TestLoadActorForResumeStep_OnGoldenDataResume verifies the golden-location
+// plumbing: when the template's onResume.fromData is Golden, a pending
+// data-only restore (a Data durable snapshot, or a paused actor whose
+// onPause is Data) additionally resolves the template's golden snapshot
+// location into the resume state, and the resume fails early when the golden
+// snapshot is unavailable.
+func TestLoadActorForResumeStep_OnGoldenDataResume(t *testing.T) {
+	const goldenLocation = "gs://bucket/ate-golden/snapshots/1/"
+	actorRef := resources.ActorRef{Atespace: "team-a", Name: "id1"}
+
+	tests := []struct {
+		name     string
+		fromData atev1alpha1.ResumeSource
+		// paused seeds the actor with LocalSnapshotInfo (a pause checkpoint)
+		// instead of a durable snapshot; onPause is the template's pause
+		// scope, contentScope the durable snapshot's recorded content.
+		paused       bool
+		onPause      atev1alpha1.SnapshotScope
+		contentScope ateapipb.SnapshotContentScope
+		// goldenSnapshot is ActorTemplate.Status.GoldenSnapshot; seedGolden
+		// controls whether the golden ActorSnapshot row it names exists, and
+		// goldenScope the scope it records (zero value UNSPECIFIED is treated
+		// as Full for legacy snapshots).
+		goldenSnapshot string
+		seedGolden     bool
+		goldenScope    ateapipb.SnapshotContentScope
+		wantCode       codes.Code
+		wantGoldenLoc  string
+	}{
+		{
+			name:           "resolves golden location for Data durable snapshot",
+			fromData:       atev1alpha1.ResumeSourceGolden,
+			contentScope:   ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA,
+			goldenSnapshot: "golden-1",
+			seedGolden:     true,
+			goldenScope:    ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL,
+			wantCode:       codes.OK,
+			wantGoldenLoc:  goldenLocation,
+		},
+		{
+			name:           "resolves golden location for paused actor with Data onPause",
+			fromData:       atev1alpha1.ResumeSourceGolden,
+			paused:         true,
+			onPause:        atev1alpha1.SnapshotScopeData,
+			goldenSnapshot: "golden-1",
+			seedGolden:     true,
+			goldenScope:    ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL,
+			wantCode:       codes.OK,
+			wantGoldenLoc:  goldenLocation,
+		},
+		{
+			// A Full pause snapshot restores from its own content; the policy
+			// only governs data-only restores.
+			name:           "leaves golden location empty for paused actor with Full onPause",
+			fromData:       atev1alpha1.ResumeSourceGolden,
+			paused:         true,
+			onPause:        atev1alpha1.SnapshotScopeFull,
+			goldenSnapshot: "golden-1",
+			seedGolden:     true,
+			goldenScope:    ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL,
+			wantCode:       codes.OK,
+			wantGoldenLoc:  "",
+		},
+		{
+			name:           "fails when golden snapshot is not Full",
+			fromData:       atev1alpha1.ResumeSourceGolden,
+			contentScope:   ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA,
+			goldenSnapshot: "golden-1",
+			seedGolden:     true,
+			goldenScope:    ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA,
+			wantCode:       codes.FailedPrecondition,
+		},
+		{
+			name:         "fails when template has no golden snapshot",
+			fromData:     atev1alpha1.ResumeSourceGolden,
+			contentScope: ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA,
+			wantCode:     codes.FailedPrecondition,
+		},
+		{
+			name:           "fails when golden snapshot data is missing",
+			fromData:       atev1alpha1.ResumeSourceGolden,
+			contentScope:   ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA,
+			goldenSnapshot: "golden-1",
+			wantCode:       codes.DataLoss,
+		},
+		{
+			// A Full snapshot restores from its own content even under
+			// Golden fromData (e.g. taken before the template switched).
+			name:           "leaves golden location empty for Full snapshot",
+			fromData:       atev1alpha1.ResumeSourceGolden,
+			contentScope:   ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL,
+			goldenSnapshot: "golden-1",
+			seedGolden:     true,
+			goldenScope:    ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL,
+			wantCode:       codes.OK,
+			wantGoldenLoc:  "",
+		},
+		{
+			name:           "leaves golden location empty under ColdBoot fromData",
+			fromData:       atev1alpha1.ResumeSourceColdBoot,
+			contentScope:   ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA,
+			goldenSnapshot: "golden-1",
+			seedGolden:     true,
+			goldenScope:    ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL,
+			wantCode:       codes.OK,
+			wantGoldenLoc:  "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			persistence := newTestPersistence(t)
+
+			if tt.seedGolden {
+				if _, err := persistence.CreateActorSnapshot(ctx, &ateapipb.ActorSnapshot{
+					Metadata:     &ateapipb.ResourceMetadata{Atespace: resources.GoldenActorAtespace, Name: tt.goldenSnapshot},
+					ContentScope: tt.goldenScope,
+				}, goldenLocation); err != nil {
+					t.Fatalf("CreateActorSnapshot(golden): %v", err)
+				}
+			}
+
+			var seedOpts []func(*ateapipb.Actor)
+			if tt.paused {
+				seedOpts = append(seedOpts, func(a *ateapipb.Actor) {
+					a.LocalSnapshotInfo = &ateapipb.LocalSnapshotInfo{SnapshotPrefix: "pause-1"}
+				})
+			} else {
+				snap, err := persistence.CreateActorSnapshot(ctx, &ateapipb.ActorSnapshot{
+					Metadata:     &ateapipb.ResourceMetadata{Atespace: actorRef.Atespace, Name: "snap-1"},
+					SourceActor:  &ateapipb.ObjectRef{Atespace: actorRef.Atespace, Name: actorRef.Name},
+					ContentScope: tt.contentScope,
+				}, "gs://bucket/actors/1/snapshots/2/")
+				if err != nil {
+					t.Fatalf("CreateActorSnapshot: %v", err)
+				}
+				seedOpts = append(seedOpts, func(a *ateapipb.Actor) {
+					a.LatestSnapshot = &ateapipb.ObjectRef{Atespace: actorRef.Atespace, Name: snap.GetMetadata().GetName()}
+				})
+			}
+			actorStatus := ateapipb.Actor_STATUS_SUSPENDED
+			if tt.paused {
+				actorStatus = ateapipb.Actor_STATUS_PAUSED
+			}
+			seedWorkflowActor(t, ctx, persistence, actorRef, "ns", "tmpl1", actorStatus, seedOpts...)
+
+			indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+			if err := indexer.Add(&atev1alpha1.ActorTemplate{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "tmpl1"},
+				Spec: atev1alpha1.ActorTemplateSpec{
+					SnapshotsConfig: atev1alpha1.SnapshotsConfig{
+						OnPause:  tt.onPause,
+						OnResume: atev1alpha1.OnResumeConfig{FromData: tt.fromData},
+					},
+				},
+				Status: atev1alpha1.ActorTemplateStatus{GoldenSnapshot: tt.goldenSnapshot},
+			}); err != nil {
+				t.Fatalf("add template to indexer: %v", err)
+			}
+
+			step := &LoadActorForResumeStep{store: persistence, actorTemplateLister: listersv1alpha1.NewActorTemplateLister(indexer)}
+			state := &ResumeState{}
+			err := step.Execute(ctx, &ResumeInput{ActorRef: actorRef}, state)
+			if got := status.Code(err); got != tt.wantCode {
+				t.Fatalf("status.Code(err) = %v, want %v (err: %v)", got, tt.wantCode, err)
+			}
+			if err != nil {
+				return
+			}
+			if state.GoldenSnapshotLocation != tt.wantGoldenLoc {
+				t.Errorf("state.GoldenSnapshotLocation = %q, want %q", state.GoldenSnapshotLocation, tt.wantGoldenLoc)
+			}
+			if !tt.paused && state.SnapshotScope != tt.contentScope {
+				t.Errorf("state.SnapshotScope = %v, want %v", state.SnapshotScope, tt.contentScope)
+			}
+		})
+	}
+}
+
+// TestLoadActorForResumeStep_GoldenFallbackRejectsNonFullGolden covers the
+// golden-fallback branch (actor with no snapshot of its own): a golden
+// snapshot recorded with a non-Full scope holds no guest state, so the resume
+// must fail with a clear error instead of forwarding its scope to atelet
+// with no golden location (which atelet rejects with a confusing
+// "missing bucket" validation error).
+func TestLoadActorForResumeStep_GoldenFallbackRejectsNonFullGolden(t *testing.T) {
+	ctx := context.Background()
+	persistence := newTestPersistence(t)
+	actorRef := resources.ActorRef{Atespace: "team-a", Name: "id1"}
+
+	if _, err := persistence.CreateActorSnapshot(ctx, &ateapipb.ActorSnapshot{
+		Metadata:     &ateapipb.ResourceMetadata{Atespace: resources.GoldenActorAtespace, Name: "golden-1"},
+		ContentScope: ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA,
+	}, "gs://bucket/ate-golden/snapshots/1/"); err != nil {
+		t.Fatalf("CreateActorSnapshot(golden): %v", err)
+	}
+	seedWorkflowActor(t, ctx, persistence, actorRef, "ns", "tmpl1", ateapipb.Actor_STATUS_SUSPENDED)
+
+	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	if err := indexer.Add(&atev1alpha1.ActorTemplate{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "tmpl1"},
+		Status:     atev1alpha1.ActorTemplateStatus{GoldenSnapshot: "golden-1"},
+	}); err != nil {
+		t.Fatalf("add template to indexer: %v", err)
+	}
+
+	step := &LoadActorForResumeStep{store: persistence, actorTemplateLister: listersv1alpha1.NewActorTemplateLister(indexer)}
+	err := step.Execute(ctx, &ResumeInput{ActorRef: actorRef}, &ResumeState{})
+	if got := status.Code(err); got != codes.FailedPrecondition {
+		t.Fatalf("status.Code(err) = %v, want FailedPrecondition (err: %v)", got, err)
+	}
+	if !strings.Contains(err.Error(), "regenerate the golden snapshot") {
+		t.Errorf("error %q does not tell the operator to regenerate the golden snapshot", err)
 	}
 }

@@ -14,20 +14,10 @@
 
 package imagecache
 
-// Regression tests for defects found in the two review rounds of the
-// Phase 2 GC POC, adapted to the record-first design (DESIGN-V2): pull
-// writes the image record before unpacking, pins are deferred to Phase 3,
-// and orphan recovery runs only at startup (RecoverOrphans). Each test
-// pins the v2 disposition of a probe that failed against v1:
-//
-//   - orphans (layers no record references) are crash debris, reclaimed at
-//     startup — and a live process can no longer create them;
-//   - a mid-pull layer is protected by the pre-written record's refcount +
-//     the record's progress-touched freshness, with no in-flight set;
-//   - a partial record enumeration skips the startup scan entirely rather
-//     than sweeping on bad refcounts;
-//   - size backfill survives directories the image made unreadable;
-//   - dry-run mutates nothing.
+// Eviction tests for damaged and in-between pool states — crash debris,
+// interrupted or wedged pulls, unreadable records — where the required
+// behavior is failing toward retention. Mainline eviction behavior is
+// covered in gc_test.go.
 
 import (
 	"archive/tar"
@@ -44,12 +34,11 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
 )
 
-// PROBE 1 (review 1, H1): a layer left in the pool with no referencing
-// image record must be reclaimable. In v2 that state is crash debris by
-// definition (pull pre-writes its record; eviction retires layers in the
-// pass that drops their records), so it is reclaimed by the STARTUP scan —
-// and deliberately NOT by the periodic pass, which reaches layers only
-// through records (the leak-until-restart trade documented in DESIGN-V2 §5).
+// A layer left in the pool with no referencing image record must be
+// reclaimable. That state is crash debris by definition (pull pre-writes
+// its record; eviction retires layers in the pass that drops their
+// records), so it is reclaimed by the STARTUP scan — and deliberately NOT
+// by the periodic pass, which reaches layers only through records.
 func TestOrphanLayerReclaimedAtStartup(t *testing.T) {
 	_, host := newTestRegistry(t)
 	ref := host + "/test/orphan:latest"
@@ -87,11 +76,11 @@ func TestOrphanLayerReclaimedAtStartup(t *testing.T) {
 	}
 }
 
-// PROBE 4 (review 1): a digestless bundle spec (written by a pre-Phase-2
-// atelet, i.e. every actor running across the upgrade) must not strand its
-// layers. In v2 the exact-layer-set rooting rule keeps the RECORD alive
-// while the bundle exists, so when the bundle goes the record and layers
-// are evicted together through the ordinary path — no orphan is ever
+// A digestless bundle spec (written before OverlaySpec.ImageDigest
+// existed, i.e. an actor running across that upgrade) must not strand its
+// layers. The exact-layer-set rooting rule keeps the RECORD alive while
+// the bundle exists, so when the bundle goes the record and layers are
+// evicted together through the ordinary path — no orphan is ever
 // manufactured, and no sweep is needed.
 func TestDigestlessSpecLayersReclaimedAfterBundleGone(t *testing.T) {
 	_, host := newTestRegistry(t)
@@ -140,12 +129,11 @@ func TestDigestlessSpecLayersReclaimedAfterBundleGone(t *testing.T) {
 	}
 }
 
-// Review 2, CRITICAL: layers of an in-flight pull must survive eviction.
-// v1 patched this with an in-memory in-flight set; v2 makes it structural —
-// pull writes the record before unpacking, so a mid-pull layer is held by
-// the record's refcount, renewed by the per-layer progress touch for as
-// long as the pull advances. Phase here: a fresh record protecting even an
-// OLD layer (the layer may have been in the pool for months from another
+// Layers of an in-flight pull must survive eviction, structurally: pull
+// writes the record before unpacking, so a mid-pull layer is held by the
+// record's refcount, renewed by the per-layer progress touch for as long
+// as the pull advances. The shape here: a fresh record protecting even an
+// OLD layer (which may have been in the pool for months from another
 // image).
 func TestRecordFirstProtectsInFlightPull(t *testing.T) {
 	store := newTestStore(t) // default min-age: 2m
@@ -174,14 +162,11 @@ func TestRecordFirstProtectsInFlightPull(t *testing.T) {
 	}
 }
 
-// Review 3, findings 1+3: the wedged-pull disposal, with the partial layer
-// FRESH — the realistic state, since a wedged pull's landed layers are
-// seconds old. (Review 3 caught the earlier version of this test carrying a
-// 3-hour backdate into this phase, which made it assert the impossible
-// "record and fresh layers evicted together" and pass vacuously.) The
-// correct contract: the stale record may be selected, but because min-age
-// vetoes the fresh layer, the record is RESTORED — nothing is stranded, and
-// the whole unit becomes evictable together once the layer ages.
+// The wedged-pull disposal, with the partial layer FRESH — the realistic
+// state, since a wedged pull's landed layers are seconds old. The
+// contract: the stale record may be selected, but because min-age vetoes
+// the fresh layer, the record is RESTORED — nothing is stranded, and the
+// whole unit becomes evictable together once the layer ages.
 func TestWedgedPullFreshLayersNotStranded(t *testing.T) {
 	store := newTestStore(t) // default min-age: 2m
 
@@ -229,7 +214,7 @@ func TestWedgedPullFreshLayersNotStranded(t *testing.T) {
 	}
 }
 
-// Review 3, finding 1 (direct shape): a record whose deletion would strand
+// The direct restore-on-keep shape: a record whose deletion would strand
 // a kept layer must be restored. Here the keep is caused by a rooted layer
 // from a digestless bundle spec whose layer set does NOT exactly match the
 // record (so LayerSets does not root the record itself).
@@ -274,11 +259,11 @@ func TestEvictionRestoresRecordWhenLayerRooted(t *testing.T) {
 	}
 }
 
-// Review 2, HIGH: refcounts derived from a partial record enumeration must
-// never drive orphan reclamation. In v2 the only reclamation scan runs at
-// startup, and it skips itself entirely (conservative, logged) when any
-// record fails to read or decode — while New still succeeds, because a
-// corrupt record must not keep atelet from serving actors.
+// Refcounts derived from a partial record enumeration must never drive
+// orphan reclamation: the startup scan skips itself entirely
+// (conservative, logged) when any record fails to read or decode — while
+// New still succeeds, because a corrupt record must not keep atelet from
+// serving actors.
 func TestStartupOrphanScanSkippedWhenEnumerationIncomplete(t *testing.T) {
 	_, host := newTestRegistry(t)
 	ref := host + "/test/enum:latest"
@@ -340,9 +325,9 @@ func TestNonLayerDirsIgnored(t *testing.T) {
 	}
 }
 
-// The record must exist BEFORE unpacking — the load-bearing ordering of the
-// record-first design. A pull that fails partway therefore leaves a record
-// (resumable progress that ages out via LRU), never unexplained layers.
+// The record must exist BEFORE unpacking — the load-bearing ordering. A
+// pull that fails partway therefore leaves a record (resumable progress
+// that ages out via LRU), never unexplained layers.
 func TestFailedPullLeavesResumableRecordNotOrphans(t *testing.T) {
 	_, host := newTestRegistry(t)
 	ref := host + "/test/badlayer:latest"
@@ -369,7 +354,7 @@ func TestFailedPullLeavesResumableRecordNotOrphans(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(recs) == 0 {
-		t.Fatal("failed pull left no record: its landed layers are unexplained (v1's orphan factory)")
+		t.Fatal("failed pull left no record: its landed layers are unexplained orphans")
 	}
 	// Whatever layers landed are referenced by that record — assert none is
 	// an orphan by running the startup scan and checking nothing is swept.
