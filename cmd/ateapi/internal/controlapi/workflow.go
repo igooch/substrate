@@ -18,10 +18,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/scheduling"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/workercache"
+	"github.com/agent-substrate/substrate/internal/ateattr"
 	"github.com/agent-substrate/substrate/internal/resources"
 	listersv1alpha1 "github.com/agent-substrate/substrate/pkg/client/listers/api/v1alpha1"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
@@ -31,6 +33,7 @@ import (
 	"google.golang.org/grpc/status"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
+	storagev1listers "k8s.io/client-go/listers/storage/v1"
 )
 
 // WorkflowStep represents a single, idempotent operation in a workflow graph.
@@ -130,18 +133,22 @@ func runStep[Params any, Context any](ctx context.Context, params Params, wCtx C
 
 // ActorWorkflow handles the workflows for actor's resume / suspend operations.
 type ActorWorkflow struct {
-	store               store.Interface
-	workerCache         *workercache.Cache
-	scheduler           scheduling.Scheduler
-	dialer              *AteletDialer
-	actorTemplateLister listersv1alpha1.ActorTemplateLister
-	workerPoolLister    listersv1alpha1.WorkerPoolLister
-	sandboxConfigLister listersv1alpha1.SandboxConfigLister
-	kubeClient          kubernetes.Interface
-	secretCache         *envSecretCache
+	store                store.Interface
+	workerCache          *workercache.Cache
+	scheduler            scheduling.Scheduler
+	dialer               *AteletDialer
+	actorTemplateLister  listersv1alpha1.ActorTemplateLister
+	workerPoolLister     listersv1alpha1.WorkerPoolLister
+	sandboxConfigLister  listersv1alpha1.SandboxConfigLister
+	storageClassLister   storagev1listers.StorageClassLister
+	kubeClient           kubernetes.Interface
+	secretCache          *envSecretCache
+	instruments          *Instruments
+	egressGatewayAddress string
+	pluginRegistry       VolumePluginRegistry
 }
 
-// NewActorWorkflow creates a new ActorWorkflow.
+// NewActorWorkflow creates a new ActorWorkflow. instruments may be nil.
 func NewActorWorkflow(
 	store store.Interface,
 	workerCache *workercache.Cache,
@@ -149,30 +156,51 @@ func NewActorWorkflow(
 	actorTemplateLister listersv1alpha1.ActorTemplateLister,
 	workerPoolLister listersv1alpha1.WorkerPoolLister,
 	sandboxConfigLister listersv1alpha1.SandboxConfigLister,
+	storageClassLister storagev1listers.StorageClassLister,
 	kubeClient kubernetes.Interface,
+	instruments *Instruments,
+	egressGatewayAddress string,
+	pluginRegistry VolumePluginRegistry,
 ) *ActorWorkflow {
 	return &ActorWorkflow{
-		store:               store,
-		workerCache:         workerCache,
-		scheduler:           scheduling.New(workerCache),
-		dialer:              dialer,
-		actorTemplateLister: actorTemplateLister,
-		workerPoolLister:    workerPoolLister,
-		sandboxConfigLister: sandboxConfigLister,
-		kubeClient:          kubeClient,
-		secretCache:         newEnvSecretCache(envSecretCacheTTL),
+		store:                store,
+		workerCache:          workerCache,
+		scheduler:            scheduling.New(workerCache, scheduling.WithMeter(otel.Meter("ateapi"))),
+		dialer:               dialer,
+		actorTemplateLister:  actorTemplateLister,
+		workerPoolLister:     workerPoolLister,
+		sandboxConfigLister:  sandboxConfigLister,
+		storageClassLister:   storageClassLister,
+		kubeClient:           kubeClient,
+		secretCache:          newEnvSecretCache(envSecretCacheTTL),
+		instruments:          instruments,
+		egressGatewayAddress: egressGatewayAddress,
+		pluginRegistry:       pluginRegistry,
 	}
 }
 
 // ResumeActor executes the workflow to resume a suspended actor. Idempotent.
-func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.ActorRef, boot bool) (*ateapipb.Actor, bool, error) {
+func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.ActorRef, boot bool) (actor *ateapipb.Actor, resumed bool, err error) {
+	start := time.Now()
 	input := &ResumeInput{
 		ActorRef: actorRef,
 		Boot:     boot,
 	}
 	state := &ResumeState{}
 
-	ctx, lock, err := w.acquireActorLock(ctx, actorRef)
+	// Recorded before the lock so lock contention still counts as an attempt.
+	// Clean already-running no-ops are skipped: the router resumes per routed
+	// request, and recording those would sample at router QPS and bury
+	// cold-resume latency.
+	defer func() {
+		if err == nil && state.WasRunning {
+			return
+		}
+		w.instruments.recordLifecycleOp(ctx, ateattr.OperationResume, start, err,
+			lifecycleOpAttrs(state.Actor, state.ActorTemplate, state.SnapshotKind, state.WireSnapshotScope)...)
+	}()
+
+	lockCtx, lock, err := w.acquireActorLock(ctx, actorRef)
 	if err != nil {
 		return nil, false, err
 	}
@@ -180,14 +208,14 @@ func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.Acto
 
 	steps := []WorkflowStep[*ResumeInput, *ResumeState]{
 		&LoadActorForResumeStep{store: w.store, actorTemplateLister: w.actorTemplateLister},
-		&CreateVolumesStep{store: w.store},
-		&AssignWorkerStep{store: w.store, workerCache: w.workerCache, scheduler: w.scheduler},
-		&AttachVolumesStep{store: w.store},
-		&CallAteletRestoreStep{store: w.store, dialer: w.dialer, kubeClient: w.kubeClient, secretCache: w.secretCache, workerPoolLister: w.workerPoolLister, sandboxConfigLister: w.sandboxConfigLister, scheduler: w.scheduler},
+		&CreateVolumesStep{store: w.store, pluginRegistry: w.pluginRegistry, storageClassLister: w.storageClassLister},
+		&AssignWorkerStep{store: w.store, workerCache: w.workerCache, scheduler: w.scheduler, instruments: w.instruments},
+		&AttachVolumesStep{store: w.store, pluginRegistry: w.pluginRegistry},
+		&CallAteletRestoreStep{store: w.store, dialer: w.dialer, kubeClient: w.kubeClient, secretCache: w.secretCache, workerPoolLister: w.workerPoolLister, sandboxConfigLister: w.sandboxConfigLister, scheduler: w.scheduler, egressGatewayAddress: w.egressGatewayAddress},
 		&FinalizeRunningStep{store: w.store},
 	}
 
-	if err := RunWorkflow(ctx, input, state, steps); err != nil {
+	if err = RunWorkflow(lockCtx, input, state, steps); err != nil {
 		return nil, false, err
 	}
 
@@ -195,13 +223,19 @@ func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.Acto
 }
 
 // SuspendActor executes the workflow to suspend a running actor. Idempotent.
-func (w *ActorWorkflow) SuspendActor(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.Actor, error) {
+func (w *ActorWorkflow) SuspendActor(ctx context.Context, actorRef resources.ActorRef) (actor *ateapipb.Actor, err error) {
+	start := time.Now()
 	input := &SuspendInput{
 		ActorRef: actorRef,
 	}
 	state := &SuspendState{}
 
-	ctx, lock, err := w.acquireActorLock(ctx, actorRef)
+	defer func() {
+		w.instruments.recordLifecycleOp(ctx, ateattr.OperationSuspend, start, err,
+			lifecycleOpAttrs(state.Actor, state.ActorTemplate, "", state.WireSnapshotScope)...)
+	}()
+
+	lockCtx, lock, err := w.acquireActorLock(ctx, actorRef)
 	if err != nil {
 		return nil, err
 	}
@@ -211,11 +245,11 @@ func (w *ActorWorkflow) SuspendActor(ctx context.Context, actorRef resources.Act
 		&LoadActorForSuspendStep{store: w.store, actorTemplateLister: w.actorTemplateLister},
 		&MarkSuspendingStep{store: w.store},
 		&CallAteletSuspendStep{store: w.store, dialer: w.dialer},
-		&DetachVolumesStep{store: w.store},
+		&DetachVolumesStep{store: w.store, pluginRegistry: w.pluginRegistry},
 		&FinalizeSuspendedStep{store: w.store},
 	}
 
-	if err := RunWorkflow(ctx, input, state, steps); err != nil {
+	if err = RunWorkflow(lockCtx, input, state, steps); err != nil {
 		return nil, err
 	}
 
@@ -223,13 +257,19 @@ func (w *ActorWorkflow) SuspendActor(ctx context.Context, actorRef resources.Act
 }
 
 // PauseActor executes the workflow to pause a running actor. Idempotent.
-func (w *ActorWorkflow) PauseActor(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.Actor, error) {
+func (w *ActorWorkflow) PauseActor(ctx context.Context, actorRef resources.ActorRef) (actor *ateapipb.Actor, err error) {
+	start := time.Now()
 	input := &PauseInput{
 		ActorRef: actorRef,
 	}
 	state := &PauseState{}
 
-	ctx, lock, err := w.acquireActorLock(ctx, actorRef)
+	defer func() {
+		w.instruments.recordLifecycleOp(ctx, ateattr.OperationPause, start, err,
+			lifecycleOpAttrs(state.Actor, state.ActorTemplate, "", state.WireSnapshotScope)...)
+	}()
+
+	lockCtx, lock, err := w.acquireActorLock(ctx, actorRef)
 	if err != nil {
 		return nil, err
 	}
@@ -239,11 +279,11 @@ func (w *ActorWorkflow) PauseActor(ctx context.Context, actorRef resources.Actor
 		&LoadActorForPauseStep{store: w.store, actorTemplateLister: w.actorTemplateLister},
 		&MarkPausingStep{store: w.store},
 		&CallAteletPauseStep{store: w.store, dialer: w.dialer},
-		&DetachVolumesForPauseStep{store: w.store},
+		&DetachVolumesForPauseStep{store: w.store, pluginRegistry: w.pluginRegistry},
 		&FinalizePausedStep{store: w.store},
 	}
 
-	if err := RunWorkflow(ctx, input, state, steps); err != nil {
+	if err = RunWorkflow(lockCtx, input, state, steps); err != nil {
 		return nil, err
 	}
 
@@ -267,7 +307,7 @@ func (w *ActorWorkflow) DeleteActor(ctx context.Context, atespace, name string) 
 	steps := []WorkflowStep[*DeleteInput, *DeleteState]{
 		&LoadActorForDeleteStep{store: w.store},
 		&MarkDeletingStep{store: w.store},
-		&DeleteVolumesStep{store: w.store},
+		&DeleteVolumesStep{store: w.store, pluginRegistry: w.pluginRegistry},
 		&FinalizeDeletedStep{store: w.store},
 	}
 

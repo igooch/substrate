@@ -19,6 +19,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/agent-substrate/substrate/internal/resources"
@@ -54,8 +55,8 @@ func TestActorResumer_ResumeActor(t *testing.T) {
 				resumeCalled++
 				return &ateapipb.ResumeActorResponse{
 					Actor: &ateapipb.Actor{
-						Status:     ateapipb.Actor_STATUS_RUNNING,
-						AteomPodIp: expectedIP,
+						Status:           ateapipb.Actor_STATUS_RUNNING,
+						WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: expectedIP},
 					},
 					Resumed: true,
 				}, nil
@@ -67,8 +68,8 @@ func TestActorResumer_ResumeActor(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if actor.GetAteomPodIp() != expectedIP {
-			t.Errorf("expected IP %q, got %q", expectedIP, actor.GetAteomPodIp())
+		if actor.GetWorkerAssignment().GetWorkerPodIp() != expectedIP {
+			t.Errorf("expected IP %q, got %q", expectedIP, actor.GetWorkerAssignment().GetWorkerPodIp())
 		}
 		if outcome != ResumeOutcomeTriggered {
 			t.Errorf("expected outcome %q, got %q", ResumeOutcomeTriggered, outcome)
@@ -83,9 +84,9 @@ func TestActorResumer_ResumeActor(t *testing.T) {
 			resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
 				return &ateapipb.ResumeActorResponse{
 					Actor: &ateapipb.Actor{
-						Metadata:   &ateapipb.ResourceMetadata{Name: testActorName},
-						Status:     ateapipb.Actor_STATUS_RUNNING,
-						AteomPodIp: expectedIP,
+						Metadata:         &ateapipb.ResourceMetadata{Name: testActorName},
+						Status:           ateapipb.Actor_STATUS_RUNNING,
+						WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: expectedIP},
 					},
 					Resumed: false,
 				}, nil
@@ -112,8 +113,8 @@ func TestActorResumer_ResumeActor(t *testing.T) {
 				}
 				return &ateapipb.ResumeActorResponse{
 					Actor: &ateapipb.Actor{
-						Status:     ateapipb.Actor_STATUS_RUNNING,
-						AteomPodIp: expectedIP,
+						Status:           ateapipb.Actor_STATUS_RUNNING,
+						WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: expectedIP},
 					},
 					Resumed: true,
 				}, nil
@@ -125,8 +126,8 @@ func TestActorResumer_ResumeActor(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if actor.GetAteomPodIp() != expectedIP {
-			t.Errorf("expected IP %q, got %q", expectedIP, actor.GetAteomPodIp())
+		if actor.GetWorkerAssignment().GetWorkerPodIp() != expectedIP {
+			t.Errorf("expected IP %q, got %q", expectedIP, actor.GetWorkerAssignment().GetWorkerPodIp())
 		}
 		if outcome != ResumeOutcomeTriggered {
 			t.Errorf("expected outcome %q, got %q", ResumeOutcomeTriggered, outcome)
@@ -165,8 +166,8 @@ func TestActorResumer_ResumeActor(t *testing.T) {
 				time.Sleep(20 * time.Millisecond)
 				return &ateapipb.ResumeActorResponse{
 					Actor: &ateapipb.Actor{
-						Status:     ateapipb.Actor_STATUS_RUNNING,
-						AteomPodIp: expectedIP,
+						Status:           ateapipb.Actor_STATUS_RUNNING,
+						WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: expectedIP},
 					},
 					Resumed: true,
 				}, nil
@@ -195,8 +196,8 @@ func TestActorResumer_ResumeActor(t *testing.T) {
 			if errs[i] != nil {
 				t.Fatalf("request %d failed: %v", i, errs[i])
 			}
-			if results[i].GetAteomPodIp() != expectedIP {
-				t.Errorf("request %d expected IP %q, got %q", i, expectedIP, results[i].GetAteomPodIp())
+			if results[i].GetWorkerAssignment().GetWorkerPodIp() != expectedIP {
+				t.Errorf("request %d expected IP %q, got %q", i, expectedIP, results[i].GetWorkerAssignment().GetWorkerPodIp())
 			}
 			switch outcomes[i] {
 			case ResumeOutcomeTriggered:
@@ -223,195 +224,211 @@ func TestActorResumer_ResumeActor(t *testing.T) {
 	})
 }
 
+// TestActorResumer_Parking runs each case inside a synctest bubble, so the
+// parked retry loop's waits are fake time.
 func TestActorResumer_Parking(t *testing.T) {
-	const testActorName = "actor-park"
-	const testAtespace = "team-a"
-	const expectedIP = "10.0.0.77"
+	const (
+		testActorName = "actor-park"
+		testAtespace  = "team-a"
+		expectedIP    = "10.0.0.77"
+	)
 	testActorRef := resources.ActorRef{Atespace: testAtespace, Name: testActorName}
 
 	t.Run("ParksThenSucceedsOnCapacityError", func(t *testing.T) {
-		var mu sync.Mutex
-		var calls int
-		mock := &resumerMockClient{
-			resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
-				mu.Lock()
-				calls++
-				n := calls
-				mu.Unlock()
-				if n < 3 {
-					// Worker pool momentarily saturated.
-					return nil, status.Error(codes.FailedPrecondition, "no free workers available")
-				}
-				return &ateapipb.ResumeActorResponse{
-					Actor: &ateapipb.Actor{Metadata: &ateapipb.ResourceMetadata{Name: testActorName}, Status: ateapipb.Actor_STATUS_RUNNING, AteomPodIp: expectedIP},
-				}, nil
-			},
-		}
+		synctest.Test(t, func(t *testing.T) {
+			var mu sync.Mutex
+			var calls int
+			mock := &resumerMockClient{
+				resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+					mu.Lock()
+					calls++
+					n := calls
+					mu.Unlock()
+					if n < 3 {
+						// Worker pool momentarily saturated.
+						return nil, status.Error(codes.FailedPrecondition, "no free workers available")
+					}
+					return &ateapipb.ResumeActorResponse{
+						Actor: &ateapipb.Actor{Metadata: &ateapipb.ResourceMetadata{Name: testActorName}, Status: ateapipb.Actor_STATUS_RUNNING, WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: expectedIP}},
+					}, nil
+				},
+			}
 
-		resumer := NewActorResumer(mock, withParking(ParkedRequestConfig{Max: 1, Budget: 5 * time.Second}))
-		actor, _, err := resumer.ResumeActor(context.Background(), testActorRef)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if actor.GetAteomPodIp() != expectedIP {
-			t.Errorf("expected IP %q, got %q", expectedIP, actor.GetAteomPodIp())
-		}
-		mu.Lock()
-		defer mu.Unlock()
-		if calls != 3 {
-			t.Errorf("expected 3 resume attempts (parked through 2 capacity errors), got %d", calls)
-		}
+			resumer := NewActorResumer(mock, withParking(ParkedRequestConfig{Max: 1, Budget: 5 * time.Second}))
+			actor, _, err := resumer.ResumeActor(context.Background(), testActorRef)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if actor.GetWorkerAssignment().GetWorkerPodIp() != expectedIP {
+				t.Errorf("expected IP %q, got %q", expectedIP, actor.GetWorkerAssignment().GetWorkerPodIp())
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if calls != 3 {
+				t.Errorf("expected 3 resume attempts (parked through 2 capacity errors), got %d", calls)
+			}
+		})
 	})
 
 	t.Run("BudgetExpiryReturnsUnderlyingCapacityError", func(t *testing.T) {
-		var mu sync.Mutex
-		var calls int
-		mock := &resumerMockClient{
-			resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
-				mu.Lock()
-				calls++
-				mu.Unlock()
-				return nil, status.Error(codes.FailedPrecondition, "no free workers available")
-			},
-		}
+		synctest.Test(t, func(t *testing.T) {
+			var mu sync.Mutex
+			var calls int
+			mock := &resumerMockClient{
+				resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+					mu.Lock()
+					calls++
+					mu.Unlock()
+					return nil, status.Error(codes.FailedPrecondition, "no free workers available")
+				},
+			}
 
-		// Budget large enough for a few ~100ms-spaced retries before it elapses;
-		// the pool never frees up.
-		resumer := NewActorResumer(mock, withParking(ParkedRequestConfig{Max: 1, Budget: 1500 * time.Millisecond}))
-		_, _, err := resumer.ResumeActor(context.Background(), testActorRef)
-		// The client must see the meaningful capacity error, not a generic
-		// timeout: status.Code must unwrap through the budget-exhaustion marker.
-		if got := status.Code(err); got != codes.FailedPrecondition {
-			t.Errorf("expected FailedPrecondition after park budget elapsed, got %v (err=%v)", got, err)
-		}
-		var budget *budgetExhaustedError
-		if !errors.As(err, &budget) {
-			t.Errorf("expected the error to be marked as budget exhaustion, got %T (%v)", err, err)
-		}
-		mu.Lock()
-		defer mu.Unlock()
-		if calls < 2 {
-			t.Errorf("expected the resume to be retried at least twice while parked, got %d", calls)
-		}
+			// Budget large enough for a few ~100ms-spaced retries before it elapses;
+			// the pool never frees up.
+			resumer := NewActorResumer(mock, withParking(ParkedRequestConfig{Max: 1, Budget: 1500 * time.Millisecond}))
+			_, _, err := resumer.ResumeActor(context.Background(), testActorRef)
+			// The client must see the meaningful capacity error, not a generic
+			// timeout: status.Code must unwrap through the budget-exhaustion marker.
+			if got := status.Code(err); got != codes.FailedPrecondition {
+				t.Errorf("expected FailedPrecondition after park budget elapsed, got %v (err=%v)", got, err)
+			}
+			var budget *budgetExhaustedError
+			if !errors.As(err, &budget) {
+				t.Errorf("expected the error to be marked as budget exhaustion, got %T (%v)", err, err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if calls < 2 {
+				t.Errorf("expected the resume to be retried at least twice while parked, got %d", calls)
+			}
+		})
 	})
 
 	t.Run("ParksThroughUnavailableBlip", func(t *testing.T) {
-		var mu sync.Mutex
-		var calls int
-		mock := &resumerMockClient{
-			resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
-				mu.Lock()
-				calls++
-				n := calls
-				mu.Unlock()
-				if n < 3 {
-					// Control plane momentarily unreachable (e.g. rolling restart).
-					return nil, status.Error(codes.Unavailable, "connection refused")
-				}
-				return &ateapipb.ResumeActorResponse{
-					Actor: &ateapipb.Actor{Metadata: &ateapipb.ResourceMetadata{Name: testActorName}, Status: ateapipb.Actor_STATUS_RUNNING, AteomPodIp: expectedIP},
-				}, nil
-			},
-		}
+		synctest.Test(t, func(t *testing.T) {
+			var mu sync.Mutex
+			var calls int
+			mock := &resumerMockClient{
+				resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+					mu.Lock()
+					calls++
+					n := calls
+					mu.Unlock()
+					if n < 3 {
+						// Control plane momentarily unreachable (e.g. rolling restart).
+						return nil, status.Error(codes.Unavailable, "connection refused")
+					}
+					return &ateapipb.ResumeActorResponse{
+						Actor: &ateapipb.Actor{Metadata: &ateapipb.ResourceMetadata{Name: testActorName}, Status: ateapipb.Actor_STATUS_RUNNING, WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: expectedIP}},
+					}, nil
+				},
+			}
 
-		resumer := NewActorResumer(mock, withParking(ParkedRequestConfig{Max: 1, Budget: 5 * time.Second}))
-		actor, _, err := resumer.ResumeActor(context.Background(), testActorRef)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if actor.GetAteomPodIp() != expectedIP {
-			t.Errorf("expected IP %q, got %q", expectedIP, actor.GetAteomPodIp())
-		}
-		mu.Lock()
-		defer mu.Unlock()
-		if calls != 3 {
-			t.Errorf("expected 3 resume attempts (parked through 2 Unavailable blips), got %d", calls)
-		}
+			resumer := NewActorResumer(mock, withParking(ParkedRequestConfig{Max: 1, Budget: 5 * time.Second}))
+			actor, _, err := resumer.ResumeActor(context.Background(), testActorRef)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if actor.GetWorkerAssignment().GetWorkerPodIp() != expectedIP {
+				t.Errorf("expected IP %q, got %q", expectedIP, actor.GetWorkerAssignment().GetWorkerPodIp())
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if calls != 3 {
+				t.Errorf("expected 3 resume attempts (parked through 2 Unavailable blips), got %d", calls)
+			}
+		})
 	})
 
 	t.Run("DisabledFailsFastOnUnavailable", func(t *testing.T) {
-		var mu sync.Mutex
-		var calls int
-		mock := &resumerMockClient{
-			resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
-				mu.Lock()
-				calls++
-				mu.Unlock()
-				return nil, status.Error(codes.Unavailable, "connection refused")
-			},
-		}
+		synctest.Test(t, func(t *testing.T) {
+			var mu sync.Mutex
+			var calls int
+			mock := &resumerMockClient{
+				resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+					mu.Lock()
+					calls++
+					mu.Unlock()
+					return nil, status.Error(codes.Unavailable, "connection refused")
+				},
+			}
 
-		resumer := NewActorResumer(mock)
-		_, _, err := resumer.ResumeActor(context.Background(), testActorRef)
-		if got := status.Code(err); got != codes.Unavailable {
-			t.Errorf("expected Unavailable, got %v (err=%v)", got, err)
-		}
-		mu.Lock()
-		defer mu.Unlock()
-		if calls != 1 {
-			t.Errorf("expected exactly 1 resume attempt when parking disabled, got %d", calls)
-		}
+			resumer := NewActorResumer(mock)
+			_, _, err := resumer.ResumeActor(context.Background(), testActorRef)
+			if got := status.Code(err); got != codes.Unavailable {
+				t.Errorf("expected Unavailable, got %v (err=%v)", got, err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if calls != 1 {
+				t.Errorf("expected exactly 1 resume attempt when parking disabled, got %d", calls)
+			}
+		})
 	})
 
 	t.Run("BudgetExpiryDuringInFlightRPC", func(t *testing.T) {
-		var mu sync.Mutex
-		var calls int
-		mock := &resumerMockClient{
-			resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
-				mu.Lock()
-				calls++
-				n := calls
-				mu.Unlock()
-				if n == 1 {
-					// First attempt: transient saturation, remembered as the
-					// last retryable error.
-					return nil, status.Error(codes.FailedPrecondition, "no free workers available")
-				}
-				// Later attempt: block until the park budget cancels the RPC,
-				// then return what a real gRPC client returns — a *status*
-				// error with code DeadlineExceeded that does NOT satisfy
-				// errors.Is(err, context.DeadlineExceeded).
-				<-ctx.Done()
-				return nil, status.FromContextError(ctx.Err()).Err()
-			},
-		}
+		synctest.Test(t, func(t *testing.T) {
+			var mu sync.Mutex
+			var calls int
+			mock := &resumerMockClient{
+				resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+					mu.Lock()
+					calls++
+					n := calls
+					mu.Unlock()
+					if n == 1 {
+						// First attempt: transient saturation, remembered as the
+						// last retryable error.
+						return nil, status.Error(codes.FailedPrecondition, "no free workers available")
+					}
+					// Later attempt: block until the park budget cancels the RPC,
+					// then return what a real gRPC client returns — a *status*
+					// error with code DeadlineExceeded that does NOT satisfy
+					// errors.Is(err, context.DeadlineExceeded).
+					<-ctx.Done()
+					return nil, status.FromContextError(ctx.Err()).Err()
+				},
+			}
 
-		resumer := NewActorResumer(mock, withParking(ParkedRequestConfig{Max: 1, Budget: 300 * time.Millisecond}))
-		_, _, err := resumer.ResumeActor(context.Background(), testActorRef)
-		// The deadline landed mid-RPC; the client must still see the capacity
-		// error (503 "no free workers available"), not a generic timeout (504).
-		if got := status.Code(err); got != codes.FailedPrecondition {
-			t.Errorf("expected FailedPrecondition when the budget lands mid-RPC, got %v (err=%v)", got, err)
-		}
-		var budget *budgetExhaustedError
-		if !errors.As(err, &budget) {
-			t.Errorf("expected the error to be marked as budget exhaustion, got %T (%v)", err, err)
-		}
+			resumer := NewActorResumer(mock, withParking(ParkedRequestConfig{Max: 1, Budget: 300 * time.Millisecond}))
+			_, _, err := resumer.ResumeActor(context.Background(), testActorRef)
+			// The deadline landed mid-RPC; the client must still see the capacity
+			// error (503 "no free workers available"), not a generic timeout (504).
+			if got := status.Code(err); got != codes.FailedPrecondition {
+				t.Errorf("expected FailedPrecondition when the budget lands mid-RPC, got %v (err=%v)", got, err)
+			}
+			var budget *budgetExhaustedError
+			if !errors.As(err, &budget) {
+				t.Errorf("expected the error to be marked as budget exhaustion, got %T (%v)", err, err)
+			}
+		})
 	})
 
 	t.Run("DisabledFailsFastOnCapacityError", func(t *testing.T) {
-		var mu sync.Mutex
-		var calls int
-		mock := &resumerMockClient{
-			resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
-				mu.Lock()
-				calls++
-				mu.Unlock()
-				return nil, status.Error(codes.FailedPrecondition, "no free workers available")
-			},
-		}
+		synctest.Test(t, func(t *testing.T) {
+			var mu sync.Mutex
+			var calls int
+			mock := &resumerMockClient{
+				resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+					mu.Lock()
+					calls++
+					mu.Unlock()
+					return nil, status.Error(codes.FailedPrecondition, "no free workers available")
+				},
+			}
 
-		// Default constructor => parking disabled => fail-fast.
-		resumer := NewActorResumer(mock)
-		_, _, err := resumer.ResumeActor(context.Background(), testActorRef)
-		if got := status.Code(err); got != codes.FailedPrecondition {
-			t.Errorf("expected FailedPrecondition, got %v (err=%v)", got, err)
-		}
-		mu.Lock()
-		defer mu.Unlock()
-		if calls != 1 {
-			t.Errorf("expected exactly 1 resume attempt when parking disabled, got %d", calls)
-		}
+			// Default constructor => parking disabled => fail-fast.
+			resumer := NewActorResumer(mock)
+			_, _, err := resumer.ResumeActor(context.Background(), testActorRef)
+			if got := status.Code(err); got != codes.FailedPrecondition {
+				t.Errorf("expected FailedPrecondition, got %v (err=%v)", got, err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if calls != 1 {
+				t.Errorf("expected exactly 1 resume attempt when parking disabled, got %d", calls)
+			}
+		})
 	})
 }
 
@@ -421,9 +438,15 @@ func TestActorResumer_Parking(t *testing.T) {
 // shared in-flight resume, which keeps running and serves a later caller from
 // the same single RPC.
 func TestActorResumer_CallerCancelDoesNotAbortFlight(t *testing.T) {
-	const testActorName = "actor-cancel"
-	const testAtespace = "team-a"
-	const expectedIP = "10.0.0.88"
+	synctest.Test(t, testCallerCancelDoesNotAbortFlight)
+}
+
+func testCallerCancelDoesNotAbortFlight(t *testing.T) {
+	const (
+		testActorName = "actor-cancel"
+		testAtespace  = "team-a"
+		expectedIP    = "10.0.0.88"
+	)
 	testActorRef := resources.ActorRef{Atespace: testAtespace, Name: testActorName}
 
 	var mu sync.Mutex
@@ -442,7 +465,7 @@ func TestActorResumer_CallerCancelDoesNotAbortFlight(t *testing.T) {
 			// Hold the flight open until the test releases it.
 			<-proceed
 			return &ateapipb.ResumeActorResponse{
-				Actor: &ateapipb.Actor{Metadata: &ateapipb.ResourceMetadata{Name: testActorName}, Status: ateapipb.Actor_STATUS_RUNNING, AteomPodIp: expectedIP},
+				Actor: &ateapipb.Actor{Metadata: &ateapipb.ResourceMetadata{Name: testActorName}, Status: ateapipb.Actor_STATUS_RUNNING, WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: expectedIP}},
 			}, nil
 		},
 	}
@@ -478,18 +501,19 @@ func TestActorResumer_CallerCancelDoesNotAbortFlight(t *testing.T) {
 		a, _, rerr := resumer.ResumeActor(context.Background(), testActorRef)
 		resCh <- result{a, rerr}
 	}()
-	// Give caller 2 a moment to join before releasing the flight, so the
-	// call-count assertion proves it shared the first RPC (same timing style
-	// as SingleflightDeduplication above).
-	time.Sleep(100 * time.Millisecond)
+	// Let caller 2 reach the flight before releasing it, so the call-count
+	// assertion proves it shared the first RPC. Inside the bubble this is exact
+	// rather than a hopeful sleep: Wait blocks until every other goroutine here
+	// — caller 2 included — is durably blocked, i.e. parked on the flight.
+	synctest.Wait()
 	close(proceed)
 
 	res := <-resCh
 	if res.err != nil {
 		t.Fatalf("second caller: unexpected error: %v", res.err)
 	}
-	if res.actor.GetAteomPodIp() != expectedIP {
-		t.Errorf("second caller IP = %q, want %q", res.actor.GetAteomPodIp(), expectedIP)
+	if res.actor.GetWorkerAssignment().GetWorkerPodIp() != expectedIP {
+		t.Errorf("second caller IP = %q, want %q", res.actor.GetWorkerAssignment().GetWorkerPodIp(), expectedIP)
 	}
 	mu.Lock()
 	defer mu.Unlock()

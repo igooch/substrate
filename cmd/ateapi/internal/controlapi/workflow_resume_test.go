@@ -17,6 +17,7 @@ package controlapi
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -37,6 +38,29 @@ import (
 	"k8s.io/client-go/tools/cache"
 )
 
+// TestSchedulerRecordable guards the retry-dedup rule: runStep re-runs Execute on
+// store.ErrVersionConflict, and those attempts (raw or wrapped) must not be
+// recorded, while the terminal success or real error must be.
+func TestSchedulerRecordable(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "success is recorded", err: nil, want: true},
+		{name: "version conflict is skipped", err: store.ErrVersionConflict, want: false},
+		{name: "wrapped version conflict is skipped", err: fmt.Errorf("update worker: %w", store.ErrVersionConflict), want: false},
+		{name: "real error is recorded", err: status.Error(codes.Internal, "boom"), want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := schedulerRecordable(tt.err); got != tt.want {
+				t.Errorf("schedulerRecordable(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestAssignWorkerStep_SkipsWorkerAssignedInOtherAtespace(t *testing.T) {
 	ctx := context.Background()
 	persistence := newTestPersistence(t)
@@ -50,7 +74,8 @@ func TestAssignWorkerStep_SkipsWorkerAssignedInOtherAtespace(t *testing.T) {
 		SandboxClass:    "gvisor",
 		State:           ateapipb.Worker_STATE_ACTIVE,
 		Assignment: &ateapipb.Assignment{
-			Actor: &ateapipb.ObjectRef{Atespace: "team-b", Name: "shared"},
+			Actor:    &ateapipb.ObjectRef{Atespace: "team-b", Name: "shared"},
+			ActorUid: "team-b-actor-uid",
 		},
 	}
 	if err := persistence.CreateWorker(ctx, worker); err != nil {
@@ -67,7 +92,7 @@ func TestAssignWorkerStep_SkipsWorkerAssignedInOtherAtespace(t *testing.T) {
 	step := &AssignWorkerStep{store: persistence, workerCache: wc, scheduler: scheduling.New(wc)}
 	state := &ResumeState{
 		Actor: &ateapipb.Actor{
-			Metadata: &ateapipb.ResourceMetadata{Atespace: "team-a", Name: "shared"},
+			Metadata: &ateapipb.ResourceMetadata{Atespace: "team-a", Name: "shared", Uid: "actor-uid"},
 		},
 		ActorTemplate: &atev1alpha1.ActorTemplate{
 			Spec: atev1alpha1.ActorTemplateSpec{SandboxClass: atev1alpha1.SandboxClassGvisor},
@@ -82,6 +107,9 @@ func TestAssignWorkerStep_SkipsWorkerAssignedInOtherAtespace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetWorker: %v", err)
 	}
+	if got := stored.GetAssignment().GetActorUid(); got != "team-b-actor-uid" {
+		t.Errorf("worker assignment uid = %q, want %q (assignment: %v)", got, "team-b-actor-uid", stored.GetAssignment())
+	}
 	if got := stored.GetAssignment().GetActor().GetAtespace(); got != "team-b" {
 		t.Errorf("worker assignment atespace = %q, want %q (assignment: %v)", got, "team-b", stored.GetAssignment())
 	}
@@ -95,6 +123,14 @@ func TestAssignWorkerStep_ReleasesIneligibleStaleWorkerInBackground(t *testing.T
 	ctx := context.Background()
 	persistence := newTestPersistence(t)
 
+	actor, err := persistence.CreateActor(ctx, &ateapipb.Actor{
+		Metadata: &ateapipb.ResourceMetadata{Atespace: "team-a", Name: "id1"},
+		Status:   ateapipb.Actor_STATUS_SUSPENDED,
+	})
+	if err != nil {
+		t.Fatalf("CreateActor: %v", err)
+	}
+
 	// stale-pod is claimed by this actor from a failed attempt but its sandbox
 	// class no longer matches the template; free-pod is eligible and free.
 	stale := &ateapipb.Worker{
@@ -104,7 +140,8 @@ func TestAssignWorkerStep_ReleasesIneligibleStaleWorkerInBackground(t *testing.T
 		SandboxClass:    "microvm",
 		State:           ateapipb.Worker_STATE_ACTIVE,
 		Assignment: &ateapipb.Assignment{
-			Actor: &ateapipb.ObjectRef{Atespace: "team-a", Name: "id1"},
+			Actor:    &ateapipb.ObjectRef{Atespace: "team-a", Name: "id1"},
+			ActorUid: actor.GetMetadata().GetUid(),
 		},
 	}
 	free := &ateapipb.Worker{
@@ -118,14 +155,6 @@ func TestAssignWorkerStep_ReleasesIneligibleStaleWorkerInBackground(t *testing.T
 		if err := persistence.CreateWorker(ctx, w); err != nil {
 			t.Fatalf("CreateWorker(%s): %v", w.GetWorkerPod(), err)
 		}
-	}
-
-	actor, err := persistence.CreateActor(ctx, &ateapipb.Actor{
-		Metadata: &ateapipb.ResourceMetadata{Atespace: "team-a", Name: "id1"},
-		Status:   ateapipb.Actor_STATUS_SUSPENDED,
-	})
-	if err != nil {
-		t.Fatalf("CreateActor: %v", err)
 	}
 
 	cacheCtx, cancel := context.WithCancel(ctx)
@@ -207,7 +236,8 @@ func TestAssignWorkerStep_RetryAfterConflictPicksFreshWorker(t *testing.T) {
 	// its stored version past the failed attempt's snapshot.
 	claimed := proto.Clone(beforeClaim).(*ateapipb.Worker)
 	claimed.Assignment = &ateapipb.Assignment{
-		Actor: &ateapipb.ObjectRef{Atespace: "team-a", Name: "other"},
+		Actor:    &ateapipb.ObjectRef{Atespace: "team-a", Name: "other"},
+		ActorUid: "other-actor-uid",
 	}
 	if err := persistence.UpdateWorker(ctx, claimed, claimed.GetVersion()); err != nil {
 		t.Fatalf("UpdateWorker (concurrent claim): %v", err)
@@ -232,7 +262,8 @@ func TestAssignWorkerStep_RetryAfterConflictPicksFreshWorker(t *testing.T) {
 	// contested worker mutated with our assignment, at the pre-claim version.
 	stale := proto.Clone(beforeClaim).(*ateapipb.Worker)
 	stale.Assignment = &ateapipb.Assignment{
-		Actor: &ateapipb.ObjectRef{Atespace: "team-a", Name: "id1"},
+		Actor:    &ateapipb.ObjectRef{Atespace: "team-a", Name: "id1"},
+		ActorUid: actor.GetMetadata().GetUid(),
 	}
 	step := &AssignWorkerStep{store: persistence, workerCache: wc, scheduler: scheduling.New(wc)}
 	state := &ResumeState{
@@ -253,15 +284,15 @@ func TestAssignWorkerStep_RetryAfterConflictPicksFreshWorker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetWorker(contested-pod): %v", err)
 	}
-	if got := storedContested.GetAssignment().GetActor().GetName(); got != "other" {
-		t.Errorf("contested worker assignment = %v, want to remain with actor %q", storedContested.GetAssignment(), "other")
+	if got := storedContested.GetAssignment().GetActorUid(); got != "other-actor-uid" {
+		t.Errorf("contested worker assignment = %v, want to remain with actor %q", storedContested.GetAssignment(), "other-actor-uid")
 	}
 	storedFallback, err := persistence.GetWorker(ctx, "worker-ns", "pool", "fallback-pod")
 	if err != nil {
 		t.Fatalf("GetWorker(fallback-pod): %v", err)
 	}
-	if got := storedFallback.GetAssignment().GetActor().GetName(); got != "id1" {
-		t.Errorf("fallback worker assignment = %v, want actor %q", storedFallback.GetAssignment(), "id1")
+	if got := storedFallback.GetAssignment().GetActorUid(); got != actor.GetMetadata().GetUid() {
+		t.Errorf("fallback worker assignment = %v, want actor uid %q", storedFallback.GetAssignment(), actor.GetMetadata().GetUid())
 	}
 
 	storedActor, err := persistence.GetActor(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"})
@@ -271,8 +302,8 @@ func TestAssignWorkerStep_RetryAfterConflictPicksFreshWorker(t *testing.T) {
 	if storedActor.GetStatus() != ateapipb.Actor_STATUS_RESUMING {
 		t.Errorf("stored actor status = %v, want %v", storedActor.GetStatus(), ateapipb.Actor_STATUS_RESUMING)
 	}
-	if got := storedActor.GetAteomPodName(); got != "fallback-pod" {
-		t.Errorf("stored actor AteomPodName = %q, want %q", got, "fallback-pod")
+	if got := storedActor.GetWorkerAssignment().GetWorkerPod(); got != "fallback-pod" {
+		t.Errorf("stored actor WorkerAssignment.WorkerPod = %q, want %q", got, "fallback-pod")
 	}
 }
 
@@ -445,11 +476,13 @@ func TestResumeActorWorkflow_RejectedAndIdempotentPaths(t *testing.T) {
 			w := newTestActorWorkflow(t, st, "ns", "tmpl1")
 
 			seedWorkflowActor(t, ctx, st, resources.ActorRef{Atespace: "team-a", Name: "id1"}, "ns", "tmpl1", tc.seedStatus, func(a *ateapipb.Actor) {
-				a.AteomPodNamespace = "wns"
-				a.AteomPodName = "wpod"
-				a.AteomPodIp = "1.2.3.4"
-				a.AteomPodUid = "uid"
-				a.WorkerPoolName = "pool1"
+				a.WorkerAssignment = &ateapipb.WorkerAssignment{
+					WorkerNamespace: "wns",
+					WorkerPool:      "pool1",
+					WorkerPod:       "wpod",
+					WorkerPodUid:    "uid",
+					WorkerPodIp:     "1.2.3.4",
+				}
 			})
 
 			actor, resumed, err := w.ResumeActor(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"}, false)
@@ -540,11 +573,11 @@ func TestResumeSteps_CheckPrerequisite(t *testing.T) {
 				// CallAteletRestoreStep's worker checks pass; this test only
 				// verifies status gating.
 				state := &ResumeState{
-					Actor: &ateapipb.Actor{Status: st},
+					Actor: &ateapipb.Actor{Status: st, Metadata: &ateapipb.ResourceMetadata{Name: "id1", Uid: "actor-uid-1"}},
 					Worker: &ateapipb.Worker{
 						SandboxClass: string(atev1alpha1.SandboxClassGvisor),
 						State:        ateapipb.Worker_STATE_ACTIVE,
-						Assignment:   &ateapipb.Assignment{Actor: &ateapipb.ObjectRef{Name: "id1"}},
+						Assignment:   &ateapipb.Assignment{Actor: &ateapipb.ObjectRef{Atespace: "team-a", Name: "id1"}, ActorUid: "actor-uid-1"},
 					},
 					ActorTemplate: &atev1alpha1.ActorTemplate{Spec: atev1alpha1.ActorTemplateSpec{SandboxClass: atev1alpha1.SandboxClassGvisor}},
 				}
@@ -555,17 +588,65 @@ func TestResumeSteps_CheckPrerequisite(t *testing.T) {
 	}
 }
 
-// TestResumeActor_CrashesOnCorruptWorkerAssignment verifies that a RESUMING
-// actor with only some of its worker assignment fields populated is moved to
-// CRASHED by LoadActorForResumeStep and the resume fails with Aborted.
-func TestResumeActor_CrashesOnCorruptWorkerAssignment(t *testing.T) {
+// TestResumeActor_MetricSkipsAlreadyRunningNoop guards the recording rule: the
+// router resumes per routed request, so a clean already-running no-op must not
+// be recorded, while failures must be.
+func TestResumeActor_MetricSkipsAlreadyRunningNoop(t *testing.T) {
+	tests := []struct {
+		name       string
+		seedStatus ateapipb.Actor_Status
+		wantRecord bool
+	}{
+		{name: "already running no-op is skipped", seedStatus: ateapipb.Actor_STATUS_RUNNING, wantRecord: false},
+		{name: "failed resume is recorded", seedStatus: ateapipb.Actor_STATUS_CRASHED, wantRecord: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			st, cleanup := storetest.SetupTestStore(t)
+			defer cleanup()
+			w := newTestActorWorkflow(t, st, "ns", "tmpl1")
+			inst, reader := newTestInstruments(t)
+			w.instruments = inst
+
+			seedWorkflowActor(t, ctx, st, resources.ActorRef{Atespace: "team-a", Name: "id1"}, "ns", "tmpl1", tt.seedStatus, func(a *ateapipb.Actor) {
+				a.WorkerAssignment = &ateapipb.WorkerAssignment{
+					WorkerNamespace: "wns",
+					WorkerPool:      "pool1",
+					WorkerPod:       "wpod",
+					WorkerPodUid:    "uid",
+				}
+			})
+
+			_, _, err := w.ResumeActor(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"}, false)
+			if tt.wantRecord && err == nil {
+				t.Fatal("expected resume to fail, got nil error")
+			}
+			if !tt.wantRecord && err != nil {
+				t.Fatalf("ResumeActor failed: %v", err)
+			}
+
+			_, recorded := collectMetric(t, reader, lifecycleOpDurationMetric)
+			if recorded != tt.wantRecord {
+				t.Errorf("lifecycle datapoint recorded = %v, want %v", recorded, tt.wantRecord)
+			}
+		})
+	}
+}
+
+// TestResumeActor_CrashesOnMissingWorkerAssignment verifies that a RESUMING
+// actor with no worker assignment is moved to CRASHED by
+// LoadActorForResumeStep and the resume fails with Aborted. A RESUMING actor
+// always has a worker assigned, so reaching this state means the record is
+// corrupt and the actor cannot be recovered.
+func TestResumeActor_CrashesOnMissingWorkerAssignment(t *testing.T) {
 	ctx := context.Background()
 	st, cleanup := storetest.SetupTestStore(t)
 	defer cleanup()
 	w := newTestActorWorkflow(t, st, "ns", "tmpl1")
 
 	seedWorkflowActor(t, ctx, st, resources.ActorRef{Atespace: "team-a", Name: "id1"}, "ns", "tmpl1", ateapipb.Actor_STATUS_RESUMING, func(a *ateapipb.Actor) {
-		a.AteomPodName = "worker-1" // AteomPodUid and WorkerPoolName left empty
+		a.WorkerAssignment = nil // RESUMING without a worker: corrupt record
 	})
 
 	_, _, err := w.ResumeActor(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"}, false)
@@ -590,10 +671,16 @@ func TestResumeActor_CrashesOnCorruptWorkerAssignment(t *testing.T) {
 // which is not ours — must not be written.
 func TestCallAteletRestoreStep_CheckPrerequisite_WorkerOwnership(t *testing.T) {
 	ownAssignment := &ateapipb.Assignment{
-		Actor: &ateapipb.ObjectRef{Atespace: "team-a", Name: "shared"},
+		Actor:    &ateapipb.ObjectRef{Atespace: "team-a", Name: "shared"},
+		ActorUid: "own-actor-uid",
 	}
 	otherAssignment := &ateapipb.Assignment{
-		Actor: &ateapipb.ObjectRef{Atespace: "team-b", Name: "shared"},
+		Actor:    &ateapipb.ObjectRef{Atespace: "team-b", Name: "shared"},
+		ActorUid: "other-actor-uid",
+	}
+	staleIncarnationAssignment := &ateapipb.Assignment{
+		Actor:    &ateapipb.ObjectRef{Atespace: "team-a", Name: "shared"},
+		ActorUid: "stale-incarnation-uid",
 	}
 
 	tests := []struct {
@@ -616,6 +703,14 @@ func TestCallAteletRestoreStep_CheckPrerequisite_WorkerOwnership(t *testing.T) {
 			wantCode:        codes.Aborted,
 			wantActorStatus: ateapipb.Actor_STATUS_CRASHED,
 			wantAssignment:  otherAssignment,
+		},
+		{
+			name:            "crashes actor and leaves worker untouched when assigned to previous incarnation of same actor",
+			sandboxClass:    "gvisor",
+			assignment:      staleIncarnationAssignment,
+			wantCode:        codes.Aborted,
+			wantActorStatus: ateapipb.Actor_STATUS_CRASHED,
+			wantAssignment:  staleIncarnationAssignment,
 		},
 		{
 			name:            "crashes actor and leaves worker untouched when assignment is cleared",
@@ -671,7 +766,7 @@ func TestCallAteletRestoreStep_CheckPrerequisite_WorkerOwnership(t *testing.T) {
 			step := &CallAteletRestoreStep{store: persistence, scheduler: scheduling.New(nil)}
 			state := &ResumeState{
 				Actor: &ateapipb.Actor{
-					Metadata: &ateapipb.ResourceMetadata{Atespace: "team-a", Name: "shared"},
+					Metadata: &ateapipb.ResourceMetadata{Atespace: "team-a", Name: "shared", Uid: "own-actor-uid"},
 					Status:   ateapipb.Actor_STATUS_RESUMING,
 				},
 				Worker:        seeded,
@@ -711,7 +806,7 @@ func TestCallAteletRestoreStep_CheckPrerequisite_WorkerOwnership(t *testing.T) {
 // location into the resume state, and the resume fails early when the golden
 // snapshot is unavailable.
 func TestLoadActorForResumeStep_OnGoldenDataResume(t *testing.T) {
-	const goldenLocation = "gs://bucket/ate-golden/snapshots/1/"
+	const goldenSnapshotURI = "gs://bucket/golden-root/snapshots/ate-golden/golden-1"
 	actorRef := resources.ActorRef{Atespace: "team-a", Name: "id1"}
 
 	tests := []struct {
@@ -731,7 +826,7 @@ func TestLoadActorForResumeStep_OnGoldenDataResume(t *testing.T) {
 		seedGolden     bool
 		goldenScope    ateapipb.SnapshotContentScope
 		wantCode       codes.Code
-		wantGoldenLoc  string
+		wantGoldenURI  string
 	}{
 		{
 			name:           "resolves golden location for Data durable snapshot",
@@ -741,7 +836,7 @@ func TestLoadActorForResumeStep_OnGoldenDataResume(t *testing.T) {
 			seedGolden:     true,
 			goldenScope:    ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL,
 			wantCode:       codes.OK,
-			wantGoldenLoc:  goldenLocation,
+			wantGoldenURI:  goldenSnapshotURI,
 		},
 		{
 			name:           "resolves golden location for paused actor with Data onPause",
@@ -752,7 +847,7 @@ func TestLoadActorForResumeStep_OnGoldenDataResume(t *testing.T) {
 			seedGolden:     true,
 			goldenScope:    ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL,
 			wantCode:       codes.OK,
-			wantGoldenLoc:  goldenLocation,
+			wantGoldenURI:  goldenSnapshotURI,
 		},
 		{
 			// A Full pause snapshot restores from its own content; the policy
@@ -765,7 +860,7 @@ func TestLoadActorForResumeStep_OnGoldenDataResume(t *testing.T) {
 			seedGolden:     true,
 			goldenScope:    ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL,
 			wantCode:       codes.OK,
-			wantGoldenLoc:  "",
+			wantGoldenURI:  "",
 		},
 		{
 			name:           "fails when golden snapshot is not Full",
@@ -799,7 +894,7 @@ func TestLoadActorForResumeStep_OnGoldenDataResume(t *testing.T) {
 			seedGolden:     true,
 			goldenScope:    ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL,
 			wantCode:       codes.OK,
-			wantGoldenLoc:  "",
+			wantGoldenURI:  "",
 		},
 		{
 			name:           "leaves golden location empty under ColdBoot fromData",
@@ -809,7 +904,7 @@ func TestLoadActorForResumeStep_OnGoldenDataResume(t *testing.T) {
 			seedGolden:     true,
 			goldenScope:    ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL,
 			wantCode:       codes.OK,
-			wantGoldenLoc:  "",
+			wantGoldenURI:  "",
 		},
 	}
 
@@ -822,7 +917,8 @@ func TestLoadActorForResumeStep_OnGoldenDataResume(t *testing.T) {
 				if _, err := persistence.CreateActorSnapshot(ctx, &ateapipb.ActorSnapshot{
 					Metadata:     &ateapipb.ResourceMetadata{Atespace: resources.GoldenActorAtespace, Name: tt.goldenSnapshot},
 					ContentScope: tt.goldenScope,
-				}, goldenLocation); err != nil {
+					SnapshotUri:  goldenSnapshotURI,
+				}); err != nil {
 					t.Fatalf("CreateActorSnapshot(golden): %v", err)
 				}
 			}
@@ -830,14 +926,15 @@ func TestLoadActorForResumeStep_OnGoldenDataResume(t *testing.T) {
 			var seedOpts []func(*ateapipb.Actor)
 			if tt.paused {
 				seedOpts = append(seedOpts, func(a *ateapipb.Actor) {
-					a.LocalSnapshotInfo = &ateapipb.LocalSnapshotInfo{SnapshotPrefix: "pause-1"}
+					a.LocalSnapshotInfo = &ateapipb.LocalSnapshotInfo{SnapshotName: "pause-1"}
 				})
 			} else {
 				snap, err := persistence.CreateActorSnapshot(ctx, &ateapipb.ActorSnapshot{
 					Metadata:     &ateapipb.ResourceMetadata{Atespace: actorRef.Atespace, Name: "snap-1"},
 					SourceActor:  &ateapipb.ObjectRef{Atespace: actorRef.Atespace, Name: actorRef.Name},
 					ContentScope: tt.contentScope,
-				}, "gs://bucket/actors/1/snapshots/2/")
+					SnapshotUri:  "gs://bucket/root/snapshots/" + actorRef.Atespace + "/snap-1",
+				})
 				if err != nil {
 					t.Fatalf("CreateActorSnapshot: %v", err)
 				}
@@ -874,8 +971,8 @@ func TestLoadActorForResumeStep_OnGoldenDataResume(t *testing.T) {
 			if err != nil {
 				return
 			}
-			if state.GoldenSnapshotLocation != tt.wantGoldenLoc {
-				t.Errorf("state.GoldenSnapshotLocation = %q, want %q", state.GoldenSnapshotLocation, tt.wantGoldenLoc)
+			if got := state.GoldenSnapshotURI.String(); got != tt.wantGoldenURI {
+				t.Errorf("state.GoldenSnapshotURI = %q, want %q", got, tt.wantGoldenURI)
 			}
 			if !tt.paused && state.SnapshotScope != tt.contentScope {
 				t.Errorf("state.SnapshotScope = %v, want %v", state.SnapshotScope, tt.contentScope)
@@ -898,7 +995,8 @@ func TestLoadActorForResumeStep_GoldenFallbackRejectsNonFullGolden(t *testing.T)
 	if _, err := persistence.CreateActorSnapshot(ctx, &ateapipb.ActorSnapshot{
 		Metadata:     &ateapipb.ResourceMetadata{Atespace: resources.GoldenActorAtespace, Name: "golden-1"},
 		ContentScope: ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA,
-	}, "gs://bucket/ate-golden/snapshots/1/"); err != nil {
+		SnapshotUri:  "gs://bucket/golden-root/snapshots/ate-golden/golden-1",
+	}); err != nil {
 		t.Fatalf("CreateActorSnapshot(golden): %v", err)
 	}
 	seedWorkflowActor(t, ctx, persistence, actorRef, "ns", "tmpl1", ateapipb.Actor_STATUS_SUSPENDED)

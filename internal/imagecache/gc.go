@@ -53,6 +53,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
@@ -98,25 +99,33 @@ func layerSetSignature(hexes []string) string {
 // the images and layers referenced by actors placed on this node. Bundles
 // exist exactly while an actor runs or transitions here (spec written
 // before any mount, deleted after unmount), so the scan protects actively
-// mounted images via the same authority that hands out mounts. Unreadable
-// specs root nothing (logged); leftover bundles from crashed actors
-// over-pin until wiped.
-func (s *Store) InUse() RootSet {
+// mounted images via the same authority that hands out mounts. Leftover
+// bundles from crashed actors over-pin until wiped.
+//
+// A non-nil error means the root set may be incomplete: an unreadable
+// actors dir, bundles dir, or spec. Deleting callers must then do nothing —
+// a missing root fails toward retiring a running actor's layers, and for a
+// long-running actor the spec is the only protection (its record mtime can
+// be arbitrarily old, so min-age would not save it). A missing dir or spec
+// file is not an error: no actor was ever placed, the actor is torn down,
+// or the bundle predates its spec write.
+func (s *Store) InUse() (RootSet, error) {
 	// Per-item lines are Debug and gated: on a full node this loop emits
 	// hundreds of them, and ungated slog calls build their attr args even
 	// when suppressed.
 	dbg := slog.Default().Enabled(context.Background(), slog.LevelDebug)
 	rs := RootSet{ImageDigests: map[string]bool{}, LayerHexes: map[string]bool{}, LayerSets: map[string]bool{}}
 	if s.actorsDir == "" {
-		return rs
+		return rs, nil
 	}
 	actorEntries, err := os.ReadDir(s.actorsDir)
 	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			slog.Warn("Failed to list actors dir for image-cache root set", slog.String("dir", s.actorsDir), slog.Any("err", err))
+		if errors.Is(err, os.ErrNotExist) {
+			return rs, nil
 		}
-		return rs
+		return rs, fmt.Errorf("while listing actors dir %q for root set: %w", s.actorsDir, err)
 	}
+	var errs []error
 	for _, actor := range actorEntries {
 		if !actor.IsDir() {
 			continue
@@ -124,7 +133,11 @@ func (s *Store) InUse() RootSet {
 		bundlesDir := filepath.Join(s.actorsDir, actor.Name(), "bundles")
 		bundles, err := os.ReadDir(bundlesDir)
 		if err != nil {
-			continue // no bundles: actor not placed / already torn down
+			if errors.Is(err, os.ErrNotExist) {
+				continue // no bundles: actor not placed / already torn down
+			}
+			errs = append(errs, fmt.Errorf("while listing bundles of actor %q: %w", actor.Name(), err))
+			continue
 		}
 		for _, bundle := range bundles {
 			if !bundle.IsDir() {
@@ -135,8 +148,7 @@ func (s *Store) InUse() RootSet {
 			// layers and fail toward deleting them.
 			spec, err := ReadSpec(filepath.Join(bundlesDir, bundle.Name()))
 			if err != nil {
-				slog.Warn("Unreadable bundle overlay spec during image-cache root-set scan",
-					slog.String("bundle", filepath.Join(bundlesDir, bundle.Name())), slog.Any("err", err))
+				errs = append(errs, fmt.Errorf("while reading bundle overlay spec %q: %w", filepath.Join(actor.Name(), "bundles", bundle.Name()), err))
 				continue
 			}
 			if spec == nil {
@@ -145,7 +157,7 @@ func (s *Store) InUse() RootSet {
 			addSpecRoots(&rs, spec, filepath.Join(actor.Name(), "bundles", bundle.Name()), dbg)
 		}
 	}
-	return rs
+	return rs, errors.Join(errs...)
 }
 
 // addSpecRoots roots one bundle spec's image digest, layers, and exact
@@ -179,8 +191,10 @@ func addSpecRoots(rs *RootSet, spec *OverlaySpec, bundle string, dbg bool) {
 
 // EvictStats reports what an eviction pass did (or, dry-run, would do).
 type EvictStats struct {
-	// FreedBytes sums recorded sizes of retired layers. Optimistic
-	// (tar-stream sizes); the caller's next statfs self-corrects.
+	// FreedBytes sums retired layers' recorded sizes, read from the size
+	// files that rode along with the rename (walked read-only only when
+	// absent) — consistent with CacheSize's accounting. An estimate; the
+	// caller's next statfs self-corrects.
 	FreedBytes int64
 	// EvictedImages / EvictedLayers count deleted records and retired layer
 	// dirs.
@@ -191,8 +205,10 @@ type EvictStats struct {
 	// RootedImages counts image records excluded because a bundle overlay
 	// spec roots them (the "actively placed" protection).
 	RootedImages int
-	// SkippedRooted / SkippedFresh count vetoes, whether fired at listing
-	// time or by the per-victim re-check during the pass.
+	// SkippedRooted counts layers kept during the pass because a bundle
+	// spec roots them (rooted images at listing time count into
+	// RootedImages instead). SkippedFresh counts min-age vetoes, fired at
+	// listing time or by the per-victim re-check.
 	SkippedRooted, SkippedFresh int
 	// OrphanLayers counts layers reclaimed by the startup scan
 	// (RecoverOrphans) — always zero for periodic passes, which reach
@@ -215,14 +231,22 @@ type evictionCandidate struct {
 //
 // Per-item failures are aggregated into the error, not fatal: the pass
 // continues and each item retries next pass. Passes are serialized. An
-// incomplete record enumeration skips the pass entirely — refcounts from
-// partial data would retire layers the unread records still reference.
+// incomplete record or bundle-spec enumeration skips the pass entirely —
+// refcounts and roots from partial data would retire layers that unread
+// records still reference or running actors still mount.
 func (s *Store) EvictUnused(ctx context.Context, targetBytes int64, dryRun bool) (EvictStats, error) {
 	var stats EvictStats
 	s.evictMu.Lock()
 	defer s.evictMu.Unlock()
 
-	roots := s.InUse()
+	roots, rootsErr := s.InUse()
+	if rootsErr != nil {
+		// Same shape as the record gate below: refcounts and roots from a
+		// partial scan would retire layers a running actor still mounts.
+		slog.ErrorContext(ctx, "Image cache eviction pass skipped: bundle specs could not be fully enumerated",
+			slog.Any("err", rootsErr))
+		return stats, rootsErr
+	}
 	cutoff := time.Now().Add(-s.minAge)
 
 	candidates, refcount, complete, listErr := s.listEviction(roots, cutoff, &stats)
@@ -374,17 +398,20 @@ func (s *Store) retireCandidateLayers(ctx context.Context, cand evictionCandidat
 		if dryRun {
 			size, st = s.dryRunRetire(hex, cutoff)
 		} else {
-			// Sized before retiring. Backfilling here can rewind a
-			// concurrent reuse-touch — bounded by retireLayer's veto and
-			// the pull path's post-unpack re-verify.
 			var rerr error
-			if size, rerr = s.layerSize(filepath.Join(s.layersDir(), hex)); rerr != nil {
-				size = 0 // unknown size: still evict, credit nothing
-			}
 			if retiredPath, st, rerr = s.retireLayer(hex, cutoff); rerr != nil {
 				errs = append(errs, rerr)
 				kept = true
 				continue
+			}
+			if st == retireRetired {
+				// Credit from the retired dir, whose size file rode along
+				// with the rename (O(1); walked only if absent, read-only
+				// either way). Sizing after the retire means the eviction
+				// path never writes a backfill into the live pool.
+				if size, rerr = s.layerSizeReadOnly(retiredPath); rerr != nil {
+					size = 0 // unknown size: still evicted, credit nothing
+				}
 			}
 		}
 		switch st {
@@ -413,21 +440,28 @@ func (s *Store) retireCandidateLayers(ctx context.Context, cand evictionCandidat
 // of two-phase deletion, run outside every lock: the dirs are unreachable
 // by diffID, so this contends with nothing. A crash mid-removal leaves
 // ".rm-*" dirs for the startup sweep.
+//
+// Errors are collected per dir rather than through errgroup.Wait, which
+// keeps only the first: every failed dir sits invisible as ".rm-*" until
+// the next startup, so each deserves surfacing.
 func removeRetiredDirs(dirs []string) []error {
-	var errs []error
+	var (
+		mu   sync.Mutex
+		errs []error
+	)
 	g := new(errgroup.Group)
 	g.SetLimit(4)
 	for _, dir := range dirs {
 		g.Go(func() error {
 			if err := RemoveAllWritable(dir); err != nil {
-				return fmt.Errorf("while removing retired layer %q: %w", dir, err)
+				mu.Lock()
+				errs = append(errs, fmt.Errorf("while removing retired layer %q: %w", dir, err))
+				mu.Unlock()
 			}
 			return nil
 		})
 	}
-	if err := g.Wait(); err != nil {
-		errs = append(errs, err)
-	}
+	_ = g.Wait() // goroutines only ever return nil
 	return errs
 }
 
@@ -440,15 +474,21 @@ func removeRetiredDirs(dirs []string) []error {
 // damage, the accepted alternative to an fsck against a live pool every
 // pass — mid-life debris leaks until the next restart, logged.
 //
-// Skipped entirely (ERROR) when the record enumeration is incomplete:
-// refcounts from partial data make referenced layers look like garbage.
+// Skipped entirely (ERROR) when the record or bundle-spec enumeration is
+// incomplete: refcounts from partial data make referenced layers look
+// like garbage, and a missing spec root would sweep a mounted layer.
 // Bundle-spec roots and min-age still veto.
 func (s *Store) RecoverOrphans(ctx context.Context) (EvictStats, error) {
 	var stats EvictStats
 	s.evictMu.Lock()
 	defer s.evictMu.Unlock()
 
-	roots := s.InUse()
+	roots, rootsErr := s.InUse()
+	if rootsErr != nil {
+		slog.ErrorContext(ctx, "Image cache startup orphan scan skipped: bundle specs could not be fully enumerated; orphaned layers (if any) will persist until the specs are repaired",
+			slog.Any("err", rootsErr))
+		return stats, rootsErr
+	}
 	cutoff := time.Now().Add(-s.minAge)
 	_, refcount, complete, listErr := s.listEviction(roots, cutoff, &stats)
 	if !complete {
@@ -505,12 +545,16 @@ func (s *Store) sweepOrphanLayers(ctx context.Context, roots RootSet, refcount m
 			size, st = s.dryRunRetire(hex, cutoff)
 		} else {
 			var rerr error
-			if size, rerr = s.layerSize(filepath.Join(s.layersDir(), hex)); rerr != nil {
-				size = 0 // unknown size: still evict, credit nothing
-			}
 			if retiredPath, st, rerr = s.retireLayer(hex, cutoff); rerr != nil {
 				errs = append(errs, rerr)
 				continue
+			}
+			if st == retireRetired {
+				// See retireCandidateLayers: size file rode along with the
+				// rename; read-only, never a write into the live pool.
+				if size, rerr = s.layerSizeReadOnly(retiredPath); rerr != nil {
+					size = 0
+				}
 			}
 		}
 		if st != retireRetired {
@@ -602,6 +646,11 @@ func (s *Store) listEviction(roots RootSet, cutoff time.Time, stats *EvictStats)
 		for _, d := range rec.DiffIDs {
 			diffID, err := v1.NewHash(d)
 			if err != nil {
+				// A garbled diffID contributes no refcount, so a layer
+				// referenced only through it would look unreferenced — the
+				// same failure direction as an undecodable record. Gate.
+				complete = false
+				errs = append(errs, fmt.Errorf("invalid diffID %q in image record %s: %w", d, digest, err))
 				continue
 			}
 			if !seen[diffID.Hex] {
@@ -616,10 +665,12 @@ func (s *Store) listEviction(roots RootSet, cutoff time.Time, stats *EvictStats)
 			continue
 		}
 		// A record is rooted either by digest (a bundle spec naming it) or
-		// because every layer it lists is rooted. The latter covers the
-		// multi-arch twin — pull records an image under both the index
-		// and per-platform child digest, but a bundle spec carries only the
-		// requested one — and digestless (pre-ImageDigest) specs. Without it the
+		// because its exact layer set matches a rooted bundle's (see
+		// RootSet.LayerSets — deliberately not "every layer rooted
+		// somewhere"). The exact-set rule covers the multi-arch twin —
+		// pull records an image under both the index and per-platform
+		// child digest, but a bundle spec carries only the requested
+		// one — and digestless (pre-ImageDigest) specs. Without it the
 		// twin is evicted and rewritten on every pull of a rooted image:
 		// harmless but pure churn, and it inflates the eviction counters.
 		if roots.ImageDigests[digest.String()] || (len(unique) > 0 && roots.LayerSets[layerSetSignature(unique)]) {
