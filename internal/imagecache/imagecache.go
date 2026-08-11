@@ -224,10 +224,11 @@ func New(root string, opts ...Option) (*Store, error) {
 		return nil, err
 	}
 	// Startup-only orphan recovery (see RecoverOrphans for why it must not
-	// run during normal operation). Failure is logged inside, never fatal:
-	// a corrupt record must not keep atelet from serving actors.
+	// run during normal operation). Never fatal: a corrupt record must not
+	// keep atelet from serving actors. Orphans (if any) persist until the
+	// named file is repaired and the next restart.
 	if _, err := s.RecoverOrphans(context.Background()); err != nil {
-		slog.Warn("Image cache startup orphan recovery incomplete", slog.Any("err", err))
+		slog.Error("Image cache startup orphan scan skipped", slog.Any("err", err))
 	}
 	return s, nil
 }

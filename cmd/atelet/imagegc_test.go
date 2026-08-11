@@ -14,7 +14,14 @@
 
 package main
 
-import "testing"
+import (
+	"errors"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/agent-substrate/substrate/internal/imagecache"
+)
 
 func TestImageCacheGCTarget(t *testing.T) {
 	const gib = int64(1 << 30)
@@ -105,30 +112,60 @@ func TestImageCacheGCTarget(t *testing.T) {
 }
 
 func TestValidateImageCacheGCFlags(t *testing.T) {
-	setFlags := func(high, low int) {
+	setFlags := func(high, low int, minAge time.Duration) {
 		*imageCacheHighPct = high
 		*imageCacheLowPct = low
+		*imageCacheMinAge = minAge
 	}
-	defer setFlags(85, 80)
+	t.Cleanup(func() { setFlags(85, 80, 2*time.Minute) })
 
-	setFlags(85, 80)
-	if err := validateImageCacheGCFlags(); err != nil {
-		t.Errorf("defaults rejected: %v", err)
+	cases := []struct {
+		name      string
+		high, low int
+		minAge    time.Duration
+		wantErr   bool
+	}{
+		{"defaults", 85, 80, 2 * time.Minute, false},
+		{"boundary high=100 low=0", 100, 0, 0, false},
+		{"high over 100", 101, 80, 0, true},
+		{"low equals high", 85, 85, 0, true},
+		{"low above high", 85, 90, 0, true},
+		{"negative low", 85, -1, 0, true},
+		{"negative min-age inverts the veto", 85, 80, -time.Second, true},
 	}
-	setFlags(101, 80)
-	if err := validateImageCacheGCFlags(); err == nil {
-		t.Error("high=101 accepted")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setFlags(tc.high, tc.low, tc.minAge)
+			err := validateImageCacheGCFlags()
+			if (err != nil) != tc.wantErr {
+				t.Errorf("high=%d low=%d minAge=%v: err=%v, wantErr=%v", tc.high, tc.low, tc.minAge, err, tc.wantErr)
+			}
+		})
 	}
-	setFlags(85, 85)
-	if err := validateImageCacheGCFlags(); err == nil {
-		t.Error("low == high accepted")
+}
+
+func TestClassifyGCPass(t *testing.T) {
+	gated := fmt.Errorf("pass gated: %w", imagecache.ErrIncompleteEnumeration)
+	perItem := errors.New("while removing retired layer: permission denied")
+	cases := []struct {
+		name          string
+		err           error
+		target, freed int64
+		want          gcPassOutcome
+	}{
+		{"gated pass", gated, 100, 0, gcPassSkipped},
+		{"gated wins even with zero target", gated, 0, 0, gcPassSkipped},
+		{"per-item errors are not a skip", perItem, 100, 100, gcPassComplete},
+		{"per-item errors with shortfall", perItem, 100, 40, gcPassShortfall},
+		{"shortfall", nil, 100, 40, gcPassShortfall},
+		{"target met", nil, 100, 100, gcPassComplete},
+		{"no target", nil, 0, 0, gcPassQuiet},
 	}
-	setFlags(85, 90)
-	if err := validateImageCacheGCFlags(); err == nil {
-		t.Error("low > high accepted")
-	}
-	setFlags(85, -1)
-	if err := validateImageCacheGCFlags(); err == nil {
-		t.Error("negative low accepted")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyGCPass(tc.err, tc.target, tc.freed); got != tc.want {
+				t.Errorf("classifyGCPass(%v, %d, %d) = %d, want %d", tc.err, tc.target, tc.freed, got, tc.want)
+			}
+		})
 	}
 }
