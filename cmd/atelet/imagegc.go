@@ -204,7 +204,9 @@ func (g *imageCacheGC) runPass(ctx context.Context) {
 	tStart := time.Now()
 	// Runs even at target 0: the enumeration gates should surface a
 	// corrupt record or spec on the next tick, not first under disk
-	// pressure. The zero-target pass is two ReadDirs plus record reads.
+	// pressure. Cost: the full root-set scan (a ReadDir per actor, a
+	// read per bundle spec) plus a read per image record — hundreds of
+	// small reads on a busy node. Deliberate, and cheap at this period.
 	stats, err := g.store.EvictUnused(ctx, target, g.dryRun)
 	attrs := []any{
 		slog.Int64("target_bytes", target),
