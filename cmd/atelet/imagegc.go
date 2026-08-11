@@ -124,7 +124,6 @@ func imageCacheGCTarget(capacity, available uint64, cacheSize, maxBytes int64, h
 // imageCacheGC is the loop's state: configuration snapshotted from the
 // flags at construction (the pass logic never reads globals, so it is
 // testable without flag juggling) plus the shortfall-backoff counter.
-// The observability phase adds its instruments here.
 type imageCacheGC struct {
 	store    *imagecache.Store
 	cacheDir string
