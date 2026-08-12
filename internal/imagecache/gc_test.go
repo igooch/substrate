@@ -363,6 +363,26 @@ func denyRead(t *testing.T, path string) {
 	t.Cleanup(func() { _ = os.Chmod(path, fi.Mode().Perm()) })
 }
 
+// Pins the invariant the fmt.Errorf("%w: %w", ...) gates rely on:
+// complete=false always pairs with a non-nil error (a nil would render
+// as %!w(<nil>), which errors.Join was immune to).
+func TestListEvictionIncompleteCarriesError(t *testing.T) {
+	store := newTestStore(t)
+	badPath := store.recordPath(v1.Hash{Algorithm: "sha256", Hex: strings.Repeat("dd", 32)})
+	if err := os.WriteFile(badPath, []byte(`{not json`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stats EvictStats
+	roots := RootSet{ImageDigests: map[string]bool{}, LayerHexes: map[string]bool{}, LayerSets: map[string]bool{}}
+	_, _, complete, err := store.listEviction(roots, time.Now(), &stats)
+	if complete {
+		t.Fatal("listEviction complete=true with an undecodable record")
+	}
+	if err == nil {
+		t.Fatal("complete=false with a nil error")
+	}
+}
+
 // A record whose layer references cannot be established — undecodable
 // JSON, or a garbled diffID inside valid JSON — contributes no refcounts,
 // so a layer referenced only through it would look unreferenced. Either
