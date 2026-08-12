@@ -273,6 +273,8 @@ func TestRunPassRecoversPanic(t *testing.T) {
 // every shortfallReminderEvery-th, streak preserved across a gated pass,
 // reset (re-arming the warnings) on a met or absent target.
 func TestNoteOutcomeShortfallBackoff(t *testing.T) {
+	// Swaps the process-global default logger: this package's tests must
+	// not use t.Parallel.
 	var buf bytes.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))

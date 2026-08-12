@@ -15,12 +15,16 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"math"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/agent-substrate/substrate/internal/imagecache"
 )
 
 func TestRunConfigValidate(t *testing.T) {
@@ -57,6 +61,7 @@ func TestRunConfigValidate(t *testing.T) {
 			c.setFlags = []string{"some-new-flag"}
 		}, "only valid with --refs-file", true},
 		{"min-free-gb overflow", func(c *runConfig) { c.minFreeGB = math.MaxUint64 }, "overflows", false},
+		{"min-free-gb past the int64 target", func(c *runConfig) { c.minFreeGB = 10_000_000_000 }, "overflows", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -86,6 +91,77 @@ func TestLooksLikeLiveNode(t *testing.T) {
 	}
 	if looksLikeLiveNode(filepath.Join(dir, "missing")) {
 		t.Error("missing dir: want false")
+	}
+	if os.Geteuid() != 0 {
+		// The point of the helper: an unreadable actors dir is still a
+		// node, not a validation host. (Root sees through the chmod.)
+		locked := filepath.Join(dir, "locked")
+		if err := os.MkdirAll(filepath.Join(locked, "actors"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(locked, 0); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(locked, 0o700) })
+		if !looksLikeLiveNode(filepath.Join(locked, "actors")) {
+			t.Error("EACCES actors dir: want true")
+		}
+	}
+}
+
+type fakeEvictor struct {
+	calls     int
+	gotTarget int64
+	stats     imagecache.EvictStats
+	err       error
+}
+
+func (f *fakeEvictor) EvictUnused(_ context.Context, target int64, _ bool) (imagecache.EvictStats, error) {
+	f.calls++
+	f.gotTarget = target
+	return f.stats, f.err
+}
+
+func TestLowWaterCooldown(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(1000, 0)
+	fake := &fakeEvictor{} // zero stats: every pass is fruitless
+	l := &lowWater{
+		store: fake, root: "/x", minFree: 100,
+		free: func(string) uint64 { return 10 },
+		now:  func() time.Time { return now },
+	}
+
+	l.evictIfLow(ctx)
+	if fake.gotTarget != 90 {
+		t.Errorf("target = %d, want 90 (minFree - free)", fake.gotTarget)
+	}
+	l.evictIfLow(ctx)
+	if fake.calls != 1 {
+		t.Errorf("calls after fruitless pass + immediate retry = %d, want 1 (cooldown)", fake.calls)
+	}
+
+	now = now.Add(fruitlessCooldown)
+	l.evictIfLow(ctx)
+	if fake.calls != 2 {
+		t.Errorf("calls once the cooldown elapsed = %d, want 2", fake.calls)
+	}
+
+	// A productive pass must not arm the cooldown, even at zero bytes
+	// credited (unreadable size files).
+	now = now.Add(fruitlessCooldown)
+	fake.stats = imagecache.EvictStats{EvictedLayers: 1}
+	l.evictIfLow(ctx)
+	l.evictIfLow(ctx)
+	if fake.calls != 4 {
+		t.Errorf("calls after productive passes = %d, want 4 (no cooldown)", fake.calls)
+	}
+
+	// Above the floor: no pass at all.
+	l.free = func(string) uint64 { return 200 }
+	l.evictIfLow(ctx)
+	if fake.calls != 4 {
+		t.Errorf("calls with free space above the floor = %d, want 4", fake.calls)
 	}
 }
 

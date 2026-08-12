@@ -54,6 +54,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -77,7 +78,7 @@ var (
 	minFreeGB = flag.Uint64("min-free-gb", 150, "Ask the eviction engine to reclaim disk when the cache volume has less free space than this")
 	evictIdle = flag.Duration("evict-idle", 10*time.Minute, "Eviction min-age: layers and records younger than this are never evicted. Minimum 1m on a node with an actors dir. NOTE: if the corpus unpacks faster than this window elapses on a small disk, nothing is evictable while the disk fills — size it well below disk-fill time")
 	evictAll  = flag.Bool("evict-all", false, "Evict everything evictable from the cache and exit (no refs file needed). Rooted images and anything younger than --evict-idle survive. Requires --force on a node with an actors dir")
-	force     = flag.Bool("force", false, "Allow eviction on a node with an actors dir")
+	force     = flag.Bool("force", false, "Allow eviction on a node with an actors dir (required there, for both modes)")
 	platform  = flag.String("platform", "linux/amd64", "Image platform to pull")
 )
 
@@ -94,7 +95,8 @@ func looksLikeLiveNode(dir string) bool {
 // must not be tuned away. Validation hosts keep full freedom.
 const liveNodeIdleFloor = time.Minute
 
-// errUsage marks validation failures that should print flag usage.
+// errUsage marks malformed invocations, which exit 2 with flag usage;
+// well-formed but refused configurations exit 1 via log.Fatal.
 var errUsage = errors.New("usage")
 
 // runConfig is the flag state validate checks — a plain struct so the
@@ -117,8 +119,10 @@ func (c runConfig) validate() error {
 		// future), making even in-flight pulls' layers evictable.
 		return fmt.Errorf("--evict-idle %v must be >= 0", c.evictIdle)
 	}
-	if c.minFreeGB > math.MaxUint64/uint64(1e9) {
-		return fmt.Errorf("--min-free-gb %d overflows a byte count", c.minFreeGB)
+	// Bound by the engine's int64 target, not uint64: past this the
+	// shortfall wraps negative and EvictUnused silently evicts nothing.
+	if c.minFreeGB > math.MaxInt64/uint64(1e9) {
+		return fmt.Errorf("--min-free-gb %d overflows the eviction target", c.minFreeGB)
 	}
 	if c.evictAll {
 		var stray []string
@@ -188,6 +192,12 @@ func main() {
 	if *evictAll {
 		// Flush mode: no refs, no registry auth. New also reclaims any
 		// crash-debris orphans before the pass.
+		// New would MkdirAll a typo'd --cache-dir into a fresh, empty
+		// cache and "successfully" flush it; only ever open an existing
+		// one (the version marker is written on first creation).
+		if _, err := os.Stat(filepath.Join(*cacheDir, "version")); err != nil {
+			log.Fatalf("%s does not look like an existing image cache: %v", *cacheDir, err)
+		}
 		store, err := newStore()
 		if err != nil {
 			log.Fatalf("opening cache: %v", err)
@@ -254,13 +264,14 @@ func main() {
 		countMu     sync.Mutex
 	)
 	tStart := time.Now()
+	lw := &lowWater{store: store, root: *cacheDir, minFree: *minFreeGB * 1e9, free: freeBytes, now: time.Now}
 
 	for _, ref := range refs {
 		sem <- struct{}{}
 		wg.Go(func() {
 			defer func() { <-sem }()
 
-			evictIfLow(ctx, store, *cacheDir, *minFreeGB*1e9)
+			lw.evictIfLow(ctx)
 
 			r := validateOne(ctx, store, ref, *timeout)
 
@@ -331,6 +342,33 @@ func shortRef(ref string) string {
 	return ref
 }
 
+// evictor is the slice of *imagecache.Store the low-water path uses — a
+// seam so the cooldown contract is testable.
+type evictor interface {
+	EvictUnused(ctx context.Context, targetBytes int64, dryRun bool) (imagecache.EvictStats, error)
+}
+
+const (
+	fruitlessCooldown = 30 * time.Second
+	evictPassTimeout  = 5 * time.Minute
+)
+
+// lowWater serializes low-water eviction across validation workers: one
+// attempt per episode (queued workers re-check and return), backed off
+// after a fruitless pass — typically everything is still younger than
+// --evict-idle, or the pass is gated — so queued workers don't each run
+// a full engine pass until free space moves.
+type lowWater struct {
+	store   evictor
+	root    string
+	minFree uint64
+	free    func(string) uint64 // statfs; faked in tests
+	now     func() time.Time
+
+	mu            sync.Mutex
+	lastFruitless time.Time
+}
+
 // evictIfLow asks the eviction engine to reclaim the free-space
 // shortfall below minFree. All engine protections apply, so in-flight
 // validations are never raced. Unlike atelet's loop, the target is not
@@ -339,29 +377,23 @@ func shortRef(ref string) string {
 // engine's FreedBytes are different estimates (disk blocks vs recorded
 // sizes), so a "met" target can leave free space still short; the next
 // worker's re-check converges.
-var (
-	evictMu sync.Mutex // one attempt per low-water episode; queued workers re-check and return
-	// lastFruitless backs off when a pass freed nothing — everything
-	// younger than --evict-idle, or a gated pass. Without it every queued
-	// worker would run a full engine pass ahead of its validation until
-	// free space moved.
-	lastFruitless time.Time
-)
+func (l *lowWater) evictIfLow(ctx context.Context) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 
-const fruitlessCooldown = 30 * time.Second
-
-func evictIfLow(ctx context.Context, store *imagecache.Store, cacheRoot string, minFree uint64) {
-	evictMu.Lock()
-	defer evictMu.Unlock()
-
-	free := freeBytes(cacheRoot)
-	if free >= minFree {
+	free := l.free(l.root)
+	if free >= l.minFree {
 		return
 	}
-	if time.Since(lastFruitless) < fruitlessCooldown {
+	if l.now().Sub(l.lastFruitless) < fruitlessCooldown {
 		return
 	}
-	stats, err := store.EvictUnused(ctx, int64(minFree-free), false)
+	// Bound the pass: it holds the low-water lock, so a stall on slow
+	// storage would block every worker indefinitely. The engine honors
+	// cancellation between candidates.
+	ctx, cancel := context.WithTimeout(ctx, evictPassTimeout)
+	defer cancel()
+	stats, err := l.store.EvictUnused(ctx, int64(l.minFree-free), false)
 	switch {
 	case errors.Is(err, imagecache.ErrIncompleteEnumeration):
 		// Gated: nothing was attempted; the error names the path to repair.
@@ -373,12 +405,12 @@ func evictIfLow(ctx context.Context, store *imagecache.Store, cacheRoot string, 
 	}
 	if stats.EvictedImages > 0 || stats.EvictedLayers > 0 {
 		log.Printf("evicted %d images / %d layers, %.1f GB credited (free now %s)",
-			stats.EvictedImages, stats.EvictedLayers, float64(stats.FreedBytes)/1e9, freeGB(cacheRoot))
+			stats.EvictedImages, stats.EvictedLayers, float64(stats.FreedBytes)/1e9, freeGB(l.root))
 	}
 	// The same counters the log line above gates on — not bytes, which
 	// credit zero for a layer retired with an unreadable size file.
 	if stats.EvictedImages == 0 && stats.EvictedLayers == 0 {
-		lastFruitless = time.Now()
+		l.lastFruitless = l.now()
 	}
 }
 
