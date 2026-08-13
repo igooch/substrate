@@ -114,6 +114,12 @@ jobs:
         E2E_TEMPLATE_NAME: counter-microvm
         E2E_TEMPLATE_READY_TIMEOUT: 600s
       run: hack/run-e2e-kind.sh ./internal/e2e/suites/demo -v -args --no-color
+    - name: Run E2E tests (imagecache, disruptive)
+      # Restarts the node's atelet, so it runs alone after the parallel
+      # suites finish.
+      env:
+        E2E_IMAGECACHE_DISRUPTIVE: "1"
+      run: hack/run-e2e-kind.sh ./internal/e2e/suites/imagecache -v -args --no-color
     - name: Dump diagnostics on failure
       if: failure()
       run: |

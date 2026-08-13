@@ -263,6 +263,14 @@ func New(root string, opts ...Option) (*Store, error) {
 	return s, nil
 }
 
+// LooksLikeCache reports whether dir already holds a cache (its layout
+// version marker exists). For tools that must not mistake a typo'd path
+// for an empty cache: New creates the layout it is given.
+func LooksLikeCache(dir string) bool {
+	_, err := os.Stat(filepath.Join(dir, versionFileName))
+	return err == nil
+}
+
 func (s *Store) layersDir() string    { return filepath.Join(s.root, "layers", "sha256") }
 func (s *Store) manifestsDir() string { return filepath.Join(s.root, "manifests", "sha256") }
 

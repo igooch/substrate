@@ -54,7 +54,6 @@ import (
 	"math"
 	"math/rand"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -193,10 +192,9 @@ func main() {
 		// Flush mode: no refs, no registry auth. New also reclaims any
 		// crash-debris orphans before the pass.
 		// New would MkdirAll a typo'd --cache-dir into a fresh, empty
-		// cache and "successfully" flush it; only ever open an existing
-		// one (the version marker is written on first creation).
-		if _, err := os.Stat(filepath.Join(*cacheDir, "version")); err != nil {
-			log.Fatalf("%s does not look like an existing image cache: %v", *cacheDir, err)
+		// cache and "successfully" flush it; only ever open an existing one.
+		if !imagecache.LooksLikeCache(*cacheDir) {
+			log.Fatalf("%s does not look like an existing image cache", *cacheDir)
 		}
 		store, err := newStore()
 		if err != nil {
