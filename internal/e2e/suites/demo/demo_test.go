@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-substrate/substrate/internal/ateattr"
 	"github.com/agent-substrate/substrate/internal/ateclient"
 	"github.com/agent-substrate/substrate/internal/atenet"
 	"github.com/agent-substrate/substrate/internal/e2e"
@@ -598,10 +599,15 @@ type actorLifecycleTestCase struct {
 // match what the API reports.
 const nodeDiskTimeout = 30 * time.Second
 
+// restoreLogTimeout bounds the wait for atelet to log a resume's restore.
+const restoreLogTimeout = 30 * time.Second
+
 // runActorLifecycleTestCase runs tc's lifecycle, and checks the actor's
 // directories on its node through an e2e.NodeInspector along the way: each
 // pause leaves only its own local snapshot, the suspend leaves none, and the
-// final delete removes the actor's directory.
+// final delete removes the actor's directory. It also checks where each
+// resume restored from: the node's local snapshot after the pause, object
+// storage after the suspend.
 func runActorLifecycleTestCase(t *testing.T, prefix string, createTemplate func(context.Context, *testing.T, *e2e.Clients, *e2e.Namespace, ateapipb.SnapshotFidelity) (*ateapipb.ActorTemplate, error), tc actorLifecycleTestCase) {
 	// Create namespace
 	nsObj := e2e.CreateNamespace(t)
@@ -677,12 +683,16 @@ func runActorLifecycleTestCase(t *testing.T, prefix string, createTemplate func(
 
 	// Resuming the actor
 	t.Logf("Resuming Actor %q again...", actorID)
+	resumed := time.Now()
 	if _, err := e2e.ResumeActorAwaitCapacity(t, ctx, clients, &ateapipb.ResumeActorRequest{
 		Actor: &ateapipb.ObjectRef{Atespace: demoAtespace, Name: actorID},
 	}); err != nil {
 		t.Fatalf("failed to resume Actor again: %v", err)
 	}
 	waitForActorState(ctx, t, clients, actorID, ateapipb.ActorState_ACTOR_STATE_RUNNING)
+	// The resume restores the snapshot the pause left on the node.
+	resumedOn := getActorOnNode(ctx, t, clients, actorID)
+	e2e.WaitForActorRestore(t, ctx, resumedOn.node, resumedOn.actorUID, resumed, ateattr.SnapshotKindLocal, restoreLogTimeout)
 
 	resp, err = callActor(t, resources.ActorRef{Atespace: demoAtespace, Name: actorID})
 	if err != nil {
@@ -749,12 +759,17 @@ func runActorLifecycleTestCase(t *testing.T, prefix string, createTemplate func(
 
 	// Resuming the actor
 	t.Logf("Resuming Actor %q again...", actorID)
+	resumed = time.Now()
 	if _, err := e2e.ResumeActorAwaitCapacity(t, ctx, clients, &ateapipb.ResumeActorRequest{
 		Actor: &ateapipb.ObjectRef{Atespace: demoAtespace, Name: actorID},
 	}); err != nil {
 		t.Fatalf("failed to resume Actor again: %v", err)
 	}
 	waitForActorState(ctx, t, clients, actorID, ateapipb.ActorState_ACTOR_STATE_RUNNING)
+	// The suspend kept no local snapshot, so the resume downloads the
+	// actor's snapshot from object storage.
+	resumedOn = getActorOnNode(ctx, t, clients, actorID)
+	e2e.WaitForActorRestore(t, ctx, resumedOn.node, resumedOn.actorUID, resumed, ateattr.SnapshotKindLatest, restoreLogTimeout)
 
 	resp, err = callActor(t, resources.ActorRef{Atespace: demoAtespace, Name: actorID})
 	if err != nil {
