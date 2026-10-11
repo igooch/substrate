@@ -73,6 +73,26 @@ func TestGluttonIterate_PauseMode(t *testing.T) {
 	}
 }
 
+func TestGluttonIterate_PauseSuspendMode(t *testing.T) {
+	srv := &fake.Server{}
+	fakeCtrl := &fakeControlClient{}
+	cfg := newTestConfig(t, srv, &userclass.Config{
+		APIStub:  fakeCtrl,
+		Atespace: "bench-test",
+		Dyn: dynconfig.NewHolder(dynconfig.Config{
+			LifecycleMode: dynconfig.LifecycleModePauseSuspend,
+		}),
+	})
+
+	rt := &taskRuntime{cfg: cfg}
+	rt.iterate()
+
+	calls := fakeCtrl.recordedCalls()
+	if len(calls) < 2 || calls[len(calls)-2] != "PauseActor" || calls[len(calls)-1] != "SuspendActor" {
+		t.Errorf("expected [PauseActor, SuspendActor] at end of pause_suspend iteration, got: %v", calls)
+	}
+}
+
 func TestGluttonShutdown_PauseModeRunningActor(t *testing.T) {
 	srv := &fake.Server{}
 	fakeCtrl := &fakeControlClient{}

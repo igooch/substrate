@@ -43,8 +43,9 @@ const (
 	ReadModeData   = "data"
 	ReadModeDigest = "digest"
 
-	LifecycleModeSuspend = "suspend"
-	LifecycleModePause   = "pause"
+	LifecycleModeSuspend      = "suspend"
+	LifecycleModePause        = "pause"
+	LifecycleModePauseSuspend = "pause_suspend"
 )
 
 // Config is the dynamic-mutable subset of boomer's behavior. Holder swaps
@@ -59,7 +60,7 @@ type Config struct {
 	TraceProbability float64
 
 	ResumeMode    string // ResumeModeExplicit | ResumeModeImplicit
-	LifecycleMode string // LifecycleModeSuspend | LifecycleModePause
+	LifecycleMode string // LifecycleModeSuspend | LifecycleModePause | LifecycleModePauseSuspend
 
 	DurDirFileSize int64  // bytes
 	DurDirReadMode string // ReadModeData | ReadModeDigest
@@ -221,8 +222,8 @@ func (c Config) Validate() error {
 	if c.ResumeMode != "" && c.ResumeMode != ResumeModeExplicit && c.ResumeMode != ResumeModeImplicit {
 		return fmt.Errorf("invalid resume_mode %q: must be %q or %q", c.ResumeMode, ResumeModeExplicit, ResumeModeImplicit)
 	}
-	if c.LifecycleMode != "" && c.LifecycleMode != LifecycleModeSuspend && c.LifecycleMode != LifecycleModePause {
-		return fmt.Errorf("invalid lifecycle_mode %q: must be %q or %q", c.LifecycleMode, LifecycleModeSuspend, LifecycleModePause)
+	if c.LifecycleMode != "" && c.LifecycleMode != LifecycleModeSuspend && c.LifecycleMode != LifecycleModePause && c.LifecycleMode != LifecycleModePauseSuspend {
+		return fmt.Errorf("invalid lifecycle_mode %q: must be %q, %q, or %q", c.LifecycleMode, LifecycleModeSuspend, LifecycleModePause, LifecycleModePauseSuspend)
 	}
 	if c.DurDirReadMode != "" && c.DurDirReadMode != ReadModeData && c.DurDirReadMode != ReadModeDigest {
 		return fmt.Errorf("invalid durdir_read_mode %q: must be %q or %q", c.DurDirReadMode, ReadModeData, ReadModeDigest)

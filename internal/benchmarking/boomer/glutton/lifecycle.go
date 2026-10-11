@@ -343,8 +343,12 @@ type gluttonActor struct {
 	// ateapi never rehabilitates one, so iterate() replaces it.
 	crashed bool
 	// hibernatePending is set by a failed Pause/Suspend: the actor is
-	// stranded RUNNING or SUSPENDING, which resume has no edge out of.
+	// stranded RUNNING, PAUSED, or SUSPENDING, which resume has no edge out of.
 	hibernatePending bool
+	// paused is set once PauseActor succeeds in LifecycleModePauseSuspend, so a
+	// hibernate retry after a failed SuspendActor skips PauseActor and retries
+	// SuspendActor from PAUSED.
+	paused bool
 	// deleted is set once replaceActor has issued this actor's DeleteActor,
 	// so a second pass does not re-send it.
 	deleted bool
@@ -451,18 +455,34 @@ func (u *gluttonActor) resume(ctx context.Context) error {
 	}
 	u.firstResume = false
 	u.actorRunning = true
+	u.paused = false
 	u.noteSuccess()
 	return nil
 }
 
 // hibernate takes the actor off its worker by whichever operation the
-// lifecycle mode selects: PauseActor keeps the snapshot on the node, while
-// SuspendActor writes it to durable storage.
+// lifecycle mode selects: PauseActor keeps the snapshot on the node,
+// SuspendActor writes it to durable storage, and PauseSuspend pauses first
+// then promotes the paused snapshot via SuspendActor.
 func (u *gluttonActor) hibernate(ctx context.Context) error {
-	if u.cfg.Dyn.Load().LifecycleMode == dynconfig.LifecycleModePause {
+	switch u.cfg.Dyn.Load().LifecycleMode {
+	case dynconfig.LifecycleModePause:
 		return u.pause(ctx)
+	case dynconfig.LifecycleModePauseSuspend:
+		if !u.paused {
+			if err := u.pause(ctx); err != nil {
+				return err
+			}
+			u.paused = true
+		}
+		err := u.suspend(ctx)
+		if err == nil {
+			u.paused = false
+		}
+		return err
+	default:
+		return u.suspend(ctx)
 	}
-	return u.suspend(ctx)
 }
 
 func (u *gluttonActor) pause(ctx context.Context) error {

@@ -424,9 +424,12 @@ type sessionUser struct {
 	// ingestBuf is the runtime's shared read-only ingest payload.
 	ingestBuf []byte
 	// hibernatePending is set by a failed Pause/Suspend: the actor is
-	// stranded RUNNING or SUSPENDING. Waking it from there would misreport
+	// stranded RUNNING, PAUSED, or SUSPENDING. Waking it from there would misreport
 	// WakeFirstTouch, so runStep finishes the hibernate first.
 	hibernatePending bool
+	// paused is set once PauseActor succeeds in LifecycleModePauseSuspend so a
+	// retried hibernate resumes from PAUSED.
+	paused bool
 	// consecutiveFailures counts ReplaceIfPersistent failures since the
 	// last successful step; see noteFailure.
 	consecutiveFailures int
@@ -752,12 +755,32 @@ func (u *sessionUser) resume(ctx context.Context) error {
 // it instead of waking a stranded actor.
 func (u *sessionUser) hibernate(ctx context.Context) {
 	var err error
-	if u.cfg.Dyn.Load().LifecycleMode == dynconfig.LifecycleModePause {
+	switch u.cfg.Dyn.Load().LifecycleMode {
+	case dynconfig.LifecycleModePause:
 		err = u.tracedCall(ctx, "PauseActor", func(callCtx context.Context, tr *metadata.MD) error {
 			_, err := u.cfg.APIStub.PauseActor(callCtx, &ateapipb.PauseActorRequest{Actor: u.ref()}, grpc.Trailer(tr))
 			return err
 		})
-	} else {
+	case dynconfig.LifecycleModePauseSuspend:
+		if !u.paused {
+			err = u.tracedCall(ctx, "PauseActor", func(callCtx context.Context, tr *metadata.MD) error {
+				_, err := u.cfg.APIStub.PauseActor(callCtx, &ateapipb.PauseActorRequest{Actor: u.ref()}, grpc.Trailer(tr))
+				return err
+			})
+			if err == nil {
+				u.paused = true
+			}
+		}
+		if err == nil {
+			err = u.tracedCall(ctx, "SuspendActor", func(callCtx context.Context, tr *metadata.MD) error {
+				_, err := u.cfg.APIStub.SuspendActor(callCtx, &ateapipb.SuspendActorRequest{Actor: u.ref()}, grpc.Trailer(tr))
+				return err
+			})
+			if err == nil {
+				u.paused = false
+			}
+		}
+	default:
 		err = u.tracedCall(ctx, "SuspendActor", func(callCtx context.Context, tr *metadata.MD) error {
 			_, err := u.cfg.APIStub.SuspendActor(callCtx, &ateapipb.SuspendActorRequest{Actor: u.ref()}, grpc.Trailer(tr))
 			return err

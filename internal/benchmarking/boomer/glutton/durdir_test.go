@@ -58,6 +58,13 @@ func TestDurDirLoopSequence(t *testing.T) {
 			wantGRPCCall:  []string{"PauseActor", "ResumeActor"},
 			wantHTTPCall:  []string{fake.ReadDiskRoute, fake.ReadDiskRoute, fake.WriteDiskRoute},
 		},
+		{
+			name:          "pause_suspend lifecycle mode",
+			lifecycleMode: dynconfig.LifecycleModePauseSuspend,
+			resumeMode:    dynconfig.ResumeModeExplicit,
+			wantGRPCCall:  []string{"PauseActor", "SuspendActor", "ResumeActor"},
+			wantHTTPCall:  []string{fake.ReadDiskRoute, fake.ReadDiskRoute, fake.WriteDiskRoute},
+		},
 	}
 
 	for _, tc := range tests {

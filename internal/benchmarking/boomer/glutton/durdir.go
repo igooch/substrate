@@ -232,9 +232,13 @@ func (u *durDirUser) suspend(ctx context.Context) {
 }
 
 func (u *durDirUser) hibernate(ctx context.Context, dynCfg dynconfig.Config) {
-	if dynCfg.LifecycleMode == dynconfig.LifecycleModePause {
+	switch dynCfg.LifecycleMode {
+	case dynconfig.LifecycleModePause:
 		u.pause(ctx)
-	} else {
+	case dynconfig.LifecycleModePauseSuspend:
+		u.pause(ctx)
+		u.suspend(ctx)
+	default:
 		u.suspend(ctx)
 	}
 }
