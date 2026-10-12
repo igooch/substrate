@@ -253,6 +253,8 @@ func (w *ActorWorkflow) ensureAteletSuspended(ctx context.Context, actorRef reso
 	// actor is currently running (recorded on-node at Run/Restore) and pins it
 	// into the snapshot manifest.
 	inProgressSnap := snapshotAtLatestGeneration(actor.GetStatus())
+	destURI := inProgressSnap.GetDurableSnapshot().GetObject().GetSnapshotUri()
+	fidelity := fidelityToAtelet(preferredFidelity(actor.GetMetadata().GetAtespace(), actorTemplate))
 	req := &ateletpb.CheckpointRequest{
 		WorkerPodUid:          assignment.GetWorkerPodUid(),
 		Atespace:              actor.GetMetadata().GetAtespace(),
@@ -260,16 +262,20 @@ func (w *ActorWorkflow) ensureAteletSuspended(ctx context.Context, actorRef reso
 		ActorTemplateAtespace: actor.GetActorTemplate().GetAtespace(),
 		ActorTemplateName:     actor.GetActorTemplate().GetName(),
 		Spec:                  workloadSpec,
-		Type:                  ateletpb.CheckpointType_CHECKPOINT_TYPE_EXTERNAL,
-		Config: &ateletpb.CheckpointRequest_ExternalConfig{
-			ExternalConfig: &ateletpb.ExternalCheckpointConfiguration{
-				SnapshotUri: inProgressSnap.GetDurableSnapshot().GetObject().GetSnapshotUri(),
+		Snapshot: &ateletpb.Snapshot{
+			SnapshotUuid: inProgressSnap.GetUuid(),
+			Fidelity:     fidelity,
+			Object: &ateletpb.ObjectStorage{
+				SnapshotUri: destURI,
 			},
 		},
-		Fidelity: fidelityToAtelet(preferredFidelity(actor.GetMetadata().GetAtespace(), actorTemplate)),
+		// Upload during Checkpoint and keep no local copy.
+		UploadConfig: &ateletpb.UploadConfig{
+			Mode: ateletpb.UploadMode_UPLOAD_MODE_IMMEDIATE,
+		},
 		ActorUid: actor.GetMetadata().Uid,
 	}
-	wireFidelity = ateattr.SnapshotFidelityValue(req.Fidelity)
+	wireFidelity = ateattr.SnapshotFidelityValue(fidelity)
 
 	if _, err = client.Checkpoint(ctx, req); err != nil {
 		return wireFidelity, handleAteletError(ctx, w.store, actorRef, ateattr.OperationSuspend, "Checkpoint", false, err)
@@ -284,7 +290,7 @@ func (w *ActorWorkflow) ensureAteletSuspended(ctx context.Context, actorRef reso
 // destination is minted once and the upload overwrites deterministic object
 // names, with the remote manifest as the commit marker.
 func (w *ActorWorkflow) ensurePausedSnapshotUploaded(ctx context.Context, actorRef resources.ActorRef, actor *ateapipb.Actor, actorTemplate *ateapipb.ActorTemplate) (wireFidelity string, err error) {
-	ctx, done := stepSpan(ctx, "UploadPausedCheckpoint")
+	ctx, done := stepSpan(ctx, "PromoteSnapshot")
 	defer func() { err = done(err) }()
 
 	localSnap := findLatestLocalSnapshot(actor.GetStatus())
@@ -307,23 +313,26 @@ func (w *ActorWorkflow) ensurePausedSnapshotUploaded(ctx context.Context, actorR
 	}
 	client := ateletpb.NewAteomHerderClient(ateletConn)
 
-	inProgressSnap := snapshotAtLatestGeneration(actor.GetStatus())
-	req := &ateletpb.UploadPausedCheckpointRequest{
-		Atespace:               actor.GetMetadata().GetAtespace(),
-		ActorName:              actor.GetMetadata().GetName(),
-		ActorUid:               actor.GetMetadata().GetUid(),
-		ActorTemplateAtespace:  actor.GetActorTemplate().GetAtespace(),
-		ActorTemplateName:      actor.GetActorTemplate().GetName(),
-		LocalSnapshotName:      localSnap.GetUuid(),
-		DestinationSnapshotUri: inProgressSnap.GetDurableSnapshot().GetObject().GetSnapshotUri(),
-		// The commit scope, like a running-origin suspend; atelet converts
-		// from the captured scope in the snapshot's manifest where possible.
-		DesiredFidelity: fidelityToAtelet(preferredFidelity(actor.GetMetadata().GetAtespace(), actorTemplate)),
+	// The template's preferred fidelity, as a running-origin suspend commits.
+	fidelity := fidelityToAtelet(preferredFidelity(actor.GetMetadata().GetAtespace(), actorTemplate))
+	req := &ateletpb.PromoteSnapshotRequest{
+		Atespace:              actor.GetMetadata().GetAtespace(),
+		ActorName:             actor.GetMetadata().GetName(),
+		ActorUid:              actor.GetMetadata().GetUid(),
+		ActorTemplateAtespace: actor.GetActorTemplate().GetAtespace(),
+		ActorTemplateName:     actor.GetActorTemplate().GetName(),
+		Snapshot: &ateletpb.Snapshot{
+			SnapshotUuid: localSnap.GetUuid(),
+			Fidelity:     fidelity,
+			Object: &ateletpb.ObjectStorage{
+				SnapshotUri: snapshotAtLatestGeneration(actor.GetStatus()).GetDurableSnapshot().GetObject().GetSnapshotUri(),
+			},
+		},
 	}
-	wireFidelity = ateattr.SnapshotFidelityValue(req.DesiredFidelity)
+	wireFidelity = ateattr.SnapshotFidelityValue(fidelity)
 
-	if _, err = client.UploadPausedCheckpoint(ctx, req); err != nil {
-		return wireFidelity, handleAteletError(ctx, w.store, actorRef, ateattr.OperationSuspend, "UploadPausedCheckpoint", false, err)
+	if _, err = client.PromoteSnapshot(ctx, req); err != nil {
+		return wireFidelity, handleAteletError(ctx, w.store, actorRef, ateattr.OperationSuspend, "PromoteSnapshot", false, err)
 	}
 	return wireFidelity, nil
 }

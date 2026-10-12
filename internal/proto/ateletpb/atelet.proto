@@ -16,6 +16,8 @@ syntax = "proto3";
 
 package atelet;
 
+import "google/protobuf/timestamp.proto";
+
 option go_package = "github.com/agent-substrate/substrate/internal/proto/ateletpb";
 
 // AteomSupport provides callouts for ateom.
@@ -242,19 +244,35 @@ service AteomHerder {
   // ateom.
   rpc Run(RunRequest) returns (RunResponse) {}
 
-  // Checkpoint tells atelet to save the current state of the workload on an
-  // ateom to object storage, and then completely the ateom to a blank state
-  // (back to "available" state.)
+  // Checkpoint saves the workload's state as a new snapshot of the actor and
+  // returns the ateom to a blank state. upload_config says when the snapshot
+  // becomes durable. Once the snapshot commits, atelet deletes the actor's
+  // older local snapshots, except one still being uploaded, which it deletes
+  // when that upload ends.
   rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse) {}
 
-  // Restore restores a workload from checkpoint onto an ateom.
+  // Restore restores a workload from a snapshot onto an ateom.
   rpc Restore(RestoreRequest) returns (RestoreResponse) {}
 
-  // UploadPausedCheckpoint copies a local (pause) checkpoint from this node's
-  // disk to object storage. Unlike Checkpoint it drives no ateom: the actor is
-  // paused, its sandbox is gone; the checkpoint files plus their manifest
-  // already sit under the actor's local-checkpoints directory.
-  rpc UploadPausedCheckpoint(UploadPausedCheckpointRequest) returns (UploadPausedCheckpointResponse) {}
+  // PromoteSnapshot makes `snapshot` durable in object storage while keeping
+  // its local copy on this node. Used when a snapshot needs to be in object
+  // storage (e.g. for tagging) without evicting the paused actor from the
+  // node. Waits for an in-flight detach, and fails for an actor running on
+  // this node.
+  //
+  // Idempotent: once the snapshot is durable, atelet answers from the
+  // manifest at `snapshot.object`, and fails if there is none.
+  rpc PromoteSnapshot(PromoteSnapshotRequest) returns (PromoteSnapshotResponse) {}
+
+  // DetachActor releases a suspended actor from this node: atelet uploads its
+  // latest local snapshot unless it is already durable, then deletes the
+  // actor's local snapshots. atelet starts the same detach on its own once the
+  // actor has stayed suspended on this node for its detach delay. It waits for
+  // a detach already in progress, is a no-op when atelet holds no local
+  // snapshot for the actor, and fails for an actor running on this node.
+  //
+  // TODO: report each detach to the control plane.
+  rpc DetachActor(DetachActorRequest) returns (DetachActorResponse) {}
 
   // Terminate tells atelet to terminate/kill any running workload for an actor,
   // unmount its volumes, and clean up actor state on the node.
@@ -490,29 +508,6 @@ message HTTPGetAction {
 message RunResponse {
 }
 
-message LocalCheckpointConfiguration {
-  // Names a sub-directory on the local filesystem below which the checkpoint
-  // data will be stored. atelet decides where that directory lives, from the
-  // actor's UID, so this is a bare name and must not contain a path separator.
-  // The structure of the checkpoint should generally be treated as opaque.
-  string snapshot_name = 1;
-}
-
-message ExternalCheckpointConfiguration {
-  // The object storage URI of the snapshot to write. Object names are appended
-  // to it, so it addresses the snapshot as a whole rather than any one object.
-  string snapshot_uri = 1;
-}
-
-enum CheckpointType {
-  // Should never happen
-  CHECKPOINT_TYPE_UNSPECIFIED = 0;
-  // Save snapshot only in local filesystem
-  CHECKPOINT_TYPE_LOCAL = 1;
-  // Save snapshot to object storage
-  CHECKPOINT_TYPE_EXTERNAL = 2;
-}
-
 // SnapshotFidelity mirrors the public ateapi enum: the state layers a
 // snapshot holds, lowest to highest, each including the ones below it.
 enum SnapshotFidelity {
@@ -530,14 +525,103 @@ enum SnapshotFidelity {
   SNAPSHOT_FIDELITY_MEMORY = 3;
 }
 
-// ExternalRestoreConfiguration is an external snapshot a restore reads.
-// Split from the checkpoint-side ExternalCheckpointConfiguration (a write
-// destination) so read-side attributes of a restore source have a home.
-message ExternalRestoreConfiguration {
-  // The object storage URI of the snapshot to read. Object names are
-  // appended to it, so it addresses the snapshot as a whole rather than any
-  // one object.
+message ObjectStorage {
+  // The object storage URI of the snapshot. Object names are appended to it,
+  // so it addresses the snapshot as a whole rather than any one object.
   string snapshot_uri = 1;
+}
+
+// Snapshot identifies one snapshot of an actor, and where its durable copy
+// lives.
+message Snapshot {
+  // ateapi Snapshot.uuid. Names the snapshot's directory under the actor's
+  // local-checkpoint directory, so this is a bare name and must not contain
+  // a path separator.
+  string snapshot_uuid = 1;
+
+  // On Checkpoint: the fidelity to capture.
+  // On Restore: the fidelity to restore the actor with.
+  // On PromoteSnapshot: the lowest fidelity the snapshot may hold. The call
+  // fails if its manifest records a lower one.
+  // In SnapshotReport: the fidelity the snapshot holds.
+  SnapshotFidelity fidelity = 2;
+
+  // The snapshot's durable copy in object storage. Required on every
+  // request: atelet uploads there, or reads from there when it holds no
+  // usable local copy.
+  ObjectStorage object = 3;
+
+  // ateapi Snapshot.generation, starting at 1. Orders the actor's snapshots.
+  // Checkpoint and PromoteSnapshot fail for a generation below atelet's newest
+  // for the actor, or for its newest under another snapshot_uuid: the
+  // caller's view is stale.
+  int32 generation = 4;
+}
+
+// SnapshotReport is a snapshot atelet holds or has uploaded, and when.
+message SnapshotReport {
+  Snapshot snapshot = 1;
+
+  // When the checkpoint that produced the snapshot committed on this node.
+  google.protobuf.Timestamp local_commit_time = 2;
+
+  // When the snapshot's manifest, the upload's commit marker, was written to
+  // object storage. Set only in ActorSnapshotState.latest_durable, and only
+  // when this atelet wrote it.
+  google.protobuf.Timestamp durable_complete_time = 3;
+}
+
+// ActorSnapshotState is what atelet holds for one actor on this node.
+// Returned by Checkpoint, PromoteSnapshot, and DetachActor.
+message ActorSnapshotState {
+  // The snapshot atelet restores the actor from locally. Unset when the
+  // latest checkpoint kept no local copy, and once a detach has made the
+  // snapshot durable and begun deleting it. Either way, latest_durable is
+  // then the actor's latest snapshot.
+  SnapshotReport latest_local = 1;
+
+  // The snapshot an in-flight upload is reading, if any. If it is
+  // latest_local, its local copy stays after the upload. If it is an older
+  // snapshot, whose upload began before latest_local was taken, atelet
+  // deletes its local copy once the upload ends.
+  SnapshotReport uploading = 2;
+
+  // The newest snapshot atelet knows is durable, whether or not the control
+  // plane has recorded it: one atelet uploaded since it started, or one a
+  // PromoteSnapshot found already uploaded. Unset if there is none, which says
+  // nothing about older durable snapshots.
+  SnapshotReport latest_durable = 3;
+
+  // When atelet next plans to trigger a background upload, which will upload
+  // whichever snapshot is latest_local at the time of triggering. Unset when
+  // there is no latest_local, or it is already durable or being uploaded.
+  // Advisory: a promote or detach can upload it sooner, and an older
+  // snapshot's upload can delay it.
+  google.protobuf.Timestamp upload_due_time = 4;
+}
+
+// UploadConfig is when a checkpoint's snapshot becomes durable.
+message UploadConfig {
+  UploadMode mode = 1;
+
+  // TODO: per-request overrides of atelet's upload and detach delays.
+}
+
+// UploadMode is when a checkpoint's snapshot is uploaded.
+enum UploadMode {
+  UPLOAD_MODE_UNSPECIFIED = 0;
+
+  // Keep the snapshot locally and upload it on atelet's schedule: at most
+  // atelet's upload delay (5 minutes) after the oldest snapshot of the actor
+  // that is not yet durable was taken. Snapshots superseded before then are
+  // never uploaded. Once the actor has stayed suspended on this node for
+  // atelet's detach delay (30 minutes), atelet detaches it, as DetachActor
+  // does. Used by PauseActor.
+  UPLOAD_MODE_DEFERRED = 1;
+
+  // Upload before Checkpoint returns, and keep no local copy. Used by
+  // SuspendActor, which also commits golden actors.
+  UPLOAD_MODE_IMMEDIATE = 2;
 }
 
 message CheckpointRequest {
@@ -555,45 +639,23 @@ message CheckpointRequest {
   // Run/Restore) and records it into the snapshot manifest.
   WorkloadSpec spec = 7;
 
-  CheckpointType type = 8;
+  // The snapshot to take, and where it is uploaded. atelet may upload it long
+  // after Checkpoint returns, without asking the control plane. A request at
+  // atelet's newest generation for the actor, with the same snapshot_uuid,
+  // is a retry: atelet returns the actor's current state without
+  // checkpointing again.
+  Snapshot snapshot = 8;
 
-  // The checkpoint configuration, depending on the type.
-  oneof config {
-    LocalCheckpointConfiguration local_config = 9;
-    ExternalCheckpointConfiguration external_config = 10;
-  }
-
-  // Fidelity the checkpoint captures.
-  SnapshotFidelity fidelity = 11;
+  // When the snapshot becomes durable.
+  UploadConfig upload_config = 9;
 }
 
 message CheckpointResponse {
-}
-
-message UploadPausedCheckpointRequest {
-  string atespace = 1;
-  string actor_name = 2;
-  string actor_uid = 3;
-
-  // For metrics attribution, like on CheckpointRequest.
-  string actor_template_atespace = 4;
-  string actor_template_name = 5;
-
-  // The local checkpoint to upload: the uuid of the actor's pause snapshot
-  // (ateapi Snapshot.uuid).
-  string local_snapshot_name = 6;
-
-  // Destination object-storage URI (the actor's in-progress snapshot URI).
-  string destination_snapshot_uri = 7;
-
-  // Fidelity the uploaded snapshot must have. The fidelity the pause
-  // checkpoint captured is not sent: atelet reads it from the local
-  // snapshot's own manifest, which is authoritative, and rejects the upload
-  // if the two differ.
-  SnapshotFidelity desired_fidelity = 8;
-}
-
-message UploadPausedCheckpointResponse {
+  // The actor's state once the checkpoint is taken: latest_local is the new
+  // snapshot, unless UPLOAD_MODE_IMMEDIATE kept no local copy. The control
+  // plane can drop its entries for any local-only generation not named here:
+  // atelet has deleted it, and will never upload it.
+  ActorSnapshotState state = 1;
 }
 
 message RestoreRequest {
@@ -608,16 +670,12 @@ message RestoreRequest {
 
   WorkloadSpec spec = 7;
 
-  CheckpointType type = 8;
-
-  // The checkpoint configuration, depending on the type.
-  oneof config {
-    LocalCheckpointConfiguration local_config = 9;
-    ExternalRestoreConfiguration external_config = 10;
-  }
-
-  // Fidelity to restore from the checkpoint.
-  SnapshotFidelity fidelity = 11;
+  // Snapshot to restore from. atelet reads its local copy if it holds a
+  // usable one, and `snapshot.object` otherwise. A local copy is unusable if
+  // its manifest does not parse or lists a missing file. While atelet is
+  // detaching the actor, it waits for the detach to finish and then reads
+  // `snapshot.object`. Fails if neither copy exists: that generation is lost.
+  Snapshot snapshot = 8;
 
   // When absent the actor has no egress: its TCP is captured and refused.
   optional EgressGateway egress_gateway = 13;
@@ -635,4 +693,41 @@ message RestoreRequest {
 }
 
 message RestoreResponse {
+}
+
+message PromoteSnapshotRequest {
+  string atespace = 1;
+  string actor_name = 2;
+  string actor_uid = 3;
+
+  // For metrics attribution, like on CheckpointRequest.
+  string actor_template_atespace = 4;
+  string actor_template_name = 5;
+
+  // The actor's latest snapshot as the control plane records it, and where
+  // it is, or will be, uploaded. fidelity is the one its Checkpoint
+  // requested, not the current template's preferred_fidelity.
+  Snapshot snapshot = 6;
+}
+
+message PromoteSnapshotResponse {
+  // The actor's state once promoted: latest_durable is its latest snapshot,
+  // and latest_local remains set if atelet still holds the local copy.
+  ActorSnapshotState state = 1;
+}
+
+message DetachActorRequest {
+  string atespace = 1;
+  string actor_name = 2;
+  string actor_uid = 3;
+
+  // For metrics attribution, like on CheckpointRequest.
+  string actor_template_atespace = 4;
+  string actor_template_name = 5;
+}
+
+message DetachActorResponse {
+  // The actor's state once detached: latest_durable is its latest snapshot,
+  // and latest_local is unset.
+  ActorSnapshotState state = 1;
 }
