@@ -717,15 +717,15 @@ func TestValidateRestoreRequest(t *testing.T) {
 		wantErr bool
 	}{
 		{"valid with object storage", makeReq(), false},
-		{"valid local only without object storage", makeReq(func(r *ateletpb.RestoreRequest) {
+		{"missing object storage", makeReq(func(r *ateletpb.RestoreRequest) {
 			r.Snapshot.Object = nil
-		}), false},
+		}), true},
 		{"missing sandbox assets", makeReq(func(r *ateletpb.RestoreRequest) { r.SandboxAssets = nil }), true},
 		{"empty snapshot uuid", makeReq(func(r *ateletpb.RestoreRequest) { r.Snapshot.SnapshotUuid = "" }), true},
 		{"invalid snapshot uuid", makeReq(func(r *ateletpb.RestoreRequest) { r.Snapshot.SnapshotUuid = "../escape" }), true},
 		{"nested snapshot uuid", makeReq(func(r *ateletpb.RestoreRequest) { r.Snapshot.SnapshotUuid = "pause/2" }), true},
 		{"traversal snapshot uuid", makeReq(func(r *ateletpb.RestoreRequest) { r.Snapshot.SnapshotUuid = ".." }), true},
-		{"empty snapshot uri when object is set", makeReq(func(r *ateletpb.RestoreRequest) { r.GetSnapshot().GetObject().SnapshotUri = "" }), true},
+		{"empty snapshot uri", makeReq(func(r *ateletpb.RestoreRequest) { r.GetSnapshot().GetObject().SnapshotUri = "" }), true},
 		{"bucketless snapshot uri", makeReq(func(r *ateletpb.RestoreRequest) {
 			r.GetSnapshot().GetObject().SnapshotUri = "relative/path"
 		}), true},

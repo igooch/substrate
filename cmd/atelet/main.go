@@ -1047,6 +1047,31 @@ func (s *AteomHerder) uploadLocalCheckpointDir(ctx context.Context, req *ateletp
 	return rec.SandboxClass, pluginsocket.CallError(s.uploadSnapshot(ctx, uri, localDir, rec, req.GetActorTemplateAtespace(), req.GetActorTemplateName()))
 }
 
+// errUnusableLocalSnapshot marks a node-local snapshot whose manifest does
+// not parse or lists a file that is missing or not a regular file. Local
+// writes are not synced, so a node crash can leave one, as can an
+// interrupted prune.
+var errUnusableLocalSnapshot = errors.New("unusable local snapshot")
+
+// readLocalSnapshot returns the manifest of the node-local snapshot in
+// localDir once every file it lists is present. A missing manifest reports
+// os.ErrNotExist, and a copy that fails the checks wraps
+// errUnusableLocalSnapshot.
+func readLocalSnapshot(localDir string) (*sandboxAssetsRecord, error) {
+	manifest, err := readSnapshotManifest(localDir)
+	if err != nil {
+		return nil, err
+	}
+	rec, err := unmarshalSandboxRecord(manifest)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", errUnusableLocalSnapshot, err)
+	}
+	if err := checkLocalSnapshotFiles(localDir, rec.SnapshotFiles); err != nil {
+		return nil, fmt.Errorf("%w: %w", errUnusableLocalSnapshot, err)
+	}
+	return rec, nil
+}
+
 func readSnapshotManifest(dir string) ([]byte, error) {
 	root, err := os.OpenRoot(dir)
 	if err != nil {
@@ -1124,14 +1149,14 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 	}
 
 	checkpointDir := ateletpath.RestoreStateDir(actorUID)
-	directLocal := req.GetSnapshot().GetObject() == nil
-	if directLocal {
-		checkpointDir = ateletpath.LocalSnapshotDir(actorUID, req.GetSnapshot().GetSnapshotUuid())
-	}
+	localDir := ateletpath.LocalSnapshotDir(actorUID, req.GetSnapshot().GetSnapshotUuid())
+	directLocal := false
 
 	// Fetch the snapshot manifest stored beside the checkpoint images
 	// first: it lists the checkpoint files to download and records the actor
-	// identity used to label the restore's metrics.
+	// identity used to label the restore's metrics. Try the node-local
+	// checkpoint directory first and fall back to object storage if the local
+	// copy is absent or unusable.
 	tManifest := time.Now()
 	manifestDone := false
 	defer func() {
@@ -1140,22 +1165,31 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 		}
 	}()
 	var sandboxRec *sandboxAssetsRecord
-	if directLocal {
-		manifest, err := readSnapshotManifest(checkpointDir)
-		if err != nil {
-			return nil, wrapFileSystemErr("while reading local snapshot manifest", err)
+	localRec, localErr := readLocalSnapshot(localDir)
+	durable := req.GetSnapshot().GetObject()
+	switch {
+	case localErr == nil:
+		directLocal = true
+		checkpointDir = localDir
+		sandboxRec = localRec
+	case errors.Is(localErr, os.ErrNotExist) || errors.Is(localErr, errUnusableLocalSnapshot):
+		if errors.Is(localErr, errUnusableLocalSnapshot) {
+			// The next checkpoint or terminate prunes the unusable copy.
+			slog.WarnContext(ctx, "Local snapshot is unusable; restoring from object storage",
+				slog.String("local_dir", localDir), slog.Any("err", localErr))
 		}
-		if sandboxRec, err = unmarshalSandboxRecord(manifest); err != nil {
-			return nil, fmt.Errorf("while unmarshalling sandbox record: %w", err)
+		manifest, err := s.fetchManifest(ctx, durable.GetSnapshotUri())
+		if status.Code(err) == codes.NotFound {
+			return nil, apierror.NotFound("snapshot %q has no usable local copy and no uploaded copy", req.GetSnapshot().GetSnapshotUuid())
 		}
-	} else {
-		manifest, err := s.fetchManifest(ctx, req.GetSnapshot().GetObject().GetSnapshotUri())
 		if err != nil {
 			return nil, fmt.Errorf("while fetching snapshot manifest: %w", err)
 		}
 		if sandboxRec, err = unmarshalSandboxRecord(manifest); err != nil {
 			return nil, fmt.Errorf("while unmarshalling sandbox record: %w", err)
 		}
+	default:
+		return nil, wrapFileSystemErr("while reading local snapshot", localErr)
 	}
 
 	dManifest = time.Since(tManifest)
@@ -1163,7 +1197,7 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 
 	// The manifest is what tells a golden restore from a latest one, so the
 	// snapshot kind only becomes knowable here.
-	op.kind = restoreSnapshotKind(req, sandboxRec)
+	op.kind = restoreSnapshotKind(directLocal, sandboxRec)
 
 	var registration *registeredActor
 	// Undo the Register if the restore fails. The errgroup join below happens
@@ -1194,10 +1228,11 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 			downloadErr = err
 		}()
 		if directLocal {
-			// Restore in place from LocalSnapshotDir; no staging.
-			return checkLocalSnapshotFiles(checkpointDir, sandboxRec.SnapshotFiles)
+			// Restore in place from LocalSnapshotDir, whose files
+			// readLocalSnapshot checked; no staging.
+			return nil
 		}
-		return s.downloadExternalCheckpoint(gctx, req.GetSnapshot().GetObject().GetSnapshotUri(), checkpointDir, sandboxRec.SnapshotFiles)
+		return s.downloadExternalCheckpoint(gctx, durable.GetSnapshotUri(), checkpointDir, sandboxRec.SnapshotFiles)
 	})
 	g.Go(func() (err error) {
 		defer func() { prepErr = err }()
@@ -1809,10 +1844,8 @@ func validateRestoreRequest(req *ateletpb.RestoreRequest) error {
 	if err := validateFidelity(snap.GetFidelity()); err != nil {
 		return err
 	}
-	if snap.GetObject() != nil {
-		if _, err := resources.ParseSnapshotURI(snap.GetObject().GetSnapshotUri()); err != nil {
-			return err
-		}
+	if _, err := resources.ParseSnapshotURI(snap.GetObject().GetSnapshotUri()); err != nil {
+		return err
 	}
 	return nil
 }
