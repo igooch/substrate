@@ -109,9 +109,9 @@ func (w *ActorWorkflow) loadActorForPause(ctx context.Context, actorRef resource
 }
 
 // ensureMarkedPausing transitions a RUNNING actor to PAUSING, minting the
-// local snapshot name. Skips when a previous attempt already marked the
-// actor; the persisted name then stays authoritative for the rest of the
-// workflow.
+// snapshot's name and the object storage URI atelet may later upload it to.
+// Skips when a previous attempt already marked the actor; the persisted name
+// and URI then stay authoritative for the rest of the workflow.
 func (w *ActorWorkflow) ensureMarkedPausing(ctx context.Context, actorRef resources.ActorRef, actor *ateapipb.Actor, actorTemplate *ateapipb.ActorTemplate) (_ *ateapipb.Actor, err error) {
 	ctx, done := stepSpan(ctx, "MarkPausing")
 	defer func() { err = done(err) }()
@@ -131,19 +131,32 @@ func (w *ActorWorkflow) ensureMarkedPausing(ctx context.Context, actorRef resour
 	}
 
 	snapshotUUID := resources.NewSnapshotName()
+	// Fail here rather than at checkpoint time if the template's location
+	// cannot produce a usable URI: nothing has been written yet.
+	uri, err := newInProgressSnapshotURI(actorTemplate, actor, snapshotUUID)
+	if err != nil {
+		return nil, err
+	}
 	storedActor, err := w.store.UpdateActor(ctx, actorRef, store.PreconditionFrom(actor), func(toUpdate *ateapipb.Actor) error {
 		toUpdate.Status.State = ateapipb.ActorState_ACTOR_STATE_PAUSING
 		// Increment last_assigned_generation for the new Pause request.
 		gen := toUpdate.Status.LastAssignedGeneration + 1
 		toUpdate.Status.LastAssignedGeneration = gen
-		toUpdate.Status.Snapshots = append(toUpdate.Status.Snapshots,
-			newLocalSnapshot(
-				gen,
-				actorTemplate.GetSnapshotConfig().GetPreferredFidelity(),
-				actorTemplate.GetMetadata().GetUid(),
-				snapshotUUID,
-				"",
-			))
+		snap := newLocalSnapshot(
+			gen,
+			actorTemplate.GetSnapshotConfig().GetPreferredFidelity(),
+			actorTemplate.GetMetadata().GetUid(),
+			snapshotUUID,
+			"",
+		)
+		// The snapshot stays on the node, and atelet may upload it here later
+		// without telling the control plane, so its durable copy stays
+		// PENDING.
+		snap.DurableSnapshot = &ateapipb.SnapshotStorage{
+			Status: ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_PENDING,
+			Object: &ateapipb.ObjectSnapshot{SnapshotUri: uri.String()},
+		}
+		toUpdate.Status.Snapshots = append(toUpdate.Status.Snapshots, snap)
 		return nil
 	})
 	if err != nil {
@@ -156,12 +169,13 @@ func (w *ActorWorkflow) ensureMarkedPausing(ctx context.Context, actorRef resour
 	return storedActor, nil
 }
 
-// ensureAteletPaused checkpoints the workload locally on the worker node
-// under the actor's persisted snapshot name. This is the atelet reentrancy
-// seam (#372): the request is keyed by the actor UID, the worker pod UID, and
-// the once-minted snapshot name, so a re-entered workflow re-sends the same
-// semantic request; once atelet's Checkpoint is idempotent on those keys this
-// step becomes fully reentrant with no changes here.
+// ensureAteletPaused checkpoints the workload on the worker node under the
+// actor's persisted snapshot name, with UPLOAD_MODE_DEFERRED: atelet keeps the
+// snapshot on the node and uploads it to the persisted URI on its own
+// schedule. This is the atelet reentrancy seam (#372): the request carries
+// the once-minted name, URI and generation, so a re-entered workflow re-sends
+// the same request, which atelet answers as a retry of the checkpoint it
+// already took.
 func (w *ActorWorkflow) ensureAteletPaused(ctx context.Context, actorRef resources.ActorRef, actor *ateapipb.Actor, actorTemplate *ateapipb.ActorTemplate) (wireFidelity string, err error) {
 	ctx, done := stepSpan(ctx, "CallAteletPause")
 	defer func() { err = done(err) }()
@@ -170,6 +184,13 @@ func (w *ActorWorkflow) ensureAteletPaused(ctx context.Context, actorRef resourc
 	if assignment == nil {
 		// Missing active worker pod reference in PAUSING state indicates corrupted store state.
 		return "", crashActorAndFail(ctx, w.store, actorRef, ateattr.OperationPause, crashMessageWorkerAssignmentMissing)
+	}
+	inProgressSnap := snapshotAtLatestGeneration(actor.GetStatus())
+	uploadURI := inProgressSnap.GetDurableSnapshot().GetObject().GetSnapshotUri()
+	if uploadURI == "" {
+		// MarkPausing records the URI with the snapshot, so its absence in
+		// PAUSING state indicates corrupted store state.
+		return "", crashActorAndFail(ctx, w.store, actorRef, ateattr.OperationPause, crashMessageSnapshotURIMissing)
 	}
 
 	ateletConn, err := w.dialer.DialForAteletOnNode(assignment.GetNodeName())
@@ -186,8 +207,6 @@ func (w *ActorWorkflow) ensureAteletPaused(ctx context.Context, actorRef resourc
 	// Checkpoint does not carry the sandbox config: atelet uses the version the
 	// actor is currently running (recorded on-node at Run/Restore) and pins it
 	// into the snapshot manifest.
-	inProgressSnap := snapshotAtLatestGeneration(actor.GetStatus())
-	snapshotName := inProgressSnap.GetUuid()
 	req := &ateletpb.CheckpointRequest{
 		WorkerPodUid:          assignment.GetWorkerPodUid(),
 		Atespace:              actor.GetMetadata().GetAtespace(),
@@ -196,16 +215,20 @@ func (w *ActorWorkflow) ensureAteletPaused(ctx context.Context, actorRef resourc
 		ActorTemplateName:     actor.GetActorTemplate().GetName(),
 		Spec:                  workloadSpec,
 		Snapshot: &ateletpb.Snapshot{
-			SnapshotUuid: snapshotName,
+			SnapshotUuid: inProgressSnap.GetUuid(),
 			Fidelity:     fidelityToAtelet(actorTemplate.GetSnapshotConfig().GetPreferredFidelity()),
+			Object: &ateletpb.ObjectStorage{
+				SnapshotUri: uploadURI,
+			},
+			Generation: inProgressSnap.GetGeneration(),
 		},
-		UploadConfig: &ateletpb.UploadConfig{
-			Mode: ateletpb.UploadMode_UPLOAD_MODE_DEFERRED,
-		},
-		ActorUid: actor.GetMetadata().Uid,
+		// Keep the snapshot on this node; atelet uploads it later.
+		UploadConfig: &ateletpb.UploadConfig{Mode: ateletpb.UploadMode_UPLOAD_MODE_DEFERRED},
+		ActorUid:     actor.GetMetadata().Uid,
 	}
 	wireFidelity = ateattr.SnapshotFidelityValue(req.GetSnapshot().GetFidelity())
 
+	// TODO: record the snapshot state atelet returns.
 	if _, err = client.Checkpoint(ctx, req); err != nil {
 		return wireFidelity, handleAteletError(ctx, w.store, actorRef, ateattr.OperationPause, "Checkpoint", false, err)
 	}

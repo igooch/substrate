@@ -103,6 +103,18 @@ func someActorSnapshotURI(t *testing.T, location, atespace, name string) string 
 	return uri.String()
 }
 
+// newPauseSnapshot builds the Snapshot entry a pause records: a local
+// snapshot whose durable copy at uri, which atelet uploads on its own
+// schedule, stays PENDING.
+func newPauseSnapshot(gen int32, fidelity ateapipb.SnapshotFidelity, templateUID, uuid, locality, uri string) *ateapipb.Snapshot {
+	snap := newLocalSnapshot(gen, fidelity, templateUID, uuid, locality)
+	snap.DurableSnapshot = &ateapipb.SnapshotStorage{
+		Status: ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_PENDING,
+		Object: &ateapipb.ObjectSnapshot{SnapshotUri: uri},
+	}
+	return snap
+}
+
 // mustTagSnapshotURI builds the URI of the one snapshot a tag owns, the way the
 // tag workflow does.
 func mustTagSnapshotURI(t *testing.T, template *ateapipb.ActorTemplate, atespace, name string) resources.SnapshotURI {

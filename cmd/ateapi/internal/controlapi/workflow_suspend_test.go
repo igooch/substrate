@@ -23,6 +23,7 @@ import (
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/storetest"
 	"github.com/agent-substrate/substrate/internal/apierror"
+	"github.com/agent-substrate/substrate/internal/ateattr"
 	"github.com/agent-substrate/substrate/internal/installdefaults"
 	"github.com/agent-substrate/substrate/internal/objectstore/objectstoretest"
 	"github.com/agent-substrate/substrate/internal/objectstoreplugin/objectstoreplugintest"
@@ -148,7 +149,7 @@ func TestSuspendActorWorkflow_RejectedAndIdempotentPaths(t *testing.T) {
 
 // TestEnsureMarkedSuspending_StateMatrix verifies the suspend edge's state
 // gating against every actor state: RUNNING takes the edge (checkpoint the
-// workload), PAUSED takes it too (upload the node-local pause snapshot),
+// workload), PAUSED takes it too (detach the node-local pause snapshot),
 // SUSPENDING skips (a previous attempt already marked the actor), everything
 // else is rejected with FailedPrecondition. SUSPENDED is rejected here
 // because the orchestrator early-returns before this step for a fully
@@ -194,10 +195,10 @@ func TestEnsureMarkedSuspending_StateMatrix(t *testing.T) {
 			pending := findLatestDurableSnapshot(marked.GetStatus(), ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_PENDING)
 			gotURI := pending.GetDurableSnapshot().GetObject().GetSnapshotUri()
 			if gotURI != wantURI.String() {
-				t.Errorf("paused-origin in-progress SnapshotUri = %q, want %q (derived from local snapshot uuid)", gotURI, wantURI.String())
+				t.Errorf("paused-origin in-progress SnapshotUri = %q, want %q (minted from the local snapshot uuid, since the pause recorded none)", gotURI, wantURI.String())
 			}
-			// The upload promotes the pause snapshot in place rather than
-			// minting a new generation.
+			// The suspend makes the pause snapshot durable in place rather
+			// than minting a new generation.
 			if pending.GetGeneration() != 1 || pending.GetUuid() != "snap-1" {
 				t.Errorf("paused-origin pending snapshot = generation %d, uuid %q; want the pause snapshot (generation 1, uuid %q)", pending.GetGeneration(), pending.GetUuid(), "snap-1")
 			}
@@ -323,9 +324,9 @@ func TestEnsureAteletSuspended_DialFailureLeavesActorRetryable(t *testing.T) {
 }
 
 // TestEnsureAteletSuspended_WireRequest verifies a running-origin suspend
-// checkpoints to the actor's in-progress durable snapshot and asks atelet to
-// keep no local copy, since FinalizeSuspended drops the actor's local
-// snapshots.
+// checkpoints to the actor's in-progress durable snapshot, at its generation,
+// and asks atelet to upload it before returning and keep no local copy, since
+// FinalizeSuspended drops the actor's local snapshots.
 func TestEnsureAteletSuspended_WireRequest(t *testing.T) {
 	ctx := context.Background()
 	persistence := newTestPersistence(t)
@@ -359,15 +360,17 @@ func TestEnsureAteletSuspended_WireRequest(t *testing.T) {
 	if req == nil {
 		t.Fatal("expected Checkpoint RPC to be called")
 	}
-	if got := req.GetSnapshot().GetSnapshotUuid(); got != snapshotName {
-		t.Errorf("CheckpointRequest.Snapshot.SnapshotUuid = %q, want %q", got, snapshotName)
+	wantSnap := &ateletpb.Snapshot{
+		SnapshotUuid: snapshotName,
+		Fidelity:     ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
+		Object:       &ateletpb.ObjectStorage{SnapshotUri: snapshotURI},
+		Generation:   1,
 	}
-	if got := req.GetSnapshot().GetObject().GetSnapshotUri(); got != snapshotURI {
-		t.Errorf("CheckpointRequest.Snapshot.Object.SnapshotUri = %q, want %q", got, snapshotURI)
+	if got := req.GetSnapshot(); !proto.Equal(got, wantSnap) {
+		t.Errorf("CheckpointRequest.Snapshot = %v, want %v", got, wantSnap)
 	}
-	wantConfig := &ateletpb.UploadConfig{Mode: ateletpb.UploadMode_UPLOAD_MODE_IMMEDIATE}
-	if got := req.GetUploadConfig(); !proto.Equal(got, wantConfig) {
-		t.Errorf("CheckpointRequest.UploadConfig = %v, want %v", got, wantConfig)
+	if got, want := req.GetUploadConfig().GetMode(), ateletpb.UploadMode_UPLOAD_MODE_IMMEDIATE; got != want {
+		t.Errorf("CheckpointRequest.UploadConfig.Mode = %v, want %v", got, want)
 	}
 }
 
@@ -782,7 +785,7 @@ func TestPreferredFidelity(t *testing.T) {
 // TestIsPausedOriginSuspend pins the paused-origin discriminator: a local
 // snapshot alone must not select the paused path, because a RUNNING actor
 // resumed from pause still carries one; only PAUSED state, or SUSPENDING with
-// no worker assignment, means the suspend uploads a local snapshot.
+// no worker assignment, means the suspend detaches a local snapshot.
 func TestIsPausedOriginSuspend(t *testing.T) {
 	assignment := &ateapipb.WorkerAssignment{WorkerNamespace: "ns", WorkerPool: "pool", WorkerPod: "pod-1"}
 	localSnaps := []*ateapipb.Snapshot{
@@ -807,11 +810,76 @@ func TestIsPausedOriginSuspend(t *testing.T) {
 	}
 }
 
-// TestEnsurePausedSnapshotUploaded_Preconditions covers the paused branch's
+// TestSuspendActor_FromPausedDetachesPauseSnapshot verifies a paused-origin
+// suspend keeps the pause snapshot as the pause recorded it: MarkSuspending
+// reuses the URI the pause recorded, where atelet may already have uploaded
+// the snapshot, and the fidelity the pause captured, though the template now
+// names another location and fidelity; DetachActor then sends that snapshot's
+// uuid, fidelity, URI and generation.
+func TestSuspendActor_FromPausedDetachesPauseSnapshot(t *testing.T) {
+	ctx := context.Background()
+	persistence := newTestPersistence(t)
+	w, atelet := newWireCaptureWorkflow(t, persistence)
+
+	pauseURI := someActorSnapshotURI(t, "gs://bucket/pause-root", "team-a", "pause-snap")
+	actorRef := resources.ActorRef{Atespace: "team-a", Name: "actor-1"}
+	paused := storetest.MustCreateActor(t, ctx, persistence, &ateapipb.Actor{
+		Metadata:      &ateapipb.ResourceMetadata{Atespace: actorRef.Atespace, Name: actorRef.Name},
+		ActorTemplate: &ateapipb.ObjectRef{Atespace: "ns", Name: "tmpl1"},
+		Status: &ateapipb.ActorStatus{
+			State:                  ateapipb.ActorState_ACTOR_STATE_PAUSED,
+			AssignedNode:           "node-1",
+			LastAssignedGeneration: 3,
+			Snapshots: []*ateapipb.Snapshot{
+				newDurableSnapshot(1, ateapipb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR, ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, "tmpl-uid-1", "prev", someActorSnapshotURI(t, testStorageLocation, "team-a", "prev"), ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED),
+				newPauseSnapshot(3, ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES, "tmpl-uid-1", "pause-snap", "node-1", pauseURI),
+			},
+		},
+	})
+	tmpl := &ateapipb.ActorTemplate{
+		Metadata: &ateapipb.ResourceMetadata{Atespace: "ns", Name: "tmpl1", Uid: "tmpl-uid-1"},
+		SnapshotConfig: &ateapipb.SnapshotConfig{
+			StorageLocation:   testStorageLocation,
+			PreferredFidelity: ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
+		},
+	}
+
+	marked, err := w.ensureMarkedSuspending(ctx, actorRef, paused, tmpl)
+	if err != nil {
+		t.Fatalf("ensureMarkedSuspending: %v", err)
+	}
+	wantInProgress := newPauseSnapshot(3, ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES, "tmpl-uid-1", "pause-snap", "node-1", pauseURI)
+	if got := snapshotAtLatestGeneration(marked.GetStatus()); !proto.Equal(got, wantInProgress) {
+		t.Errorf("in-progress snapshot = %v, want the pause snapshot as recorded, %v", got, wantInProgress)
+	}
+
+	wireFidelity, err := w.ensurePausedSnapshotDetached(ctx, actorRef, marked)
+	if err != nil {
+		t.Fatalf("ensurePausedSnapshotDetached: %v", err)
+	}
+	if want := ateattr.SnapshotFidelityValue(ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES); wireFidelity != want {
+		t.Errorf("wireFidelity = %q, want %q", wireFidelity, want)
+	}
+	if req := atelet.checkpointRequest(); req != nil {
+		t.Errorf("Checkpoint sent for a paused actor, which has no workload: %v", req)
+	}
+	wantReq := &ateletpb.DetachActorRequest{
+		Atespace:              actorRef.Atespace,
+		ActorName:             actorRef.Name,
+		ActorUid:              paused.GetMetadata().GetUid(),
+		ActorTemplateAtespace: "ns",
+		ActorTemplateName:     "tmpl1",
+	}
+	if got := atelet.detachRequest(); !proto.Equal(got, wantReq) {
+		t.Errorf("DetachActorRequest = %v, want %v", got, wantReq)
+	}
+}
+
+// TestEnsurePausedSnapshotDetached_Preconditions covers the paused branch's
 // failure handling: a lost node record crashes the actor (the snapshot can
 // never be found), while an unreachable atelet stays retryable (the bytes
 // are likely still on the node's disk).
-func TestEnsurePausedSnapshotUploaded_Preconditions(t *testing.T) {
+func TestEnsurePausedSnapshotDetached_Preconditions(t *testing.T) {
 	t.Run("no node recorded crashes", func(t *testing.T) {
 		ctx := context.Background()
 		persistence := newTestPersistence(t)
@@ -828,7 +896,7 @@ func TestEnsurePausedSnapshotUploaded_Preconditions(t *testing.T) {
 			},
 		})
 
-		_, err := w.ensurePausedSnapshotUploaded(ctx, resources.ActorRef{Atespace: "team-a", Name: "actor-1"}, created, &ateapipb.ActorTemplate{})
+		_, err := w.ensurePausedSnapshotDetached(ctx, resources.ActorRef{Atespace: "team-a", Name: "actor-1"}, created)
 		if got := apierror.Code(err); got != codes.FailedPrecondition {
 			t.Fatalf("apierror.Code(err) = %v, want %v for a missing node record (err: %v)", got, codes.FailedPrecondition, err)
 		}
@@ -859,10 +927,9 @@ func TestEnsurePausedSnapshotUploaded_Preconditions(t *testing.T) {
 			},
 		})
 
-		tmpl := &ateapipb.ActorTemplate{SnapshotConfig: &ateapipb.SnapshotConfig{StorageLocation: "gs://snapshots"}}
-		_, err := w.ensurePausedSnapshotUploaded(ctx, resources.ActorRef{Atespace: "team-a", Name: "actor-1"}, created, tmpl)
+		_, err := w.ensurePausedSnapshotDetached(ctx, resources.ActorRef{Atespace: "team-a", Name: "actor-1"}, created)
 		if !errors.Is(err, ErrNoAteletOnNode) {
-			t.Fatalf("ensurePausedSnapshotUploaded = %v, want ErrNoAteletOnNode", err)
+			t.Fatalf("ensurePausedSnapshotDetached = %v, want ErrNoAteletOnNode", err)
 		}
 
 		stored, err := persistence.GetActor(ctx, resources.ActorRef{Atespace: "team-a", Name: "actor-1"})

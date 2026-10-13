@@ -21,8 +21,11 @@ import (
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/internal/apierror"
+	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // TagActorSnapshot tags the external snapshot held by the suspended actor the
@@ -30,7 +33,9 @@ import (
 // The tag is given its own copy of that snapshot, so suspending the actor again
 // or deleting the actor does not garbage collect the tag's snapshot.
 //
-// The tag is built in 4 phases:
+// The tag is built in 5 phases:
+//  0. Promote the actor's latest snapshot to object storage if atelet has not
+//     uploaded it yet.
 //  1. Reserve the tag's name; the store assigns its UID.
 //  2. Record the snapshot's URI, under the tag's UID, before anything is
 //     copied there.
@@ -65,11 +70,14 @@ func (w *ActorWorkflow) TagActorSnapshot(ctx context.Context, tag *ateapipb.Tag)
 	}
 	defer tagLease.Close()
 
-	actor, actorTemplate, err := w.loadActorForTag(leaseCtx, actorRef)
+	actor, actorTemplate, snapshot, err := w.loadActorForTag(leaseCtx, actorRef)
 	if err != nil {
 		return nil, err
 	}
-	snapshot := findLatestDurableSnapshot(actor.GetStatus(), ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED)
+	actor, snapshot, err = w.ensureActorSnapshotPromoted(leaseCtx, actorRef, actor, snapshot)
+	if err != nil {
+		return nil, err
+	}
 
 	reserved, err := w.ensureTagReserved(leaseCtx, tagRef, actor, actorTemplate, snapshot, tag)
 	if err != nil {
@@ -200,23 +208,30 @@ func (w *ActorWorkflow) finalizeTagDeleted(ctx context.Context, tagRef resources
 }
 
 // loadActorForTag fetches the actor to tag and its template, and checks that
-// the actor holds an external snapshot a tag can be made from.
-func (w *ActorWorkflow) loadActorForTag(ctx context.Context, actorRef resources.ActorRef) (_ *ateapipb.Actor, _ *ateapipb.ActorTemplate, err error) {
+// the actor holds a snapshot a tag can be made from.
+func (w *ActorWorkflow) loadActorForTag(ctx context.Context, actorRef resources.ActorRef) (_ *ateapipb.Actor, _ *ateapipb.ActorTemplate, _ *ateapipb.Snapshot, err error) {
 	ctx, done := stepSpan(ctx, "LoadActorForTag")
 	defer func() { err = done(err) }()
 
 	actor, err := w.store.GetActor(ctx, actorRef)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	// Only a suspended actor's snapshot is complete. A running or
 	// suspending actor's is either stale or still being written.
 	if got := actor.GetStatus().GetState(); got != ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
-		return nil, nil, apierror.FailedPrecondition("Actor %s must be %s to be tagged (got: %v)", actorRef, ateapipb.ActorState_ACTOR_STATE_SUSPENDED, got)
+		return nil, nil, nil, apierror.FailedPrecondition("Actor %s must be %s to be tagged (got: %v)", actorRef, ateapipb.ActorState_ACTOR_STATE_SUSPENDED, got)
 	}
-	snap := findLatestDurableSnapshot(actor.GetStatus(), ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED)
+	snap := snapshotAtLatestGeneration(actor.GetStatus())
 	if snap == nil {
-		return nil, nil, apierror.FailedPrecondition("Actor %s holds no external snapshot to tag", actorRef)
+		snap = findLatestDurableSnapshot(actor.GetStatus(), ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED)
+	}
+	if snap.GetDurableSnapshot().GetObject().GetSnapshotUri() == "" {
+		return nil, nil, nil, apierror.FailedPrecondition("Actor %s holds no external snapshot to tag", actorRef)
+	}
+	if snap.GetDurableSnapshot().GetStatus() != ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED &&
+		actor.GetStatus().GetAssignedNode() == "" && snap.GetLocality() == "" {
+		return nil, nil, nil, apierror.FailedPrecondition("Actor %s holds no external snapshot to tag", actorRef)
 	}
 	// Every way an Actor comes to hold an external snapshot records the
 	// template its guest state was built under: a suspend through
@@ -224,13 +239,89 @@ func (w *ActorWorkflow) loadActorForTag(ctx context.Context, actorRef resources.
 	// A snapshot without one is a broken row, and tagging it would mint a tag
 	// that names no template.
 	if snap.GetActorTemplateUid() == "" {
-		return nil, nil, apierror.Internal("Actor %s holds an external snapshot but records no template it was built under", actorRef)
+		return nil, nil, nil, apierror.Internal("Actor %s holds an external snapshot but records no template it was built under", actorRef)
 	}
 	actorTemplate, err := resolveActorTemplate(ctx, w.store, actor)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return actor, actorTemplate, nil
+	return actor, actorTemplate, snap, nil
+}
+
+// ensureActorSnapshotPromoted makes the actor's latest snapshot durable in
+// object storage if atelet has not uploaded it yet. It calls atelet's
+// PromoteSnapshot on the node holding the snapshot, which uploads the snapshot
+// while keeping its local copy on disk, then marks the snapshot COMPLETED on
+// the actor and collects any older external snapshots it superseded.
+func (w *ActorWorkflow) ensureActorSnapshotPromoted(ctx context.Context, actorRef resources.ActorRef, actor *ateapipb.Actor, snapshot *ateapipb.Snapshot) (_ *ateapipb.Actor, _ *ateapipb.Snapshot, err error) {
+	ctx, done := stepSpan(ctx, "PromoteTagSnapshot")
+	defer func() { err = done(err) }()
+
+	if snapshot.GetDurableSnapshot().GetStatus() == ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED {
+		markSkipped(ctx, "the actor's snapshot is already durable")
+		return actor, snapshot, nil
+	}
+	nodeName := actor.GetStatus().GetAssignedNode()
+	if nodeName == "" {
+		nodeName = snapshot.GetLocality()
+	}
+	if nodeName == "" || w.dialer == nil {
+		return nil, nil, apierror.FailedPrecondition("Actor %s holds no external snapshot to tag", actorRef)
+	}
+
+	ateletConn, err := w.dialer.DialForAteletOnNode(nodeName)
+	if err != nil {
+		return nil, nil, fmt.Errorf("while getting atelet conn for node %q: %w", nodeName, err)
+	}
+	client := ateletpb.NewAteomHerderClient(ateletConn)
+
+	req := &ateletpb.PromoteSnapshotRequest{
+		Atespace:              actor.GetMetadata().GetAtespace(),
+		ActorName:             actor.GetMetadata().GetName(),
+		ActorUid:              actor.GetMetadata().GetUid(),
+		ActorTemplateAtespace: actor.GetActorTemplate().GetAtespace(),
+		ActorTemplateName:     actor.GetActorTemplate().GetName(),
+		Snapshot: &ateletpb.Snapshot{
+			SnapshotUuid: snapshot.GetUuid(),
+			Fidelity:     fidelityToAtelet(snapshot.GetFidelity()),
+			Object: &ateletpb.ObjectStorage{
+				SnapshotUri: snapshot.GetDurableSnapshot().GetObject().GetSnapshotUri(),
+			},
+			Generation: snapshot.GetGeneration(),
+		},
+	}
+	resp, err := client.PromoteSnapshot(ctx, req)
+	if err != nil {
+		if status.Code(err) == codes.Unavailable {
+			return nil, nil, apierror.Unavailable("while calling atelet PromoteSnapshot: %w", err)
+		}
+		if status.Code(err) == codes.FailedPrecondition {
+			return nil, nil, apierror.FailedPrecondition("while calling atelet PromoteSnapshot: %w", err)
+		}
+		return nil, nil, fmt.Errorf("while calling atelet PromoteSnapshot for actor %s: %w", actorRef, err)
+	}
+
+	updatedActor, err := w.store.UpdateActor(ctx, actorRef, store.PreconditionFrom(actor), func(toUpdate *ateapipb.Actor) error {
+		target := findSnapshotByGeneration(toUpdate.Status.GetSnapshots(), snapshot.GetGeneration())
+		if target == nil || target.GetDurableSnapshot() == nil {
+			return fmt.Errorf("snapshot generation %d missing on actor %s", snapshot.GetGeneration(), actorRef)
+		}
+		target.DurableSnapshot.Status = ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED
+		local := findLatestLocalSnapshot(toUpdate.Status)
+		if resp.GetState() != nil && resp.GetState().GetLatestLocal() == nil {
+			local = nil
+			toUpdate.Status.AssignedNode = ""
+		}
+		pruneSnapshots(toUpdate.Status, local)
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, store.ErrVersionConflict) {
+			return nil, nil, apierror.Aborted("concurrent update conflict, please retry")
+		}
+		return nil, nil, fmt.Errorf("while recording promoted snapshot of actor %s: %w", actorRef, err)
+	}
+	return updatedActor, findSnapshotByGeneration(updatedActor.GetStatus().GetSnapshots(), snapshot.GetGeneration()), nil
 }
 
 // ensureTagReserved takes the tag's name. The store assigns the tag's UID on

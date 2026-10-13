@@ -392,9 +392,9 @@ func (w *ActorWorkflow) ensureExternalSnapshotsReleased(ctx context.Context, act
 }
 
 // actorSnapshotStoragePrefix returns the prefix holding every object the actor wrote:
-// the snapshot it last took, the one a suspend was in the middle of taking, and
-// anything a crashed suspend stranded. A zero prefix means the actor never
-// wrote anything.
+// the snapshot it last took, the one a suspend was in the middle of taking or
+// atelet may upload for a pause, and anything a crashed suspend stranded. A
+// zero prefix means the actor never wrote anything.
 func actorSnapshotStoragePrefix(actor *ateapipb.Actor) (resources.StoragePrefix, error) {
 	actorOwner := actorSnapshotOwner(actor)
 	if snap := findLatestDurableSnapshot(actor.GetStatus(), ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED); snap != nil {
@@ -410,9 +410,10 @@ func actorSnapshotStoragePrefix(actor *ateapipb.Actor) (resources.StoragePrefix,
 			return uri.OwnerPrefix(), nil
 		}
 	}
-	// Nothing of the actor's own is recorded. Unless a suspend died partway,
-	// nothing was ever written under its prefix: the in-progress URI is
-	// recorded before atelet uploads the first object.
+	// Nothing of the actor's own is recorded as complete. Unless a suspend
+	// died partway or atelet uploaded a pause snapshot, nothing was ever
+	// written under its prefix: both record the URI before atelet uploads the
+	// first object.
 	inProgressSnap := findLatestDurableSnapshot(actor.GetStatus(), ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_PENDING)
 	inProgress := inProgressSnap.GetDurableSnapshot().GetObject().GetSnapshotUri()
 	if inProgress == "" {

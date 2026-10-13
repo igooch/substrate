@@ -30,6 +30,8 @@ import (
 	"github.com/agent-substrate/substrate/internal/serverboot"
 	"github.com/agent-substrate/substrate/internal/testenv"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
@@ -128,9 +130,25 @@ type FakeAteletServer struct {
 	FailRestore    error
 	RestoreDelay   time.Duration
 
-	PromoteCalled  bool
-	PromoteRequest *ateletpb.PromoteSnapshotRequest
-	FailPromote    error
+	PromoteCalled          bool
+	PromoteRequest         *ateletpb.PromoteSnapshotRequest
+	PromoteRequests        []*ateletpb.PromoteSnapshotRequest
+	FailPromote            error
+	FailPromoteAfterCommit error
+
+	DetachCalled  bool
+	DetachRequest *ateletpb.DetachActorRequest
+	// DetachRequests holds every DetachActor request, in order.
+	DetachRequests []*ateletpb.DetachActorRequest
+	FailDetach     error
+	// FailDetachAfterCommit is returned once the upload has committed, as
+	// when the response to a successful detach is lost.
+	FailDetachAfterCommit error
+
+	// deferred holds the latest deferred snapshot per actor UID until DetachActor uploads and deletes it.
+	deferred map[string]*ateletpb.Snapshot
+	// uploaded holds the fidelity uploaded to each snapshot URI.
+	uploaded map[string]ateletpb.SnapshotFidelity
 
 	TerminateCalled  bool
 	TerminateRequest *ateletpb.TerminateRequest
@@ -152,6 +170,8 @@ func (f *FakeAteletServer) SetObjectStore(store *objectstoretest.Fake) {
 	f.Lock.Lock()
 	defer f.Lock.Unlock()
 	f.objectStore = store
+	f.deferred = nil
+	f.uploaded = nil
 }
 
 // writeSnapshot records the external snapshot a checkpoint or an upload would
@@ -161,6 +181,18 @@ func (f *FakeAteletServer) writeSnapshot(snapshotURI string) error {
 		return nil
 	}
 	return f.objectStore.WriteSnapshot(snapshotURI, snapshotObjects...)
+}
+
+// validateSnapshot rejects a snapshot missing what atelet requires on every
+// request: where its durable copy lives, and its generation.
+func validateSnapshot(snap *ateletpb.Snapshot) error {
+	if snap.GetObject().GetSnapshotUri() == "" {
+		return status.Error(codes.InvalidArgument, "snapshot.object.snapshot_uri is required")
+	}
+	if snap.GetGeneration() < 1 {
+		return status.Errorf(codes.InvalidArgument, "snapshot.generation must be at least 1, got %d", snap.GetGeneration())
+	}
+	return nil
 }
 
 func (f *FakeAteletServer) Reset() {
@@ -182,13 +214,19 @@ func (f *FakeAteletServer) Reset() {
 
 	f.PromoteCalled = false
 	f.PromoteRequest = nil
+	f.PromoteRequests = nil
 	f.FailPromote = nil
+	f.FailPromoteAfterCommit = nil
+
+	f.DetachCalled = false
+	f.DetachRequest = nil
+	f.DetachRequests = nil
+	f.FailDetach = nil
+	f.FailDetachAfterCommit = nil
 
 	f.TerminateCalled = false
 	f.TerminateRequest = nil
 	f.FailTerminate = nil
-
-	f.objectStore = nil
 }
 
 func (f *FakeAteletServer) PromoteSnapshot(ctx context.Context, req *ateletpb.PromoteSnapshotRequest) (*ateletpb.PromoteSnapshotResponse, error) {
@@ -197,13 +235,60 @@ func (f *FakeAteletServer) PromoteSnapshot(ctx context.Context, req *ateletpb.Pr
 
 	f.PromoteCalled = true
 	f.PromoteRequest = proto.Clone(req).(*ateletpb.PromoteSnapshotRequest)
+	f.PromoteRequests = append(f.PromoteRequests, f.PromoteRequest)
+	if err := validateSnapshot(req.GetSnapshot()); err != nil {
+		return nil, err
+	}
 	if f.FailPromote != nil {
 		return nil, f.FailPromote
 	}
-	if err := f.writeSnapshot(req.GetSnapshot().GetObject().GetSnapshotUri()); err != nil {
+	uri := req.GetSnapshot().GetObject().GetSnapshotUri()
+	if uploaded, ok := f.uploaded[uri]; ok {
+		if uploaded < req.GetSnapshot().GetFidelity() {
+			return nil, status.Errorf(codes.FailedPrecondition, "%s holds the snapshot as %v, lower than %v", uri, uploaded, req.GetSnapshot().GetFidelity())
+		}
+		return &ateletpb.PromoteSnapshotResponse{}, nil
+	}
+	if err := f.writeSnapshot(uri); err != nil {
 		return nil, err
 	}
+	if f.uploaded == nil {
+		f.uploaded = map[string]ateletpb.SnapshotFidelity{}
+	}
+	f.uploaded[uri] = req.GetSnapshot().GetFidelity()
+	if f.FailPromoteAfterCommit != nil {
+		return nil, f.FailPromoteAfterCommit
+	}
 	return &ateletpb.PromoteSnapshotResponse{}, nil
+}
+
+func (f *FakeAteletServer) DetachActor(ctx context.Context, req *ateletpb.DetachActorRequest) (*ateletpb.DetachActorResponse, error) {
+	f.Lock.Lock()
+	defer f.Lock.Unlock()
+
+	f.DetachCalled = true
+	f.DetachRequest = proto.Clone(req).(*ateletpb.DetachActorRequest)
+	f.DetachRequests = append(f.DetachRequests, f.DetachRequest)
+	if f.FailDetach != nil {
+		return nil, f.FailDetach
+	}
+	if snap := f.deferred[req.GetActorUid()]; snap != nil {
+		uri := snap.GetObject().GetSnapshotUri()
+		if _, ok := f.uploaded[uri]; !ok {
+			if err := f.writeSnapshot(uri); err != nil {
+				return nil, err
+			}
+			if f.uploaded == nil {
+				f.uploaded = map[string]ateletpb.SnapshotFidelity{}
+			}
+			f.uploaded[uri] = snap.GetFidelity()
+		}
+		delete(f.deferred, req.GetActorUid())
+	}
+	if f.FailDetachAfterCommit != nil {
+		return nil, f.FailDetachAfterCommit
+	}
+	return &ateletpb.DetachActorResponse{}, nil
 }
 
 func (f *FakeAteletServer) Run(ctx context.Context, req *ateletpb.RunRequest) (*ateletpb.RunResponse, error) {
@@ -225,12 +310,25 @@ func (f *FakeAteletServer) Checkpoint(ctx context.Context, req *ateletpb.Checkpo
 
 	f.CheckpointCalled = true
 	f.CheckpointRequest = proto.Clone(req).(*ateletpb.CheckpointRequest)
+	if err := validateSnapshot(req.GetSnapshot()); err != nil {
+		return nil, err
+	}
 	if f.FailCheckpoint != nil {
 		return nil, f.FailCheckpoint
 	}
 
-	if err := f.writeSnapshot(req.GetSnapshot().GetObject().GetSnapshotUri()); err != nil {
-		return nil, err
+	// Only an immediate upload lands before Checkpoint returns. The fake runs
+	// no deferred uploads: the actor's DetachActor or PromoteSnapshot writes those instead.
+	if req.GetUploadConfig().GetMode() == ateletpb.UploadMode_UPLOAD_MODE_IMMEDIATE {
+		if err := f.writeSnapshot(req.GetSnapshot().GetObject().GetSnapshotUri()); err != nil {
+			return nil, err
+		}
+		delete(f.deferred, req.GetActorUid())
+	} else {
+		if f.deferred == nil {
+			f.deferred = map[string]*ateletpb.Snapshot{}
+		}
+		f.deferred[req.GetActorUid()] = proto.Clone(req.GetSnapshot()).(*ateletpb.Snapshot)
 	}
 	return &ateletpb.CheckpointResponse{}, nil
 }
@@ -241,6 +339,9 @@ func (f *FakeAteletServer) Restore(ctx context.Context, req *ateletpb.RestoreReq
 
 	f.RestoreCalled = true
 	f.RestoreRequest = proto.Clone(req).(*ateletpb.RestoreRequest)
+	if err := validateSnapshot(req.GetSnapshot()); err != nil {
+		return nil, err
+	}
 	if f.RestoreDelay > 0 {
 		time.Sleep(f.RestoreDelay)
 	}

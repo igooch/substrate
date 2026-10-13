@@ -25,10 +25,12 @@ import (
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/storetest"
 	"github.com/agent-substrate/substrate/internal/apierror"
 	"github.com/agent-substrate/substrate/internal/objectstore/objectstoretest"
+	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/google/go-cmp/cmp"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/protobuf/proto"
 )
 
 // seedTagSource stores a suspended actor whose external snapshot is made of
@@ -638,5 +640,109 @@ func TestDeleteTag_Preconditions(t *testing.T) {
 	}
 	if _, err := persistence.GetTag(ctx, tagRef); !errors.Is(err, store.ErrNotFound) {
 		t.Errorf("GetTag after the delete = %v, want ErrNotFound", err)
+	}
+}
+
+// TestTagActorSnapshot_PromotesPendingSnapshot verifies that tagging a
+// suspended actor whose latest snapshot is still PENDING in object storage
+// promotes that snapshot via atelet's PromoteSnapshot, marks it COMPLETED on
+// the actor while keeping its local copy and node pinning intact, collects any
+// older superseded durable snapshot, and copies the promoted snapshot into the
+// tag's own prefix.
+func TestTagActorSnapshot_PromotesPendingSnapshot(t *testing.T) {
+	ctx := context.Background()
+	persistence := newTestPersistence(t)
+	template := seedSubstrateTemplate(t, ctx, persistence, "sub-tmpl")
+	w, objects := newFinalizeWorkflow(persistence)
+	wireW, atelet := newWireCaptureWorkflow(t, persistence)
+	w.dialer = wireW.dialer
+
+	actorRef := resources.ActorRef{Atespace: "team-a", Name: "actor-1"}
+	actor := storetest.MustCreateActor(t, ctx, persistence, &ateapipb.Actor{
+		Metadata:      &ateapipb.ResourceMetadata{Atespace: actorRef.Atespace, Name: actorRef.Name},
+		ActorTemplate: &ateapipb.ObjectRef{Atespace: "team-a", Name: template.GetMetadata().GetName()},
+		Status: &ateapipb.ActorStatus{
+			State:        ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
+			AssignedNode: "node-1",
+		},
+	})
+	oldURI := mustActorSnapshotURI(t, template, actor, "actor-1-gen1")
+	pendingURI := mustActorSnapshotURI(t, template, actor, "actor-1-gen2")
+	objects.PutSnapshot(t, oldURI, "old.json")
+
+	actor = mustUpdateActorStatus(t, ctx, persistence, actor, func(s *ateapipb.ActorStatus) {
+		s.LastAssignedGeneration = 2
+		s.Snapshots = []*ateapipb.Snapshot{
+			newDurableSnapshot(1, ateapipb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR, ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, template.GetMetadata().GetUid(), oldURI.Name(), oldURI.String(), ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED),
+			newPauseSnapshot(2, ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, template.GetMetadata().GetUid(), pendingURI.Name(), "node-1", pendingURI.String()),
+		}
+	})
+
+	atelet.snapshotState = &ateletpb.ActorSnapshotState{
+		LatestLocal: &ateletpb.SnapshotReport{
+			Snapshot: &ateletpb.Snapshot{
+				SnapshotUuid: pendingURI.Name(),
+				Fidelity:     ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
+				Object:       &ateletpb.ObjectStorage{SnapshotUri: pendingURI.String()},
+				Generation:   2,
+			},
+		},
+		LatestDurable: &ateletpb.SnapshotReport{
+			Snapshot: &ateletpb.Snapshot{
+				SnapshotUuid: pendingURI.Name(),
+				Fidelity:     ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
+				Object:       &ateletpb.ObjectStorage{SnapshotUri: pendingURI.String()},
+				Generation:   2,
+			},
+		},
+	}
+	atelet.onPromote = func(req *ateletpb.PromoteSnapshotRequest) error {
+		objects.PutSnapshot(t, pendingURI, "manifest.json", "memory.zst")
+		return nil
+	}
+
+	tag, err := w.TagActorSnapshot(ctx, tagToCreate(actorRef, "v1"))
+	if err != nil {
+		t.Fatalf("TagActorSnapshot: %v", err)
+	}
+
+	wantPromote := &ateletpb.PromoteSnapshotRequest{
+		Atespace:              actorRef.Atespace,
+		ActorName:             actorRef.Name,
+		ActorUid:              actor.GetMetadata().GetUid(),
+		ActorTemplateAtespace: "team-a",
+		ActorTemplateName:     template.GetMetadata().GetName(),
+		Snapshot: &ateletpb.Snapshot{
+			SnapshotUuid: pendingURI.Name(),
+			Fidelity:     ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
+			Object:       &ateletpb.ObjectStorage{SnapshotUri: pendingURI.String()},
+			Generation:   2,
+		},
+	}
+	if got := atelet.promoteRequest(); !proto.Equal(got, wantPromote) {
+		t.Errorf("PromoteSnapshotRequest = %v, want %v", got, wantPromote)
+	}
+	if got := atelet.detachRequest(); got != nil {
+		t.Errorf("DetachActorRequest = %v, want nil (PromoteSnapshot keeps local copy)", got)
+	}
+
+	tagSnapshot := tagDurableSnapshotURI(tag, ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED)
+	if diff := cmp.Diff([]string{"manifest.json", "memory.zst"}, objects.Snapshot(t, mustParseSnapshotURI(t, tagSnapshot))); diff != "" {
+		t.Errorf("tag external snapshot mismatch (-want +got):\n%s", diff)
+	}
+
+	storedActor, err := persistence.GetActor(ctx, actorRef)
+	if err != nil {
+		t.Fatalf("GetActor: %v", err)
+	}
+	if got := storedActor.GetStatus().GetAssignedNode(); got != "node-1" {
+		t.Errorf("AssignedNode = %q, want %q preserved after PromoteSnapshot", got, "node-1")
+	}
+	promoted := snapshotAtLatestGeneration(storedActor.GetStatus())
+	if promoted.GetDurableSnapshot().GetStatus() != ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED {
+		t.Errorf("promoted snapshot status = %v, want COMPLETED", promoted.GetDurableSnapshot().GetStatus())
+	}
+	if got := promoted.GetLocality(); got != "node-1" {
+		t.Errorf("promoted snapshot Locality = %q, want %q preserved", got, "node-1")
 	}
 }

@@ -66,12 +66,12 @@ func (s *recordingStorage) objects() []string {
 }
 
 func uniformDelays(d time.Duration) delays {
-	return delays{run: d, restore: d, checkpoint: d, promoteSnapshot: d, terminate: d}
+	return delays{run: d, restore: d, checkpoint: d, detachActor: d, terminate: d}
 }
 
 // herderCalls invokes every AteomHerder method the herder implements. The
-// Checkpoint and PromoteSnapshot calls upload a snapshot, so each writes a
-// placeholder.
+// Checkpoint, PromoteSnapshot, and DetachActor calls upload a snapshot, so
+// each writes a placeholder.
 func herderCalls(h *herder) map[string]func(context.Context) error {
 	return map[string]func(context.Context) error{
 		"Run": func(ctx context.Context) error {
@@ -94,6 +94,13 @@ func herderCalls(h *herder) map[string]func(context.Context) error {
 			})
 			return err
 		},
+		"DetachActor": func(ctx context.Context) error {
+			h.setDeferred(testActorUID, testSnapshotURI)
+			_, err := h.DetachActor(ctx, &ateletpb.DetachActorRequest{
+				ActorUid: testActorUID,
+			})
+			return err
+		},
 		"Terminate": func(ctx context.Context) error {
 			_, err := h.Terminate(ctx, &ateletpb.TerminateRequest{})
 			return err
@@ -108,6 +115,7 @@ func externalCheckpoint(uri string) *ateletpb.CheckpointRequest {
 
 func checkpointWithMode(uri string, mode ateletpb.UploadMode) *ateletpb.CheckpointRequest {
 	return &ateletpb.CheckpointRequest{
+		ActorUid: testActorUID,
 		Snapshot: &ateletpb.Snapshot{
 			Object: &ateletpb.ObjectStorage{SnapshotUri: uri},
 		},
@@ -167,7 +175,7 @@ func TestHerderUsesEachCallsOwnDelay(t *testing.T) {
 // must leave an object under its URI.
 func TestHerderWritesPlaceholderUnderSnapshotURI(t *testing.T) {
 	const want = "bench-bucket/benchmark-workloads/sleep/atespaces/team-a/actors/0f9c1d2e-3b4a-4c5d-8e6f-7a8b9c0d1e2f/snapshots/snap-1/" + placeholderObject
-	for _, name := range []string{"Checkpoint", "PromoteSnapshot"} {
+	for _, name := range []string{"Checkpoint", "PromoteSnapshot", "DetachActor"} {
 		t.Run(name, func(t *testing.T) {
 			storage := &recordingStorage{}
 			if err := herderCalls(&herder{storage: storage})[name](context.Background()); err != nil {
@@ -192,7 +200,7 @@ func TestHerderWritesNothingForLocalCheckpoint(t *testing.T) {
 		t.Fatalf("Checkpoint with a deferred upload: %v", err)
 	}
 	for name, call := range herderCalls(h) {
-		if name == "Checkpoint" || name == "PromoteSnapshot" {
+		if name == "Checkpoint" || name == "PromoteSnapshot" || name == "DetachActor" {
 			continue
 		}
 		if err := call(context.Background()); err != nil {
@@ -200,7 +208,7 @@ func TestHerderWritesNothingForLocalCheckpoint(t *testing.T) {
 		}
 	}
 	if got := storage.objects(); len(got) != 0 {
-		t.Errorf("wrote %v, want nothing outside immediate uploads and promotions", got)
+		t.Errorf("wrote %v, want nothing outside immediate uploads, promotions, and detaches", got)
 	}
 }
 
@@ -214,6 +222,9 @@ func TestHerderFailsWhenPlaceholderCannotBeWritten(t *testing.T) {
 	}
 	if err := herderCalls(h)["PromoteSnapshot"](context.Background()); err == nil {
 		t.Error("PromoteSnapshot succeeded with no placeholder written; a later tag of this snapshot would fail")
+	}
+	if err := herderCalls(h)["DetachActor"](context.Background()); err == nil {
+		t.Error("DetachActor succeeded with no placeholder written; a later tag of this snapshot would fail")
 	}
 }
 

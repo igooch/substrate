@@ -1028,15 +1028,19 @@ func TestLoadActorForResume_RunningActorShortCircuits(t *testing.T) {
 	}
 }
 
-// capturingAtelet records the last Restore and Run request it receives, so a
-// test can assert on the exact wire request the resume workflow sends.
+// capturingAtelet records the last request of each kind it receives, so a
+// test can assert on the exact wire request a workflow sends.
 type capturingAtelet struct {
 	ateletpb.UnimplementedAteomHerderServer
 
-	mu         sync.Mutex
-	restore    *ateletpb.RestoreRequest
-	run        *ateletpb.RunRequest
-	checkpoint *ateletpb.CheckpointRequest
+	mu            sync.Mutex
+	restore       *ateletpb.RestoreRequest
+	run           *ateletpb.RunRequest
+	checkpoint    *ateletpb.CheckpointRequest
+	promote       *ateletpb.PromoteSnapshotRequest
+	detach        *ateletpb.DetachActorRequest
+	snapshotState *ateletpb.ActorSnapshotState
+	onPromote     func(*ateletpb.PromoteSnapshotRequest) error
 }
 
 func (f *capturingAtelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (*ateletpb.RestoreResponse, error) {
@@ -1057,7 +1061,26 @@ func (f *capturingAtelet) Checkpoint(ctx context.Context, req *ateletpb.Checkpoi
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.checkpoint = proto.Clone(req).(*ateletpb.CheckpointRequest)
-	return &ateletpb.CheckpointResponse{}, nil
+	return &ateletpb.CheckpointResponse{State: proto.Clone(f.snapshotState).(*ateletpb.ActorSnapshotState)}, nil
+}
+
+func (f *capturingAtelet) PromoteSnapshot(ctx context.Context, req *ateletpb.PromoteSnapshotRequest) (*ateletpb.PromoteSnapshotResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.promote = proto.Clone(req).(*ateletpb.PromoteSnapshotRequest)
+	if f.onPromote != nil {
+		if err := f.onPromote(f.promote); err != nil {
+			return nil, err
+		}
+	}
+	return &ateletpb.PromoteSnapshotResponse{State: proto.Clone(f.snapshotState).(*ateletpb.ActorSnapshotState)}, nil
+}
+
+func (f *capturingAtelet) DetachActor(ctx context.Context, req *ateletpb.DetachActorRequest) (*ateletpb.DetachActorResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.detach = proto.Clone(req).(*ateletpb.DetachActorRequest)
+	return &ateletpb.DetachActorResponse{State: proto.Clone(f.snapshotState).(*ateletpb.ActorSnapshotState)}, nil
 }
 
 func (f *capturingAtelet) checkpointRequest() *ateletpb.CheckpointRequest {
@@ -1067,6 +1090,24 @@ func (f *capturingAtelet) checkpointRequest() *ateletpb.CheckpointRequest {
 		return nil
 	}
 	return proto.Clone(f.checkpoint).(*ateletpb.CheckpointRequest)
+}
+
+func (f *capturingAtelet) promoteRequest() *ateletpb.PromoteSnapshotRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.promote == nil {
+		return nil
+	}
+	return proto.Clone(f.promote).(*ateletpb.PromoteSnapshotRequest)
+}
+
+func (f *capturingAtelet) detachRequest() *ateletpb.DetachActorRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.detach == nil {
+		return nil
+	}
+	return proto.Clone(f.detach).(*ateletpb.DetachActorRequest)
 }
 
 // requests returns the recorded Restore and Run requests, nil for an RPC that
@@ -1167,6 +1208,8 @@ func TestResumeActor_AteletWireRequest(t *testing.T) {
 
 	actorURI := someActorSnapshotURI(t, testStorageLocation, "team-a", durableSnapshotName)
 	goldenURI := someActorSnapshotURI(t, "gs://bucket/golden-root", "ate-golden", "golden-1")
+	// localURI is where the pause recorded atelet may upload its snapshot.
+	localURI := someActorSnapshotURI(t, testStorageLocation, "team-a", localSnapshotName)
 
 	fullScope := ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY
 	rootfsScope := ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS
@@ -1177,7 +1220,7 @@ func TestResumeActor_AteletWireRequest(t *testing.T) {
 		return newDurableSnapshot(1, ateapipb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR, fidelity, "", durableSnapshotName, uri, ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED)
 	}
 	localSnap := func(name string, fidelity ateapipb.SnapshotFidelity) *ateapipb.Snapshot {
-		return newLocalSnapshot(1, fidelity, "", name, "node-1")
+		return newPauseSnapshot(1, fidelity, "", name, "node-1", localURI)
 	}
 
 	// actorSeed is the actor status a row persists before resuming.
@@ -1210,10 +1253,15 @@ func TestResumeActor_AteletWireRequest(t *testing.T) {
 		run  bool
 		// snapshotName is Snapshot.SnapshotUuid and snapshotURI is
 		// Snapshot.Object.SnapshotUri. Both are asserted on every Restore, so
-		// a local row also pins that no durable copy is sent.
+		// a local row also pins that the durable copy the pause recorded is
+		// sent, for atelet to read if the node no longer holds the snapshot.
 		snapshotName string
 		snapshotURI  string
-		scope        ateletpb.SnapshotFidelity
+		// generation is Snapshot.Generation: the restored entry's. A row
+		// seeds its external snapshot first, so a local one alongside it is
+		// generation 2.
+		generation int32
+		scope      ateletpb.SnapshotFidelity
 	}
 
 	tests := []struct {
@@ -1233,6 +1281,7 @@ func TestResumeActor_AteletWireRequest(t *testing.T) {
 			want: restoreWant{
 				snapshotName: durableSnapshotName,
 				snapshotURI:  goldenURI,
+				generation:   1,
 				scope:        ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
 			},
 		},
@@ -1259,6 +1308,7 @@ func TestResumeActor_AteletWireRequest(t *testing.T) {
 			want: restoreWant{
 				snapshotName: durableSnapshotName,
 				snapshotURI:  actorURI,
+				generation:   1,
 				scope:        ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
 			},
 		},
@@ -1271,6 +1321,7 @@ func TestResumeActor_AteletWireRequest(t *testing.T) {
 			want: restoreWant{
 				snapshotName: durableSnapshotName,
 				snapshotURI:  actorURI,
+				generation:   1,
 				scope:        ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
 			},
 		},
@@ -1286,6 +1337,7 @@ func TestResumeActor_AteletWireRequest(t *testing.T) {
 			want: restoreWant{
 				snapshotName: durableSnapshotName,
 				snapshotURI:  actorURI,
+				generation:   1,
 				scope:        ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES,
 			},
 		},
@@ -1295,6 +1347,7 @@ func TestResumeActor_AteletWireRequest(t *testing.T) {
 			want: restoreWant{
 				snapshotName: durableSnapshotName,
 				snapshotURI:  actorURI,
+				generation:   1,
 				scope:        ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS,
 			},
 		},
@@ -1309,6 +1362,7 @@ func TestResumeActor_AteletWireRequest(t *testing.T) {
 			want: restoreWant{
 				snapshotName: durableSnapshotName,
 				snapshotURI:  actorURI,
+				generation:   1,
 				scope:        ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES,
 			},
 		},
@@ -1318,6 +1372,7 @@ func TestResumeActor_AteletWireRequest(t *testing.T) {
 			want: restoreWant{
 				snapshotName: durableSnapshotName,
 				snapshotURI:  actorURI,
+				generation:   1,
 				scope:        ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES,
 			},
 		},
@@ -1330,6 +1385,7 @@ func TestResumeActor_AteletWireRequest(t *testing.T) {
 			want: restoreWant{
 				snapshotName: durableSnapshotName,
 				snapshotURI:  actorURI,
+				generation:   1,
 				scope:        ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES,
 			},
 		},
@@ -1342,6 +1398,7 @@ func TestResumeActor_AteletWireRequest(t *testing.T) {
 			want: restoreWant{
 				snapshotName: durableSnapshotName,
 				snapshotURI:  actorURI,
+				generation:   1,
 				scope:        ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_UNSPECIFIED,
 			},
 		},
@@ -1357,6 +1414,8 @@ func TestResumeActor_AteletWireRequest(t *testing.T) {
 			},
 			want: restoreWant{
 				snapshotName: localSnapshotName,
+				snapshotURI:  localURI,
+				generation:   1,
 				scope:        ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
 			},
 		},
@@ -1371,6 +1430,8 @@ func TestResumeActor_AteletWireRequest(t *testing.T) {
 			},
 			want: restoreWant{
 				snapshotName: localSnapshotName,
+				snapshotURI:  localURI,
+				generation:   1,
 				scope:        ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
 			},
 		},
@@ -1381,6 +1442,8 @@ func TestResumeActor_AteletWireRequest(t *testing.T) {
 			},
 			want: restoreWant{
 				snapshotName: localSnapshotName,
+				snapshotURI:  localURI,
+				generation:   1,
 				scope:        ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES,
 			},
 		},
@@ -1394,6 +1457,8 @@ func TestResumeActor_AteletWireRequest(t *testing.T) {
 			},
 			want: restoreWant{
 				snapshotName: localSnapshotName,
+				snapshotURI:  localURI,
+				generation:   1,
 				scope:        ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES,
 			},
 		},
@@ -1407,6 +1472,8 @@ func TestResumeActor_AteletWireRequest(t *testing.T) {
 			},
 			want: restoreWant{
 				snapshotName: localSnapshotName,
+				snapshotURI:  localURI,
+				generation:   2,
 				scope:        ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES,
 			},
 		},
@@ -1423,6 +1490,8 @@ func TestResumeActor_AteletWireRequest(t *testing.T) {
 			},
 			want: restoreWant{
 				snapshotName: localSnapshotName,
+				snapshotURI:  localURI,
+				generation:   2,
 				scope:        ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
 			},
 		},
@@ -1566,10 +1635,65 @@ func TestResumeActor_AteletWireRequest(t *testing.T) {
 			if got := restore.GetSnapshot().GetObject().GetSnapshotUri(); got != tt.want.snapshotURI {
 				t.Errorf("Snapshot.Object.SnapshotUri = %q, want %q", got, tt.want.snapshotURI)
 			}
+			if got := restore.GetSnapshot().GetGeneration(); got != tt.want.generation {
+				t.Errorf("Snapshot.Generation = %d, want %d", got, tt.want.generation)
+			}
 			if got := restore.GetSnapshot().GetFidelity(); got != tt.want.scope {
 				t.Errorf("restore scope = %v, want %v", got, tt.want.scope)
 			}
 		})
+	}
+}
+
+// TestEnsureAteletRestored_LocalSnapshotWithoutURICrashes verifies a PAUSED
+// actor whose pause entry records no upload URI, which a pause always
+// records, is crashed as corrupted instead of restored: atelet needs the URI
+// to read the snapshot back once the node no longer holds it.
+func TestEnsureAteletRestored_LocalSnapshotWithoutURICrashes(t *testing.T) {
+	ctx := context.Background()
+	persistence := newTestPersistence(t)
+	w, atelet := newWireCaptureWorkflow(t, persistence)
+
+	storetest.MustCreateAtespace(t, ctx, persistence, "ns")
+	if _, err := persistence.CreateActorTemplate(ctx, &ateapipb.ActorTemplate{
+		Metadata:       &ateapipb.ResourceMetadata{Atespace: "ns", Name: "tmpl1"},
+		SnapshotConfig: &ateapipb.SnapshotConfig{StorageLocation: testStorageLocation},
+		SandboxConfig: &ateapipb.SandboxConfig{
+			SandboxClass: ateapipb.SandboxClass_SANDBOX_CLASS_GVISOR,
+			ConfigName:   "gvisor",
+		},
+	}); err != nil {
+		t.Fatalf("create template: %v", err)
+	}
+	actorRef := resources.ActorRef{Atespace: "team-a", Name: "id1"}
+	seedWorkflowActor(t, ctx, persistence, actorRef, "ns", "tmpl1", ateapipb.ActorState_ACTOR_STATE_PAUSED, func(a *ateapipb.Actor) {
+		a.Status.WorkerAssignment = wireTestAssignment()
+		a.Status.AssignedNode = "node-1"
+		a.Status.LastAssignedGeneration = 1
+		a.Status.Snapshots = []*ateapipb.Snapshot{
+			newLocalSnapshot(1, ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, "", "pause-snap-1", "node-1"),
+		}
+	})
+
+	actor, tmpl, src, err := w.loadActorForResume(ctx, actorRef)
+	if err != nil {
+		t.Fatalf("loadActorForResume: %v", err)
+	}
+	if _, err := w.ensureAteletRestored(ctx, actorRef, actor, tmpl, nil, src); apierror.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("ensureAteletRestored error = %v, want FailedPrecondition for the actor it crashed", err)
+	}
+	if restore, run := atelet.requests(); restore != nil || run != nil {
+		t.Errorf("atelet requests = (restore=%v, run=%v), want none", restore, run)
+	}
+	stored, err := persistence.GetActor(ctx, actorRef)
+	if err != nil {
+		t.Fatalf("GetActor: %v", err)
+	}
+	if got := stored.GetStatus().GetState(); got != ateapipb.ActorState_ACTOR_STATE_CRASHED {
+		t.Errorf("state = %v, want CRASHED", got)
+	}
+	if msg, want := stored.GetStatus().GetCrash().GetMessage(), "resume failed: "+crashMessageSnapshotURIMissing; msg != want {
+		t.Errorf("crash message = %q, want %q", msg, want)
 	}
 }
 

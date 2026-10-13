@@ -44,7 +44,9 @@ type resumeSnapshotSource struct {
 	// Zero means cold boot from the spec (unless the actor holds a local
 	// snapshot, which takes precedence at restore).
 	SnapshotURI resources.SnapshotURI
-	Fidelity    ateapipb.SnapshotFidelity
+	// Generation is the durable snapshot's generation on the actor.
+	Generation int32
+	Fidelity   ateapipb.SnapshotFidelity
 	// TemplateReplaced is true when the external snapshot's recorded template
 	// UID differs from the actor's current template.
 	TemplateReplaced bool
@@ -179,6 +181,7 @@ func (w *ActorWorkflow) loadActorForResume(ctx context.Context, actorRef resourc
 			return nil, nil, src, apierror.DataLoss("Actor %s external snapshot: %v", actorRef, err)
 		}
 		src.SnapshotUUID = snap.GetUuid()
+		src.Generation = snap.GetGeneration()
 		src.Fidelity = snap.GetFidelity()
 		capturedUnder := snap.GetActorTemplateUid()
 		src.TemplateReplaced = capturedUnder != "" && capturedUnder != actorTemplate.GetMetadata().GetUid()
@@ -661,11 +664,13 @@ func (w *ActorWorkflow) ensureVolumesAttached(ctx context.Context, actor *ateapi
 
 // ensureAteletRestored brings the workload up on the assigned worker:
 // restoring the actor's local snapshot when one exists, else its external
-// snapshot, else cold-booting from the template spec. This is the
-// atelet reentrancy seam (#372): the request is keyed by the actor UID and
-// the worker pod UID, so a re-entered workflow re-sends the same semantic
-// request; once atelet's Restore/Run are idempotent on those keys this step
-// becomes fully reentrant with no changes here.
+// snapshot, else cold-booting from the template spec. A local snapshot's
+// request also names its durable copy, which atelet reads instead if the node
+// no longer holds the snapshot. This is the atelet reentrancy seam (#372):
+// the request is keyed by the actor UID and the worker pod UID, so a
+// re-entered workflow re-sends the same semantic request; once atelet's
+// Restore/Run are idempotent on those keys this step becomes fully reentrant
+// with no changes here.
 func (w *ActorWorkflow) ensureAteletRestored(ctx context.Context, actorRef resources.ActorRef, actor *ateapipb.Actor, actorTemplate *ateapipb.ActorTemplate, volumePublishContexts map[string]map[string]string, src resumeSnapshotSource) (tele restoreTelemetry, err error) {
 	ctx, done := stepSpan(ctx, "CallAteletRestore")
 	defer func() { err = done(err) }()
@@ -701,6 +706,12 @@ func (w *ActorWorkflow) ensureAteletRestored(ctx context.Context, actorRef resou
 		slog.InfoContext(ctx, "Actor has snapshot; Restoring from snapshot")
 		tele.SnapshotKind = ateattr.SnapshotKindLocal
 
+		snapshotURI := localSnap.GetDurableSnapshot().GetObject().GetSnapshotUri()
+		if snapshotURI == "" {
+			// MarkPausing records the URI with the snapshot, so its absence
+			// indicates corrupted store state.
+			return tele, crashActorAndFail(ctx, w.store, actorRef, ateattr.OperationResume, crashMessageSnapshotURIMissing)
+		}
 		localName := localSnap.GetUuid()
 		fidelity := fidelityToAtelet(localSnap.GetFidelity())
 		req := &ateletpb.RestoreRequest{
@@ -713,6 +724,10 @@ func (w *ActorWorkflow) ensureAteletRestored(ctx context.Context, actorRef resou
 			Snapshot: &ateletpb.Snapshot{
 				SnapshotUuid: localName,
 				Fidelity:     fidelity,
+				Object: &ateletpb.ObjectStorage{
+					SnapshotUri: snapshotURI,
+				},
+				Generation: localSnap.GetGeneration(),
 			},
 			SandboxAssets: sandboxAssets,
 			ActorUid:      actor.GetMetadata().Uid,
@@ -747,6 +762,7 @@ func (w *ActorWorkflow) ensureAteletRestored(ctx context.Context, actorRef resou
 				Object: &ateletpb.ObjectStorage{
 					SnapshotUri: src.SnapshotURI.String(),
 				},
+				Generation: src.Generation,
 			},
 			SandboxAssets: sandboxAssets,
 			ActorUid:      actor.GetMetadata().Uid,

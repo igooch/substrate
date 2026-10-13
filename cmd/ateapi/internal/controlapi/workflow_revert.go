@@ -194,7 +194,8 @@ func (w *ActorWorkflow) ensureWorkerDiscarded(ctx context.Context, actorRef reso
 }
 
 // ensureInProgressSnapshotDiscarded deletes the objects a suspend was partway
-// through writing when the actor was reverted.
+// through writing, or atelet uploaded for a pause, when the actor was
+// reverted.
 func (w *ActorWorkflow) ensureInProgressSnapshotDiscarded(ctx context.Context, actor *ateapipb.Actor) (err error) {
 	ctx, done := stepSpan(ctx, "DiscardInProgressSnapshot")
 	defer func() { err = done(err) }()
@@ -214,9 +215,9 @@ func (w *ActorWorkflow) ensureInProgressSnapshotDiscarded(ctx context.Context, a
 	if err != nil {
 		return fmt.Errorf("while parsing the in-progress snapshot %q: %w", inProgress, err)
 	}
-	// A suspend records the in-progress URI under the actor's own prefix
-	// before atelet writes the first object, so a URI owned by anything else
-	// is a corrupted record.
+	// A pause or suspend records the in-progress URI under the actor's own
+	// prefix before atelet writes the first object, so a URI owned by anything
+	// else is a corrupted record.
 	owner := actorSnapshotOwner(actor)
 	if !uri.OwnedBy(owner) {
 		return fmt.Errorf("the in-progress snapshot %q is not owned by actor %s", inProgress, owner)

@@ -39,6 +39,7 @@ const (
 	crashMessageLocalSnapshotNodeUnknown = "node holding the actor's local snapshot is unknown"
 	crashMessageLocalSnapshotMissing     = "actor has no local snapshot"
 	crashMessageDurableSnapshotMissing   = "actor has no durable snapshot"
+	crashMessageSnapshotURIMissing       = "actor's snapshot has no object storage URI"
 	crashMessageWorkerGone               = "assigned worker no longer exists"
 	crashMessageWorkerDraining           = "assigned worker is draining"
 	crashMessageWorkerReassigned         = "assigned worker no longer hosts the actor"

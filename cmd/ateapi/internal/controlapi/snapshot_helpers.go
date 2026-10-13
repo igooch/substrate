@@ -88,11 +88,16 @@ func clearLocalSnapshots(status *ateapipb.ActorStatus) {
 // Dropping PENDING durable snapshots is safe because:
 //   - On pause finalization, pause is only reachable from RUNNING (a failed
 //     suspend cannot resume without reverting first, which discards any
-//     in-flight upload), so no uncleaned PENDING durable snapshot exists.
+//     in-flight upload), so the only PENDING entries it drops are earlier
+//     pauses', whose local copies atelet deletes once the new checkpoint
+//     commits.
 //   - On revert finalization, ensureInProgressSnapshotDiscarded has already
 //     deleted any in-flight durable snapshot objects.
 //   - On suspend finalization, the latest snapshot has already been marked
 //     COMPLETED.
+//
+// TODO: atelet may upload a pause's snapshot without telling the control
+// plane, and dropping its entry leaves that upload under the actor's prefix.
 //
 // status.LastAssignedGeneration is not decreased so that we can keep track of
 // stale snapshots that need to be cleaned up and discarded generation numbers

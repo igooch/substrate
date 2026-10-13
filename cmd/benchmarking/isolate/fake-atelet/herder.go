@@ -24,6 +24,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/agent-substrate/substrate/internal/objectstore"
@@ -50,7 +51,7 @@ type actorCertMinter interface {
 // delays is how long each AteomHerder call takes before it succeeds: the
 // data plane's share of it, not counting an actor certificate mint.
 type delays struct {
-	run, restore, checkpoint, promoteSnapshot, terminate time.Duration
+	run, restore, checkpoint, detachActor, terminate time.Duration
 }
 
 // herder answers every AteomHerder call with success after its delay, without
@@ -74,6 +75,30 @@ type herder struct {
 	// leaves the mint out. csr is sent with every mint.
 	minter actorCertMinter
 	csr    []byte
+
+	mu       sync.Mutex
+	deferred map[string]string
+}
+
+func (h *herder) setDeferred(actorUID, uri string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if uri == "" {
+		delete(h.deferred, actorUID)
+		return
+	}
+	if h.deferred == nil {
+		h.deferred = make(map[string]string)
+	}
+	h.deferred[actorUID] = uri
+}
+
+func (h *herder) takeDeferred(actorUID string) string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	uri := h.deferred[actorUID]
+	delete(h.deferred, actorUID)
+	return uri
 }
 
 // newActorCSR returns a CSR for a fresh key. ate-api-server takes only the
@@ -173,11 +198,14 @@ func (h *herder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRequest
 	start := time.Now()
 	// An immediate upload puts the snapshot in object storage before
 	// Checkpoint returns. The fake does not run deferred uploads: the
-	// actor's PromoteSnapshot writes it instead.
+	// actor's DetachActor or PromoteSnapshot writes it instead.
 	if req.GetUploadConfig().GetMode() == ateletpb.UploadMode_UPLOAD_MODE_IMMEDIATE {
 		if err := h.writePlaceholder(ctx, start, h.delays.checkpoint, req.GetSnapshot().GetObject().GetSnapshotUri()); err != nil {
 			return nil, err
 		}
+		h.setDeferred(req.GetActorUid(), "")
+	} else {
+		h.setDeferred(req.GetActorUid(), req.GetSnapshot().GetObject().GetSnapshotUri())
 	}
 	if err := wait(ctx, start, h.delays.checkpoint); err != nil {
 		return nil, err
@@ -187,13 +215,26 @@ func (h *herder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRequest
 
 func (h *herder) PromoteSnapshot(ctx context.Context, req *ateletpb.PromoteSnapshotRequest) (*ateletpb.PromoteSnapshotResponse, error) {
 	start := time.Now()
-	if err := h.writePlaceholder(ctx, start, h.delays.promoteSnapshot, req.GetSnapshot().GetObject().GetSnapshotUri()); err != nil {
+	if err := h.writePlaceholder(ctx, start, h.delays.detachActor, req.GetSnapshot().GetObject().GetSnapshotUri()); err != nil {
 		return nil, err
 	}
-	if err := wait(ctx, start, h.delays.promoteSnapshot); err != nil {
+	if err := wait(ctx, start, h.delays.detachActor); err != nil {
 		return nil, err
 	}
 	return &ateletpb.PromoteSnapshotResponse{}, nil
+}
+
+func (h *herder) DetachActor(ctx context.Context, req *ateletpb.DetachActorRequest) (*ateletpb.DetachActorResponse, error) {
+	start := time.Now()
+	if uri := h.takeDeferred(req.GetActorUid()); uri != "" {
+		if err := h.writePlaceholder(ctx, start, h.delays.detachActor, uri); err != nil {
+			return nil, err
+		}
+	}
+	if err := wait(ctx, start, h.delays.detachActor); err != nil {
+		return nil, err
+	}
+	return &ateletpb.DetachActorResponse{}, nil
 }
 
 func (h *herder) Terminate(ctx context.Context, _ *ateletpb.TerminateRequest) (*ateletpb.TerminateResponse, error) {
