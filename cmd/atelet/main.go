@@ -114,7 +114,7 @@ var (
 
 	drainDelay              = pflag.Duration("drain-delay", 0, "How long to keep accepting new RPCs after SIGTERM before starting the gRPC drain.")
 	snapshotUploadDelayFlag = pflag.Duration("snapshot-upload-delay", snapshotUploadDelay, "Longest a deferred local snapshot waits for its background upload, counted from the oldest snapshot of the actor not yet durable.")
-	actorDetachDelayFlag    = pflag.Duration("actor-detach-delay", actorDetachDelay, "How long an actor stays suspended on this node before atelet detaches it: makes its latest snapshot durable, reports it, and deletes its local snapshots.")
+	actorDetachDelayFlag    = pflag.Duration("actor-detach-delay", actorDetachDelay, "How long an actor stays suspended on this node before atelet detaches it: makes its latest snapshot durable, deletes its local snapshots, and reports it.")
 	drainTimeout            = pflag.Duration("drain-timeout", 5*time.Minute, "Deadline for the graceful gRPC drain on shutdown. In-flight RPCs still running past it are forcefully cancelled.")
 
 	snapshotPluginSocket = pflag.String("snapshot-plugin-socket", "/run/snapshot-plugin/node.sock", "Unix socket of the node object-store plugin that external snapshots are fetched and uploaded through, and every sandbox asset is fetched through. A gs:// asset the plugin cannot serve is then read anonymously.")

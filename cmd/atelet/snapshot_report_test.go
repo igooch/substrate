@@ -17,7 +17,6 @@ package main
 import (
 	"context"
 	"os"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -31,21 +30,27 @@ import (
 )
 
 // fakeReporter records the reports it receives. err, when set, is returned
-// for every call. onReport, when set, runs during each call.
+// for every call.
 type fakeReporter struct {
-	mu       sync.Mutex
-	reqs     []*ateapipb.ReportActorSnapshotStateRequest
-	err      error
-	onReport func(*ateapipb.ReportActorSnapshotStateRequest)
+	// block, when set, holds each call until it is closed.
+	block chan struct{}
+
+	mu   sync.Mutex
+	reqs []*ateapipb.ReportActorSnapshotStateRequest
+	err  error
 }
 
-func (f *fakeReporter) ReportActorSnapshotState(_ context.Context, req *ateapipb.ReportActorSnapshotStateRequest, _ ...grpc.CallOption) (*ateapipb.ReportActorSnapshotStateResponse, error) {
+func (f *fakeReporter) ReportActorSnapshotState(ctx context.Context, req *ateapipb.ReportActorSnapshotStateRequest, _ ...grpc.CallOption) (*ateapipb.ReportActorSnapshotStateResponse, error) {
+	if f.block != nil {
+		select {
+		case <-f.block:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.reqs = append(f.reqs, req)
-	if f.onReport != nil {
-		f.onReport(req)
-	}
 	return &ateapipb.ReportActorSnapshotStateResponse{}, f.err
 }
 
@@ -88,55 +93,44 @@ func TestTrackerReportsBackgroundUpload(t *testing.T) {
 	}
 }
 
-// A background detach reports before it deletes the local snapshots, so the
-// control plane stops sending local restores here first.
-func TestTrackerReportsDetachBeforeDeleting(t *testing.T) {
+// A background detach deletes the local snapshots and reports that atelet no
+// longer holds the actor locally.
+func TestTrackerReportsDetach(t *testing.T) {
 	store := newFakeSnapshotStore()
 	tr, reporter := newReportingTracker(t, store)
 	snapDir := ateletpath.LocalSnapshotDir(trackedActorUID, "s1")
 	if err := os.MkdirAll(snapDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(snapDir, "checkpoint.img"), nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	var filesAtReport bool
-	reporter.onReport = func(req *ateapipb.ReportActorSnapshotStateRequest) {
-		if req.GetState().GetLatestLocal() == nil {
-			_, err := os.Stat(snapDir)
-			filesAtReport = err == nil
-		}
-	}
 	tr.commitLocal(trackedActorUID, testRef("s1", 1, tr.clock.Now()))
 
 	detachNow(t, tr)
-	var detach *ateapipb.ReportActorSnapshotStateRequest
-	for _, r := range reporter.reports() {
-		if r.GetState().GetLatestLocal() == nil {
-			detach = r
-		}
-	}
-	if detach == nil {
-		t.Fatalf("reports = %v, want one for the detach", reporter.reports())
-	}
-	if detach.GetState().GetLatestDurable().GetUuid() != "s1" {
-		t.Errorf("detach report latest_durable = %v, want s1", detach.GetState().GetLatestDurable())
-	}
-	if !filesAtReport {
-		t.Error("the local snapshot was deleted before the detach was reported")
-	}
 	if _, err := os.Stat(snapDir); !os.IsNotExist(err) {
 		t.Errorf("local snapshot still on disk after the detach: %v", err)
 	}
+	var detach *ateapipb.ReportActorSnapshotStateRequest
+	eventually(t, "the detach is reported", func() bool {
+		for _, r := range reporter.reports() {
+			if r.GetState().GetLatestLocal() == nil {
+				detach = r
+			}
+		}
+		return detach != nil
+	})
+	if got := detach.GetState().GetLatestDurable().GetUuid(); got != "s1" {
+		t.Errorf("detach report latest_durable = %q, want s1", got)
+	}
 }
 
-// A detach whose report the control plane does not accept in time still
-// deletes the local snapshots: the snapshot is durable by then.
-func TestTrackerDetachDeletesWhenReportFails(t *testing.T) {
+// A background detach does not wait for its report. A report the control
+// plane holds back, for example behind a resume that holds the actor's lease
+// and waits for this detach, cannot hold the detach up.
+func TestTrackerDetachDoesNotWaitForReport(t *testing.T) {
 	store := newFakeSnapshotStore()
 	tr, reporter := newReportingTracker(t, store)
-	tr.reportTimeout = 50 * time.Millisecond
-	reporter.err = status.Error(codes.Unavailable, "control plane down")
+	unblock := make(chan struct{})
+	defer close(unblock)
+	reporter.block = unblock
 	snapDir := ateletpath.LocalSnapshotDir(trackedActorUID, "s1")
 	if err := os.MkdirAll(snapDir, 0o700); err != nil {
 		t.Fatal(err)
@@ -144,10 +138,15 @@ func TestTrackerDetachDeletesWhenReportFails(t *testing.T) {
 	tr.commitLocal(trackedActorUID, testRef("s1", 1, tr.clock.Now()))
 
 	detachNow(t, tr)
-	eventually(t, "the local snapshot is deleted", func() bool {
-		_, err := os.Stat(snapDir)
-		return os.IsNotExist(err)
-	})
+	if _, err := os.Stat(snapDir); !os.IsNotExist(err) {
+		t.Errorf("local snapshot still on disk while the report is blocked: %v", err)
+	}
+	tr.mu.Lock()
+	_, err := tr.waitForDetachLocked(t.Context(), trackedActorUID)
+	tr.mu.Unlock()
+	if err != nil {
+		t.Errorf("waiting for the detach while its report is blocked: %v", err)
+	}
 }
 
 // A refusal ends the retries: retrying cannot change the control plane's

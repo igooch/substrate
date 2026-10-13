@@ -28,11 +28,6 @@ import (
 )
 
 const (
-	// detachReportTimeout is how long a background detach waits for the
-	// control plane to accept its report before deleting the local files
-	// anyway. The snapshot is durable by then, so a resume can still restore
-	// it from object storage.
-	detachReportTimeout = time.Minute
 	reportRetryDelay    = time.Second
 	maxReportRetryDelay = time.Minute
 )
@@ -100,24 +95,6 @@ func (t *snapshotTracker) reportLoop(ctx context.Context, a *actorSnapshots) {
 		}
 		select {
 		case <-ctx.Done():
-		case <-t.clock.After(delay):
-		}
-		delay = min(2*delay, maxReportRetryDelay)
-	}
-}
-
-// reportBlocking reports the actor's state, retrying until the control plane
-// accepts or refuses it or ctx ends. It reports whether the report was
-// accepted.
-func (t *snapshotTracker) reportBlocking(ctx context.Context, a *actorSnapshots) bool {
-	delay := reportRetryDelay
-	for {
-		if t.reportOnce(ctx, a) {
-			return true
-		}
-		select {
-		case <-ctx.Done():
-			return false
 		case <-t.clock.After(delay):
 		}
 		delay = min(2*delay, maxReportRetryDelay)
