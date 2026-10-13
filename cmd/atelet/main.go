@@ -112,8 +112,10 @@ var (
 
 	actorStatsPollInterval = pflag.Duration("actor-stats-poll-interval", time.Minute, fmt.Sprintf("Actor resource utilization sampling frequency. 0 disables the sampling entirely; minimum accepted value is %v.", minActorStatsPollInterval))
 
-	drainDelay   = pflag.Duration("drain-delay", 0, "How long to keep accepting new RPCs after SIGTERM before starting the gRPC drain.")
-	drainTimeout = pflag.Duration("drain-timeout", 5*time.Minute, "Deadline for the graceful gRPC drain on shutdown. In-flight RPCs still running past it are forcefully cancelled.")
+	drainDelay              = pflag.Duration("drain-delay", 0, "How long to keep accepting new RPCs after SIGTERM before starting the gRPC drain.")
+	snapshotUploadDelayFlag = pflag.Duration("snapshot-upload-delay", snapshotUploadDelay, "Longest a deferred local snapshot waits for its background upload, counted from the oldest snapshot of the actor not yet durable.")
+	actorDetachDelayFlag    = pflag.Duration("actor-detach-delay", actorDetachDelay, "How long an actor stays suspended on this node before atelet detaches it: makes its latest snapshot durable, reports it, and deletes its local snapshots.")
+	drainTimeout            = pflag.Duration("drain-timeout", 5*time.Minute, "Deadline for the graceful gRPC drain on shutdown. In-flight RPCs still running past it are forcefully cancelled.")
 
 	snapshotPluginSocket = pflag.String("snapshot-plugin-socket", "/run/snapshot-plugin/node.sock", "Unix socket of the node object-store plugin that external snapshots are fetched and uploaded through, and every sandbox asset is fetched through. A gs:// asset the plugin cannot serve is then read anonymously.")
 )
@@ -382,9 +384,11 @@ func main() {
 
 	ateomFacingSrv := grpc.NewServer(grpc.Creds(credentials.NewTLS(ateomFacingTLS)))
 
+	workerClient := ateapipb.NewWorkerServiceClient(ateapiConn)
 	ateletpb.RegisterAteomSupportServer(ateomFacingSrv, &ateomSupportServer{
-		workers: ateapipb.NewWorkerServiceClient(ateapiConn),
+		workers: workerClient,
 	})
+	wmService.snapshotTracker().setReporter(workerClient)
 	go func() {
 		if err := ateomFacingSrv.Serve(ateomFacingLis); err != nil {
 			serverboot.Fatal(ctx, "Failed to serve credential broker", err)
@@ -528,6 +532,7 @@ func NewService(
 		systemInfoVolumes:     systemInfoVolumes,
 	}
 	wms.snapshots = newSnapshotTracker(ctx, wms, clock.RealClock{})
+	wms.snapshots.uploadDelay, wms.snapshots.detachDelay = *snapshotUploadDelayFlag, *actorDetachDelayFlag
 	if err := wms.snapshots.load(); err != nil {
 		slog.WarnContext(ctx, "Failed to load actors' snapshot state; pending uploads and detaches are lost", slog.Any("err", err))
 	}
@@ -690,6 +695,7 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 	if err != nil {
 		return nil, err
 	}
+	tracker.identify(actorUID, req.GetAtespace(), req.GetActorName())
 	if retry {
 		slog.InfoContext(ctx, "Checkpoint already taken; returning the actor's state",
 			slog.Any("actor", actorRef), slog.String("snapshot", snap.uuid), slog.Int("generation", int(snap.generation)))
@@ -1359,6 +1365,7 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 		return nil, err
 	}
 
+	s.snapshotTracker().identify(actorUID, req.GetAtespace(), req.GetActorName())
 	s.snapshotTracker().restored(actorUID, snapshotRefFrom(req.GetSnapshot()))
 	return &ateletpb.RestoreResponse{}, nil
 }

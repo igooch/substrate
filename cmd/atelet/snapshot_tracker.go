@@ -135,6 +135,15 @@ type actorOp struct {
 // Its fields are guarded by snapshotTracker.mu.
 type actorSnapshots struct {
 	actorUID string
+	// atespace and actorName name the actor in reports to the control plane.
+	// Empty until a Checkpoint or Restore names it.
+	atespace, actorName string
+
+	// reportWanted counts changes that call for a report, and reportSent the
+	// ones the control plane has taken. reporting is set while a goroutine
+	// reports the actor's state.
+	reportWanted, reportSent uint64
+	reporting                bool
 
 	// newest is the highest-generation snapshot this node has seen for the
 	// actor, either committed by Checkpoint or read by Restore. It differs
@@ -330,7 +339,13 @@ type snapshotTracker struct {
 	// workersDone counts the workers still running.
 	workersDone sync.WaitGroup
 
+	// reportTimeout bounds how long a background detach waits for its report
+	// before deleting the local files.
+	reportTimeout time.Duration
+
 	mu sync.Mutex
+	// reporter is where actors' snapshot state is reported. Nil until set.
+	reporter snapshotReporter
 	// actors maps actorUID to the snapshot tracking state for that actor.
 	actors map[string]*actorSnapshots
 }
@@ -339,15 +354,16 @@ type snapshotTracker struct {
 // Its workers run once start is called, until ctx ends.
 func newSnapshotTracker(ctx context.Context, store snapshotStore, clk clock.WithTicker) *snapshotTracker {
 	t := &snapshotTracker{
-		ctx:         ctx,
-		store:       store,
-		clock:       clk,
-		uploadDelay: snapshotUploadDelay,
-		detachDelay: actorDetachDelay,
-		retries:     workqueue.NewTypedItemExponentialFailureRateLimiter[string](snapshotRetryDelay, maxSnapshotRetryDelay),
-		workers:     snapshotWorkers,
-		queue:       workqueue.NewTypedDelayingQueueWithConfig(workqueue.TypedDelayingQueueConfig[string]{Clock: clk}),
-		actors:      map[string]*actorSnapshots{},
+		ctx:           ctx,
+		store:         store,
+		clock:         clk,
+		uploadDelay:   snapshotUploadDelay,
+		detachDelay:   actorDetachDelay,
+		retries:       workqueue.NewTypedItemExponentialFailureRateLimiter[string](snapshotRetryDelay, maxSnapshotRetryDelay),
+		workers:       snapshotWorkers,
+		reportTimeout: detachReportTimeout,
+		queue:         workqueue.NewTypedDelayingQueueWithConfig(workqueue.TypedDelayingQueueConfig[string]{Clock: clk}),
+		actors:        map[string]*actorSnapshots{},
 	}
 	context.AfterFunc(ctx, t.queue.ShutDown)
 	return t
@@ -720,6 +736,9 @@ func (t *snapshotTracker) backgroundUpload(ctx context.Context, a *actorSnapshot
 	}
 	t.endOpLocked(a, op)
 	t.mu.Unlock()
+	if err == nil {
+		t.reportAsync(a)
+	}
 
 	if superseded {
 		if err := removeLocalCheckpoint(t.ctx, a.actorUID, target.uuid); err != nil {
@@ -942,6 +961,17 @@ func (t *snapshotTracker) finishDetach(ctx context.Context, a *actorSnapshots, o
 	}
 	t.mu.Unlock()
 
+	if err == nil && tracked && background {
+		// Report before deleting, so the control plane stops sending local
+		// restores here before the files are gone. The snapshot is durable, so
+		// deleting without an accepted report is still safe.
+		rctx, cancel := context.WithTimeout(t.ctx, t.reportTimeout)
+		if !t.reportBlocking(rctx, a) {
+			slog.WarnContext(t.ctx, "Detach report not accepted in time; deleting local snapshots anyway", slog.String("actorUID", a.actorUID))
+			t.reportAsync(a)
+		}
+		cancel()
+	}
 	if err == nil && tracked {
 		if perr := pruneLocalCheckpoints(t.ctx, a.actorUID); perr != nil {
 			slog.WarnContext(t.ctx, "failed to delete local checkpoints after detach", slog.String("actorUID", a.actorUID), slog.Any("err", perr))

@@ -73,6 +73,9 @@ func (rec *snapshotRecord) ref() *snapshotRef {
 // actorSnapshotsRecord is the content of an actor's snapshot state file: the
 // part of actorSnapshots that outlives an atelet restart.
 type actorSnapshotsRecord struct {
+	// Atespace and ActorName name the actor in reports to the control plane.
+	Atespace           string          `json:"atespace,omitempty"`
+	ActorName          string          `json:"actorName,omitempty"`
 	Newest             *snapshotRecord `json:"newest,omitempty"`
 	NewestByCheckpoint bool            `json:"newestByCheckpoint,omitempty"`
 	LatestLocal        *snapshotRecord `json:"latestLocal,omitempty"`
@@ -88,6 +91,8 @@ type actorSnapshotsRecord struct {
 
 func (a *actorSnapshots) record() *actorSnapshotsRecord {
 	return &actorSnapshotsRecord{
+		Atespace:           a.atespace,
+		ActorName:          a.actorName,
 		Newest:             recordOf(a.newest),
 		NewestByCheckpoint: a.newestByCheckpoint,
 		LatestLocal:        recordOf(a.latestLocal),
@@ -105,6 +110,8 @@ func (a *actorSnapshots) record() *actorSnapshotsRecord {
 func (rec *actorSnapshotsRecord) actorSnapshots(actorUID string) *actorSnapshots {
 	a := &actorSnapshots{
 		actorUID:           actorUID,
+		atespace:           rec.Atespace,
+		actorName:          rec.ActorName,
 		newest:             rec.Newest.ref(),
 		newestByCheckpoint: rec.NewestByCheckpoint,
 		latestLocal:        rec.LatestLocal.ref(),
