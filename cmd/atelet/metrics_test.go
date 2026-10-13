@@ -329,31 +329,29 @@ func TestRestoreSnapshotKind(t *testing.T) {
 }
 
 func TestCheckpointSnapshotKind(t *testing.T) {
-	deferred := &ateletpb.UploadConfig{Mode: ateletpb.UploadMode_UPLOAD_MODE_DEFERRED}
-	immediate := &ateletpb.UploadConfig{Mode: ateletpb.UploadMode_UPLOAD_MODE_IMMEDIATE}
 	tests := []struct {
 		name string
 		req  *ateletpb.CheckpointRequest
 		want string
 	}{
 		{
-			name: "pause writes the node-local snapshot",
-			req:  &ateletpb.CheckpointRequest{UploadConfig: deferred, Atespace: "team-a"},
+			name: "a deferred upload keeps the node-local snapshot",
+			req:  &ateletpb.CheckpointRequest{UploadConfig: deferredUpload(), Atespace: "team-a"},
 			want: ateattr.SnapshotKindLocal,
 		},
 		{
-			name: "suspend writes the actor's durable snapshot",
-			req:  &ateletpb.CheckpointRequest{UploadConfig: immediate, Atespace: "team-a"},
+			name: "an immediate upload writes the actor's durable snapshot",
+			req:  &ateletpb.CheckpointRequest{UploadConfig: immediateUpload(), Atespace: "team-a"},
 			want: ateattr.SnapshotKindLatest,
 		},
 		{
 			name: "a golden actor's commit writes the template's golden",
-			req:  &ateletpb.CheckpointRequest{UploadConfig: immediate, Atespace: resources.GoldenActorAtespace},
+			req:  &ateletpb.CheckpointRequest{UploadConfig: immediateUpload(), Atespace: resources.GoldenActorAtespace},
 			want: ateattr.SnapshotKindGolden,
 		},
 		{
-			name: "a local checkpoint in the golden atespace is still local",
-			req:  &ateletpb.CheckpointRequest{UploadConfig: deferred, Atespace: resources.GoldenActorAtespace},
+			name: "a deferred upload in the golden atespace is still local",
+			req:  &ateletpb.CheckpointRequest{UploadConfig: deferredUpload(), Atespace: resources.GoldenActorAtespace},
 			want: ateattr.SnapshotKindLocal,
 		},
 	}
