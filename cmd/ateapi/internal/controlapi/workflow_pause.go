@@ -72,7 +72,8 @@ func (w *ActorWorkflow) PauseActor(ctx context.Context, actorRef resources.Actor
 		return nil, err
 	}
 	actor = marked
-	if wireFidelity, err = w.ensureAteletPaused(leaseCtx, actorRef, actor, actorTemplate); err != nil {
+	var snapshotState *ateletpb.ActorSnapshotState
+	if wireFidelity, snapshotState, err = w.ensureAteletPaused(leaseCtx, actorRef, actor, actorTemplate); err != nil {
 		return nil, err
 	}
 	// TODO: There is no difference between suspend and pause for now, but we
@@ -85,7 +86,7 @@ func (w *ActorWorkflow) PauseActor(ctx context.Context, actorRef resources.Actor
 	// them here, as crash.go does for the crash counter.
 	finalAttrs = lifecycleOpAttrs(actor, actorTemplate, "", wireFidelity)
 	var finalized *ateapipb.Actor
-	if finalized, err = w.ensurePausedFinalized(leaseCtx, actorRef); err != nil {
+	if finalized, err = w.ensurePausedFinalized(leaseCtx, actorRef, snapshotState); err != nil {
 		return nil, err
 	}
 	actor = finalized
@@ -176,32 +177,32 @@ func (w *ActorWorkflow) ensureMarkedPausing(ctx context.Context, actorRef resour
 // the once-minted name, URI and generation, so a re-entered workflow re-sends
 // the same request, which atelet answers as a retry of the checkpoint it
 // already took.
-func (w *ActorWorkflow) ensureAteletPaused(ctx context.Context, actorRef resources.ActorRef, actor *ateapipb.Actor, actorTemplate *ateapipb.ActorTemplate) (wireFidelity string, err error) {
+func (w *ActorWorkflow) ensureAteletPaused(ctx context.Context, actorRef resources.ActorRef, actor *ateapipb.Actor, actorTemplate *ateapipb.ActorTemplate) (wireFidelity string, _ *ateletpb.ActorSnapshotState, err error) {
 	ctx, done := stepSpan(ctx, "CallAteletPause")
 	defer func() { err = done(err) }()
 
 	assignment := actor.GetStatus().GetWorkerAssignment()
 	if assignment == nil {
 		// Missing active worker pod reference in PAUSING state indicates corrupted store state.
-		return "", crashActorAndFail(ctx, w.store, actorRef, ateattr.OperationPause, crashMessageWorkerAssignmentMissing)
+		return "", nil, crashActorAndFail(ctx, w.store, actorRef, ateattr.OperationPause, crashMessageWorkerAssignmentMissing)
 	}
 	inProgressSnap := snapshotAtLatestGeneration(actor.GetStatus())
 	uploadURI := inProgressSnap.GetDurableSnapshot().GetObject().GetSnapshotUri()
 	if uploadURI == "" {
 		// MarkPausing records the URI with the snapshot, so its absence in
 		// PAUSING state indicates corrupted store state.
-		return "", crashActorAndFail(ctx, w.store, actorRef, ateattr.OperationPause, crashMessageSnapshotURIMissing)
+		return "", nil, crashActorAndFail(ctx, w.store, actorRef, ateattr.OperationPause, crashMessageSnapshotURIMissing)
 	}
 
 	ateletConn, err := w.dialer.DialForAteletOnNode(assignment.GetNodeName())
 	if err != nil {
-		return "", fmt.Errorf("while getting atelet conn for node %q: %w", assignment.GetNodeName(), err)
+		return "", nil, fmt.Errorf("while getting atelet conn for node %q: %w", assignment.GetNodeName(), err)
 	}
 	client := ateletpb.NewAteomHerderClient(ateletConn)
 
 	workloadSpec, err := workloadSpecFromActorTemplate(actorTemplate, actor, nil)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	// Checkpoint does not carry the sandbox config: atelet uses the version the
@@ -228,23 +229,23 @@ func (w *ActorWorkflow) ensureAteletPaused(ctx context.Context, actorRef resourc
 	}
 	wireFidelity = ateattr.SnapshotFidelityValue(req.GetSnapshot().GetFidelity())
 
-	// TODO: record the snapshot state atelet returns.
-	if _, err = client.Checkpoint(ctx, req); err != nil {
-		return wireFidelity, handleAteletError(ctx, w.store, actorRef, ateattr.OperationPause, "Checkpoint", false, err)
+	resp, err := client.Checkpoint(ctx, req)
+	if err != nil {
+		return wireFidelity, nil, handleAteletError(ctx, w.store, actorRef, ateattr.OperationPause, "Checkpoint", false, err)
 	}
-	return wireFidelity, nil
+	return wireFidelity, resp.GetState(), nil
 }
 
 // ensurePausedFinalized releases the actor's worker (only when it is still
 // owned by this actor), records where the local snapshot lives, and commits
-// PAUSED with the assignment cleared in a single update. When the worker's
-// node name was lost or the latest local snapshot entry is missing, the actor
-// can never be resumed from local state, so it commits CRASHED instead and
-// fails the step with FailedPrecondition. It re-reads the actor first so an
-// out-of-band transition (e.g. the syncer crashing the actor after its worker
-// died) is not overwritten: with no assignment left there is nothing to
-// finalize.
-func (w *ActorWorkflow) ensurePausedFinalized(ctx context.Context, actorRef resources.ActorRef) (_ *ateapipb.Actor, err error) {
+// PAUSED with the assignment cleared in a single update, then releases any
+// durable snapshot this pause superseded. When the worker's node name was lost
+// or the latest local snapshot entry is missing, the actor can never be
+// resumed from local state, so it commits CRASHED instead and fails the step
+// with FailedPrecondition. It re-reads the actor first so an out-of-band
+// transition (e.g. the syncer crashing the actor after its worker died) is not
+// overwritten: with no assignment left there is nothing to finalize.
+func (w *ActorWorkflow) ensurePausedFinalized(ctx context.Context, actorRef resources.ActorRef, snapshotState *ateletpb.ActorSnapshotState) (_ *ateapipb.Actor, err error) {
 	ctx, done := stepSpan(ctx, "FinalizePaused")
 	defer func() { err = done(err) }()
 
@@ -303,6 +304,15 @@ func (w *ActorWorkflow) ensurePausedFinalized(ctx context.Context, actorRef reso
 			return nil, err
 		}
 		logActorStateChanged(ctx, storedActor, ateattr.OperationPause)
+
+		// 3. Release any external snapshot atelet uploaded for an earlier pause
+		// that this pause superseded. Best-effort: the pause is already
+		// committed and the worker is released.
+		if releaseErr := w.releaseStaleSnapshots(ctx, latestActor, storedActor, snapshotState); releaseErr != nil {
+			slog.WarnContext(ctx, "Failed to release stale external snapshots after pause; their objects are left in storage until the actor is deleted",
+				slog.Any("actor", actorRef),
+				slog.String("err", releaseErr.Error()))
+		}
 		latestActor = storedActor
 	}
 

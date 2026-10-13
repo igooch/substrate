@@ -405,6 +405,7 @@ func (t *snapshotTracker) syncActor(actorUID string) {
 		ctx, op := t.beginOpLocked(t.ctx, a, opUpload, *a.latestLocal)
 		// The upload covers every snapshot taken so far.
 		a.undurableSince = time.Time{}
+		t.saveLocked(a)
 		t.mu.Unlock()
 		t.backgroundUpload(ctx, a, op)
 		return
@@ -451,6 +452,7 @@ func (t *snapshotTracker) endOpLocked(a *actorSnapshots, op *actorOp) {
 	a.op = nil
 	if t.actors[a.actorUID] == a {
 		t.requeueLocked(a)
+		t.saveLocked(a)
 	}
 }
 
@@ -570,6 +572,7 @@ func (t *snapshotTracker) commitLocal(actorUID string, snap snapshotRef) ([]stri
 		keep = append(keep, up.uuid)
 	}
 	t.requeueLocked(a)
+	t.saveLocked(a)
 	return keep, t.stateLocked(a)
 }
 
@@ -592,6 +595,7 @@ func (t *snapshotTracker) commitDurable(ctx context.Context, actorUID string, sn
 	if op != nil {
 		op.cancel()
 	}
+	t.saveLocked(a)
 	t.mu.Unlock()
 
 	if op != nil {
@@ -615,6 +619,7 @@ func (t *snapshotTracker) claimRunning(ctx context.Context, actorUID string) (fu
 	a := t.actorLocked(actorUID)
 	a.running = true
 	a.detachAt = time.Time{}
+	t.saveLocked(a)
 	return func(started bool) {
 		t.mu.Lock()
 		defer t.mu.Unlock()
@@ -626,6 +631,7 @@ func (t *snapshotTracker) claimRunning(ctx context.Context, actorUID string) (fu
 			a.detachAt = t.clock.Now().Add(t.detachDelay)
 			t.requeueLocked(a)
 		}
+		t.saveLocked(a)
 	}, nil
 }
 
@@ -637,6 +643,7 @@ func (t *snapshotTracker) restored(actorUID string, snap snapshotRef) {
 	if a.newest == nil || snap.generation > a.newest.generation {
 		newest := snap
 		a.newest, a.newestByCheckpoint = &newest, false
+		t.saveLocked(a)
 	}
 }
 
@@ -662,7 +669,7 @@ func (t *snapshotTracker) forget(ctx context.Context, actorUID string) error {
 			return ctx.Err()
 		}
 	}
-	return nil
+	return removeSnapshotState(actorUID)
 }
 
 // backgroundUpload runs op, a background upload of the actor's latest local
@@ -931,6 +938,7 @@ func (t *snapshotTracker) finishDetach(ctx context.Context, a *actorSnapshots, o
 			// passed.
 			a.detachAt = t.backOffLocked(a)
 		}
+		t.saveLocked(a)
 	}
 	t.mu.Unlock()
 

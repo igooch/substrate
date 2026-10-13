@@ -745,4 +745,7 @@ func TestTagActorSnapshot_PromotesPendingSnapshot(t *testing.T) {
 	if got := promoted.GetLocality(); got != "node-1" {
 		t.Errorf("promoted snapshot Locality = %q, want %q preserved", got, "node-1")
 	}
+	if len(objects.Snapshot(t, oldURI)) != 0 {
+		t.Error("superseded generation 1 durable snapshot was not collected after promotion")
+	}
 }

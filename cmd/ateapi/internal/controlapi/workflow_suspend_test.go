@@ -298,7 +298,7 @@ func TestEnsureAteletSuspended_DialFailureLeavesActorRetryable(t *testing.T) {
 			created := storetest.MustCreateActor(t, ctx, persistence, actor)
 
 			w := &ActorWorkflow{store: persistence, dialer: newDanglingDialer()}
-			if _, err := w.ensureAteletSuspended(ctx, resources.ActorRef{Atespace: "team-a", Name: "actor-1"}, created, &ateapipb.ActorTemplate{}); err == nil {
+			if _, _, err := w.ensureAteletSuspended(ctx, resources.ActorRef{Atespace: "team-a", Name: "actor-1"}, created, &ateapipb.ActorTemplate{}); err == nil {
 				t.Fatal("ensureAteletSuspended: want error when atelet is unreachable, got nil")
 			}
 
@@ -353,7 +353,7 @@ func TestEnsureAteletSuspended_WireRequest(t *testing.T) {
 		SnapshotConfig: &ateapipb.SnapshotConfig{PreferredFidelity: ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY},
 	}
 
-	if _, err := w.ensureAteletSuspended(ctx, actorRef, created, tmpl); err != nil {
+	if _, _, err := w.ensureAteletSuspended(ctx, actorRef, created, tmpl); err != nil {
 		t.Fatalf("ensureAteletSuspended: %v", err)
 	}
 	req := atelet.checkpointRequest()
@@ -399,7 +399,7 @@ func TestEnsureSuspendedFinalized_NoAssignment(t *testing.T) {
 	storetest.MustCreateActor(t, ctx, persistence, actor)
 
 	w := &ActorWorkflow{store: persistence}
-	stored, err := w.ensureSuspendedFinalized(ctx, resources.ActorRef{Atespace: "team-a", Name: "actor-1"})
+	stored, err := w.ensureSuspendedFinalized(ctx, resources.ActorRef{Atespace: "team-a", Name: "actor-1"}, nil)
 	if err != nil {
 		t.Fatalf("ensureSuspendedFinalized: %v", err)
 	}
@@ -487,7 +487,7 @@ func TestEnsureSuspendedFinalized_ReleasesReplacedSnapshot(t *testing.T) {
 				}
 			})
 
-			stored, err := w.ensureSuspendedFinalized(ctx, actorRef)
+			stored, err := w.ensureSuspendedFinalized(ctx, actorRef, nil)
 			if err != nil {
 				t.Fatalf("ensureSuspendedFinalized: %v", err)
 			}
@@ -504,6 +504,65 @@ func TestEnsureSuspendedFinalized_ReleasesReplacedSnapshot(t *testing.T) {
 				t.Error("the external snapshot this suspend wrote was collected")
 			}
 		})
+	}
+}
+
+// TestEnsureSuspendedFinalized_ReleasesStalePauseSnapshots verifies that when a
+// running-origin suspend follows a pause whose snapshot atelet uploaded in the
+// background, FinalizeSuspended deletes both the actor's previous COMPLETED
+// suspend snapshot and the superseded pause snapshot (whether recorded as
+// PENDING on the actor or reported in ActorSnapshotState.latest_durable), while
+// keeping the newly committed suspend snapshot.
+func TestEnsureSuspendedFinalized_ReleasesStalePauseSnapshots(t *testing.T) {
+	ctx := context.Background()
+	persistence := newTestPersistence(t)
+	template := seedSubstrateTemplate(t, ctx, persistence, "sub-tmpl")
+	w, objects := newFinalizeWorkflow(persistence)
+
+	actorRef := resources.ActorRef{Atespace: "team-a", Name: "actor-1"}
+	actor := storetest.MustCreateActor(t, ctx, persistence, &ateapipb.Actor{
+		Metadata:      &ateapipb.ResourceMetadata{Atespace: actorRef.Atespace, Name: actorRef.Name},
+		ActorTemplate: &ateapipb.ObjectRef{Atespace: "team-a", Name: "sub-tmpl"},
+		Status:        &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDING},
+	})
+
+	oldSuspend := mustActorSnapshotURI(t, template, actor, "suspend-1")
+	stalePause := mustActorSnapshotURI(t, template, actor, "pause-2")
+	freshSuspend := mustActorSnapshotURI(t, template, actor, "suspend-3")
+	objects.PutSnapshot(t, oldSuspend, "manifest.json")
+	objects.PutSnapshot(t, stalePause, "manifest.json")
+	objects.PutSnapshot(t, freshSuspend, "manifest.json")
+
+	mustUpdateActorStatus(t, ctx, persistence, actor, func(s *ateapipb.ActorStatus) {
+		s.LastAssignedGeneration = 3
+		s.Snapshots = []*ateapipb.Snapshot{
+			newDurableSnapshot(1, ateapipb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR, ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, "", oldSuspend.Name(), oldSuspend.String(), ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED),
+			newPauseSnapshot(2, ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, "", stalePause.Name(), "node-1", stalePause.String()),
+			newDurableSnapshot(3, ateapipb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR, ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, "", freshSuspend.Name(), freshSuspend.String(), ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_PENDING),
+		}
+	})
+
+	state := &ateletpb.ActorSnapshotState{
+		LatestDurable: &ateletpb.SnapshotReport{
+			Snapshot: &ateletpb.Snapshot{
+				SnapshotUuid: freshSuspend.Name(),
+				Generation:   3,
+				Object:       &ateletpb.ObjectStorage{SnapshotUri: freshSuspend.String()},
+			},
+		},
+	}
+
+	if _, err := w.ensureSuspendedFinalized(ctx, actorRef, state); err != nil {
+		t.Fatalf("ensureSuspendedFinalized: %v", err)
+	}
+	if len(objects.Snapshot(t, oldSuspend)) != 0 {
+		t.Error("old COMPLETED suspend snapshot was not collected")
+	}
+	if len(objects.Snapshot(t, stalePause)) != 0 {
+		t.Error("stale background-uploaded pause snapshot was not collected")
+	}
+	if len(objects.Snapshot(t, freshSuspend)) == 0 {
+		t.Error("new suspend snapshot was collected")
 	}
 }
 
@@ -550,7 +609,7 @@ func TestEnsureSuspendedFinalized_CommitsDespiteObjectStoreFailure(t *testing.T)
 	})
 
 	objects.OnDelete = func(string, string) error { return errObjectStore }
-	stored, err := w.ensureSuspendedFinalized(ctx, actorRef)
+	stored, err := w.ensureSuspendedFinalized(ctx, actorRef, nil)
 	if err != nil {
 		t.Fatalf("ensureSuspendedFinalized: %v", err)
 	}
@@ -602,7 +661,7 @@ func TestEnsureSuspendedFinalized_KeepsReplacedSnapshotOnConflict(t *testing.T) 
 	})
 
 	w := &ActorWorkflow{store: &conflictingUpdateStore{Interface: persistence}, snapshotPlugin: objectstoreplugintest.ControlClient(objects)}
-	if _, err := w.ensureSuspendedFinalized(ctx, actorRef); apierror.Code(err) != codes.Aborted {
+	if _, err := w.ensureSuspendedFinalized(ctx, actorRef, nil); apierror.Code(err) != codes.Aborted {
 		t.Fatalf("ensureSuspendedFinalized = %v, want code Aborted", err)
 	}
 	if len(objects.Snapshot(t, previous)) == 0 {
@@ -666,7 +725,7 @@ func TestEnsureSuspendedFinalized_KeepsCrashFromWorkerDelete(t *testing.T) {
 	})
 
 	w := &ActorWorkflow{store: workerDeletedDuringReleaseStore{Interface: persistence}}
-	_, err := w.ensureSuspendedFinalized(ctx, actorRef)
+	_, err := w.ensureSuspendedFinalized(ctx, actorRef, nil)
 	assertConcurrentCrashKept(t, ctx, persistence, actorRef, err, "suspend failed: "+crashMessageWorkerPodGone)
 }
 
@@ -739,7 +798,7 @@ func TestEnsureSuspendedFinalized_ReleasesOnlyOwnWorker(t *testing.T) {
 			})
 
 			w := &ActorWorkflow{store: persistence}
-			if _, err := w.ensureSuspendedFinalized(ctx, resources.ActorRef{Atespace: "team-a", Name: "shared"}); err != nil {
+			if _, err := w.ensureSuspendedFinalized(ctx, resources.ActorRef{Atespace: "team-a", Name: "shared"}, nil); err != nil {
 				t.Fatalf("ensureSuspendedFinalized: %v", err)
 			}
 
@@ -814,8 +873,8 @@ func TestIsPausedOriginSuspend(t *testing.T) {
 // suspend keeps the pause snapshot as the pause recorded it: MarkSuspending
 // reuses the URI the pause recorded, where atelet may already have uploaded
 // the snapshot, and the fidelity the pause captured, though the template now
-// names another location and fidelity; DetachActor then sends that snapshot's
-// uuid, fidelity, URI and generation.
+// names another location and fidelity; DetachActor then detaches the actor
+// from its node.
 func TestSuspendActor_FromPausedDetachesPauseSnapshot(t *testing.T) {
 	ctx := context.Background()
 	persistence := newTestPersistence(t)
@@ -853,7 +912,7 @@ func TestSuspendActor_FromPausedDetachesPauseSnapshot(t *testing.T) {
 		t.Errorf("in-progress snapshot = %v, want the pause snapshot as recorded, %v", got, wantInProgress)
 	}
 
-	wireFidelity, err := w.ensurePausedSnapshotDetached(ctx, actorRef, marked)
+	wireFidelity, _, err := w.ensurePausedSnapshotDetached(ctx, actorRef, marked)
 	if err != nil {
 		t.Fatalf("ensurePausedSnapshotDetached: %v", err)
 	}
@@ -896,7 +955,7 @@ func TestEnsurePausedSnapshotDetached_Preconditions(t *testing.T) {
 			},
 		})
 
-		_, err := w.ensurePausedSnapshotDetached(ctx, resources.ActorRef{Atespace: "team-a", Name: "actor-1"}, created)
+		_, _, err := w.ensurePausedSnapshotDetached(ctx, resources.ActorRef{Atespace: "team-a", Name: "actor-1"}, created)
 		if got := apierror.Code(err); got != codes.FailedPrecondition {
 			t.Fatalf("apierror.Code(err) = %v, want %v for a missing node record (err: %v)", got, codes.FailedPrecondition, err)
 		}
@@ -927,7 +986,7 @@ func TestEnsurePausedSnapshotDetached_Preconditions(t *testing.T) {
 			},
 		})
 
-		_, err := w.ensurePausedSnapshotDetached(ctx, resources.ActorRef{Atespace: "team-a", Name: "actor-1"}, created)
+		_, _, err := w.ensurePausedSnapshotDetached(ctx, resources.ActorRef{Atespace: "team-a", Name: "actor-1"}, created)
 		if !errors.Is(err, ErrNoAteletOnNode) {
 			t.Fatalf("ensurePausedSnapshotDetached = %v, want ErrNoAteletOnNode", err)
 		}
@@ -1020,7 +1079,7 @@ func TestEnsureSuspendedFinalized_MissingDurableSnapshotClearsAssignment(t *test
 	})
 
 	w := &ActorWorkflow{store: st}
-	if _, err := w.ensureSuspendedFinalized(ctx, actorRef); apierror.Code(err) != codes.FailedPrecondition {
+	if _, err := w.ensureSuspendedFinalized(ctx, actorRef, nil); apierror.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("ensureSuspendedFinalized error = %v, want FailedPrecondition for the actor it crashed", err)
 	}
 	got, err := st.GetActor(ctx, actorRef)

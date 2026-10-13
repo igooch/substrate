@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/internal/apierror"
@@ -320,6 +321,12 @@ func (w *ActorWorkflow) ensureActorSnapshotPromoted(ctx context.Context, actorRe
 			return nil, nil, apierror.Aborted("concurrent update conflict, please retry")
 		}
 		return nil, nil, fmt.Errorf("while recording promoted snapshot of actor %s: %w", actorRef, err)
+	}
+
+	if releaseErr := w.releaseStaleSnapshots(ctx, actor, updatedActor, resp.GetState()); releaseErr != nil {
+		slog.WarnContext(ctx, "Failed to release stale external snapshots after promoting snapshot for tag; their objects are left in storage until the actor is deleted",
+			slog.Any("actor", actorRef),
+			slog.String("err", releaseErr.Error()))
 	}
 	return updatedActor, findSnapshotByGeneration(updatedActor.GetStatus().GetSnapshots(), snapshot.GetGeneration()), nil
 }

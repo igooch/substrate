@@ -528,6 +528,9 @@ func NewService(
 		systemInfoVolumes:     systemInfoVolumes,
 	}
 	wms.snapshots = newSnapshotTracker(ctx, wms, clock.RealClock{})
+	if err := wms.snapshots.load(); err != nil {
+		slog.WarnContext(ctx, "Failed to load actors' snapshot state; pending uploads and detaches are lost", slog.Any("err", err))
+	}
 	wms.snapshots.start()
 	return wms
 }

@@ -69,6 +69,18 @@ func ActorSandboxAssetsFile(actorUID string) string {
 	)
 }
 
+// ActorSnapshotStateFile is the per-actor file where atelet keeps what it
+// tracks of the actor's snapshots: its local and durable snapshots, and its
+// pending upload and detach, so a restarted atelet carries on with them. Like
+// ActorSandboxAssetsFile it lives directly under ActorPath, outside the
+// subdirs resetActorDirs wipes.
+func ActorSnapshotStateFile(actorUID string) string {
+	return filepath.Join(
+		ActorPath(actorUID),
+		"snapshot-state.json",
+	)
+}
+
 func OCIBundleDir(actorUID string) string {
 	return filepath.Join(
 		ActorPath(actorUID),
