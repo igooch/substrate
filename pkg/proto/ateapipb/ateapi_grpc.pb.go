@@ -1878,20 +1878,13 @@ type WorkerServiceClient interface {
 	RequestActorSuspend(ctx context.Context, in *RequestActorSuspendRequest, opts ...grpc.CallOption) (*RequestActorSuspendResponse, error)
 	// ReportActorSnapshotState records which snapshots of an Actor the calling
 	// atelet holds on its node, and which of them are durable. Only atelet can
-	// observe when an upload finishes or a local copy is deleted, and the
-	// control plane needs both to decide where the Actor can resume. A report
-	// never places a local snapshot the control plane has not recorded.
+	// observe when an upload finishes or a local copy is deleted.
 	//
-	// Only atelet should call this, with its own client certificate. The
-	// control plane serves it only for an Actor on the caller's node.
-	// Idempotent: each report carries the whole state and replaces the previous
-	// one. Returns ABORTED while another operation holds the Actor; retry.
-	// Returns NOT_FOUND once the Actor is gone or no longer on the caller's
-	// node, including after a detach the control plane already recorded; stop
-	// reporting it. Returns FAILED_PRECONDITION when the report disagrees with
-	// the control plane's record of the Actor's snapshots, and INVALID_ARGUMENT
-	// when an upload went somewhere other than its recorded URI. Retrying the
-	// same state gets the same answer: report again only once the state changes.
+	// atelet calls this with its own client certificate, for an Actor on its
+	// node. Idempotent: each report replaces the previous one. Returns ABORTED
+	// while another operation holds the Actor; retry. NOT_FOUND,
+	// FAILED_PRECONDITION, and INVALID_ARGUMENT are final for the reported
+	// state.
 	ReportActorSnapshotState(ctx context.Context, in *ReportActorSnapshotStateRequest, opts ...grpc.CallOption) (*ReportActorSnapshotStateResponse, error)
 }
 
@@ -1990,20 +1983,13 @@ type WorkerServiceServer interface {
 	RequestActorSuspend(context.Context, *RequestActorSuspendRequest) (*RequestActorSuspendResponse, error)
 	// ReportActorSnapshotState records which snapshots of an Actor the calling
 	// atelet holds on its node, and which of them are durable. Only atelet can
-	// observe when an upload finishes or a local copy is deleted, and the
-	// control plane needs both to decide where the Actor can resume. A report
-	// never places a local snapshot the control plane has not recorded.
+	// observe when an upload finishes or a local copy is deleted.
 	//
-	// Only atelet should call this, with its own client certificate. The
-	// control plane serves it only for an Actor on the caller's node.
-	// Idempotent: each report carries the whole state and replaces the previous
-	// one. Returns ABORTED while another operation holds the Actor; retry.
-	// Returns NOT_FOUND once the Actor is gone or no longer on the caller's
-	// node, including after a detach the control plane already recorded; stop
-	// reporting it. Returns FAILED_PRECONDITION when the report disagrees with
-	// the control plane's record of the Actor's snapshots, and INVALID_ARGUMENT
-	// when an upload went somewhere other than its recorded URI. Retrying the
-	// same state gets the same answer: report again only once the state changes.
+	// atelet calls this with its own client certificate, for an Actor on its
+	// node. Idempotent: each report replaces the previous one. Returns ABORTED
+	// while another operation holds the Actor; retry. NOT_FOUND,
+	// FAILED_PRECONDITION, and INVALID_ARGUMENT are final for the reported
+	// state.
 	ReportActorSnapshotState(context.Context, *ReportActorSnapshotStateRequest) (*ReportActorSnapshotStateResponse, error)
 	mustEmbedUnimplementedWorkerServiceServer()
 }
