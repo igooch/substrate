@@ -33,10 +33,10 @@ type Server struct {
 	// state every request is authorized against.
 	store store.Interface
 
-	// control is the in-process Control service. A Worker's suspend request
-	// runs the same entry point Control.SuspendActor uses, so it is subject to
-	// every precondition a client's would be.
-	control controlPlane
+	// suspender runs the suspend a Worker asks for. It is the same entry point
+	// Control.SuspendActor uses, so a Worker's request is subject to every
+	// precondition a client's would be.
+	suspender actorSuspender
 
 	// ateletSPIFFEID is the identity the calling atelet must present.
 	ateletSPIFFEID string
@@ -44,19 +44,19 @@ type Server struct {
 	actorIDCAPool localca.Pool
 }
 
-// controlPlane is the in-process slice of the Control service this package
+// actorSuspender is the in-process slice of the Control service this package
 // drives. *controlapi.RPCService satisfies it.
-type controlPlane interface {
+type actorSuspender interface {
 	SuspendActor(ctx context.Context, req *ateapipb.SuspendActorRequest) (*ateapipb.SuspendActorResponse, error)
 	ApplyActorSnapshotState(ctx context.Context, actorRef resources.ActorRef, actorUID, node string, state *ateapipb.ActorSnapshotState) error
 }
 
 var _ ateapipb.WorkerServiceServer = (*Server)(nil)
 
-func New(store store.Interface, control controlPlane, ateletSPIFFEID string, actorIDCAPool localca.Pool) *Server {
+func New(store store.Interface, suspender actorSuspender, ateletSPIFFEID string, actorIDCAPool localca.Pool) *Server {
 	return &Server{
 		store:          store,
-		control:        control,
+		suspender:      suspender,
 		ateletSPIFFEID: ateletSPIFFEID,
 		actorIDCAPool:  actorIDCAPool,
 	}

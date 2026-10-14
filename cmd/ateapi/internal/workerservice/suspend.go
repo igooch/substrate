@@ -92,7 +92,7 @@ func (s *Server) RequestActorSuspend(ctx context.Context, req *ateapipb.RequestA
 	// the workflow to acquire the lease, the Actor can be resumed onto another
 	// Worker, or deleted and recreated under the same name, and the workflow
 	// suspends whatever the reference resolves to by then. See #1773.
-	resp, err := s.control.SuspendActor(ctx, &ateapipb.SuspendActorRequest{Actor: req.GetActor()})
+	resp, err := s.suspender.SuspendActor(ctx, &ateapipb.SuspendActorRequest{Actor: req.GetActor()})
 	if err != nil {
 		return nil, err
 	}

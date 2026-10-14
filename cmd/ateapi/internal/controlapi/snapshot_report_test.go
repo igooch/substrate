@@ -50,8 +50,7 @@ func ownedURI(t *testing.T, actorUID string, gen int32) string {
 	return uri.String()
 }
 
-// localOnly returns a Snapshot as pause records it, held on locality with no
-// durable copy.
+// localOnly returns a Snapshot held on locality with no durable copy.
 func localOnly(gen int32, locality string) *ateapipb.Snapshot {
 	return &ateapipb.Snapshot{Uuid: snapName(gen), Generation: gen, Locality: locality, Fidelity: ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY}
 }
@@ -325,6 +324,14 @@ func TestApplyActorSnapshotState(t *testing.T) {
 		}()},
 		wantCode: codes.FailedPrecondition,
 	}, {
+		name: "an upload to a URI other than the recorded one is refused",
+		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
+			withDurable(t, 2, reportNode, pending),
+			localOnly(3, reportNode),
+		}},
+		state:    &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 3), Uploading: reportedAt(t, 2, ownedURI(t, reportActorUID, 9))},
+		wantCode: codes.InvalidArgument,
+	}, {
 		name: "durable uuid mismatch is refused",
 		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
 			localOnly(2, reportNode),
@@ -360,7 +367,6 @@ func TestApplyActorSnapshotState(t *testing.T) {
 		state: &ateapipb.ActorSnapshotState{LatestDurable: reported(t, 1)},
 		want: &ateapipb.ActorStatus{
 			State:                  ateapipb.ActorState_ACTOR_STATE_CRASHED,
-			AssignedNode:           reportNode,
 			LastAssignedGeneration: 2,
 			Crash:                  &ateapipb.ActorCrash{Message: "suspend failed: atelet on node node-a deleted snapshot generation 2 before it was durable"},
 			Snapshots: []*ateapipb.Snapshot{
@@ -498,20 +504,20 @@ func TestApplyReportedSnapshotState(t *testing.T) {
 	uid := actor.GetMetadata().GetUid()
 	old := mustActorSnapshotURI(t, tmpl, actor, "snap-1")
 	objects.PutSnapshot(t, old, "manifest.json")
-	paused := mustActorSnapshotURI(t, tmpl, actor, "snap-2")
+	pending := mustActorSnapshotURI(t, tmpl, actor, "snap-2")
 	actor = mustUpdateActorStatus(t, ctx, persistence, actor, func(s *ateapipb.ActorStatus) {
 		s.AssignedNode = reportNode
 		s.LastAssignedGeneration = 2
 		s.Snapshots = []*ateapipb.Snapshot{
 			newDurableSnapshot(1, ateapipb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR, ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, "", old.Name(), old.String(), ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED),
 			func() *ateapipb.Snapshot {
-				snap := newDurableSnapshot(2, ateapipb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR, ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, "", paused.Name(), paused.String(), ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_PENDING)
+				snap := newDurableSnapshot(2, ateapipb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR, ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, "", pending.Name(), pending.String(), ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_PENDING)
 				snap.Locality = reportNode
 				return snap
 			}(),
 		}
 	})
-	uploaded := reportedAt(t, 2, paused.String())
+	uploaded := reportedAt(t, 2, pending.String())
 	state := &ateapipb.ActorSnapshotState{LatestLocal: uploaded, LatestDurable: uploaded}
 
 	t.Run("refused while another operation holds the actor", func(t *testing.T) {
@@ -602,7 +608,7 @@ func TestApplyReportedSnapshotState(t *testing.T) {
 		Owner:      ateapipb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR,
 		DurableSnapshot: &ateapipb.SnapshotStorage{
 			Status: ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED,
-			Object: &ateapipb.ObjectSnapshot{SnapshotUri: paused.String()},
+			Object: &ateapipb.ObjectSnapshot{SnapshotUri: pending.String()},
 		},
 	}
 	if diff := cmp.Diff([]*ateapipb.Snapshot{want}, got.GetStatus().GetSnapshots(), protocmp.Transform()); diff != "" {
@@ -623,4 +629,71 @@ func TestApplyReportedSnapshotState(t *testing.T) {
 	if again.GetMetadata().GetVersion() != got.GetMetadata().GetVersion() {
 		t.Errorf("an unchanged report wrote the actor: version %d, want %d", again.GetMetadata().GetVersion(), got.GetMetadata().GetVersion())
 	}
+}
+
+// A detach that deleted the only copy of a suspended actor's latest snapshot
+// crashes the actor and releases it from the node. An upload atelet gave up
+// on is pruned, and its objects are released.
+func TestApplyReportedSnapshotState_CrashAndRelease(t *testing.T) {
+	ctx := context.Background()
+	persistence := newTestPersistence(t)
+	objects := objectstoretest.New()
+	w := NewActorWorkflow(persistence, nil, nil, nil, nil, nil, "", nil, objectstoreplugintest.ControlClient(objects))
+	tmpl := seedSubstrateTemplate(t, ctx, persistence, "tmpl")
+	seed := func(name string, snaps func(actor *ateapipb.Actor) []*ateapipb.Snapshot) (resources.ActorRef, *ateapipb.Actor) {
+		ref := resources.ActorRef{Atespace: reportAtespace, Name: name}
+		actor := storetest.MustCreateActor(t, ctx, persistence, &ateapipb.Actor{
+			Metadata:      &ateapipb.ResourceMetadata{Atespace: ref.Atespace, Name: ref.Name},
+			ActorTemplate: &ateapipb.ObjectRef{Atespace: reportAtespace, Name: "tmpl"},
+			Status:        &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED},
+		})
+		return ref, mustUpdateActorStatus(t, ctx, persistence, actor, func(s *ateapipb.ActorStatus) {
+			s.AssignedNode = reportNode
+			s.LastAssignedGeneration = 2
+			s.Snapshots = snaps(actor)
+		})
+	}
+
+	t.Run("detach of the only copy crashes the actor", func(t *testing.T) {
+		ref, actor := seed("crashes", func(*ateapipb.Actor) []*ateapipb.Snapshot {
+			return []*ateapipb.Snapshot{localOnly(2, reportNode)}
+		})
+		if err := w.ApplyReportedSnapshotState(ctx, ref, actor.GetMetadata().GetUid(), reportNode, &ateapipb.ActorSnapshotState{}); err != nil {
+			t.Fatalf("ApplyReportedSnapshotState() failed: %v", err)
+		}
+		got, err := persistence.GetActor(ctx, ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_CRASHED || got.GetStatus().GetCrash().GetMessage() == "" {
+			t.Errorf("state = %v, crash = %v; want CRASHED with a crash message", got.GetStatus().GetState(), got.GetStatus().GetCrash())
+		}
+		if node := got.GetStatus().GetAssignedNode(); node != "" {
+			t.Errorf("assigned_node = %q, want it cleared: the node holds nothing for the actor", node)
+		}
+	})
+
+	t.Run("an abandoned upload is released", func(t *testing.T) {
+		var abandoned resources.SnapshotURI
+		ref, actor := seed("releases", func(actor *ateapipb.Actor) []*ateapipb.Snapshot {
+			abandoned = mustActorSnapshotURI(t, tmpl, actor, "snap-1")
+			objects.PutSnapshot(t, abandoned, "memory.zst")
+			snap := newDurableSnapshot(1, ateapipb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR, ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, "", abandoned.Name(), abandoned.String(), ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_PENDING)
+			snap.Locality = reportNode
+			return []*ateapipb.Snapshot{snap, localOnly(2, reportNode)}
+		})
+		if err := w.ApplyReportedSnapshotState(ctx, ref, actor.GetMetadata().GetUid(), reportNode, &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 2)}); err != nil {
+			t.Fatalf("ApplyReportedSnapshotState() failed: %v", err)
+		}
+		got, err := persistence.GetActor(ctx, ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if diff := cmp.Diff([]*ateapipb.Snapshot{localOnly(2, reportNode)}, got.GetStatus().GetSnapshots(), protocmp.Transform()); diff != "" {
+			t.Errorf("snapshots mismatch (-want +got):\n%s", diff)
+		}
+		if left := objects.Prefix(t, abandoned.Prefix()); len(left) != 0 {
+			t.Errorf("abandoned upload still holds %v, want it released", left)
+		}
+	})
 }

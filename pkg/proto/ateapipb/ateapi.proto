@@ -2424,7 +2424,7 @@ service WorkerService {
   // observe when an upload finishes or a local copy is deleted.
   //
   // atelet calls this with its own client certificate, for an Actor on its
-  // node. Idempotent: each report replaces the previous one. Returns ABORTED
+  // node. Each report replaces the previous one. Returns ABORTED
   // while another operation is changing the Actor; retry. Returns NOT_FOUND
   // once the Actor is gone or no longer on the caller's node.
   rpc ReportActorSnapshotState(ReportActorSnapshotStateRequest) returns (ReportActorSnapshotStateResponse);

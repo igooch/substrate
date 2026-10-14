@@ -1881,7 +1881,7 @@ type WorkerServiceClient interface {
 	// observe when an upload finishes or a local copy is deleted.
 	//
 	// atelet calls this with its own client certificate, for an Actor on its
-	// node. Idempotent: each report replaces the previous one. Returns ABORTED
+	// node. Each report replaces the previous one. Returns ABORTED
 	// while another operation is changing the Actor; retry. Returns NOT_FOUND
 	// once the Actor is gone or no longer on the caller's node.
 	ReportActorSnapshotState(ctx context.Context, in *ReportActorSnapshotStateRequest, opts ...grpc.CallOption) (*ReportActorSnapshotStateResponse, error)
@@ -1985,7 +1985,7 @@ type WorkerServiceServer interface {
 	// observe when an upload finishes or a local copy is deleted.
 	//
 	// atelet calls this with its own client certificate, for an Actor on its
-	// node. Idempotent: each report replaces the previous one. Returns ABORTED
+	// node. Each report replaces the previous one. Returns ABORTED
 	// while another operation is changing the Actor; retry. Returns NOT_FOUND
 	// once the Actor is gone or no longer on the caller's node.
 	ReportActorSnapshotState(context.Context, *ReportActorSnapshotStateRequest) (*ReportActorSnapshotStateResponse, error)

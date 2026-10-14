@@ -134,8 +134,9 @@ func (w *ActorWorkflow) releaseReportedSnapshot(ctx context.Context, actor *atea
 	return w.cleanupSnapshot(ctx, uri.Prefix())
 }
 
-// replacedDurableURIs returns the upload URIs recorded in before but not in
-// after, except the one atelet is still uploading.
+// replacedDurableURIs returns the upload URIs of snapshots the report removed
+// from the actor, so their objects can be deleted. It skips the snapshot atelet
+// is still uploading.
 func replacedDurableURIs(before, after *ateapipb.Actor, state *ateapipb.ActorSnapshotState) []string {
 	keep := map[string]bool{state.GetUploading().GetObject().GetSnapshotUri(): true}
 	for _, snap := range after.GetStatus().GetSnapshots() {
@@ -187,9 +188,9 @@ func applyActorSnapshotState(status *ateapipb.ActorStatus, node string, state *a
 
 // checkReportedLocal checks the report's latest_local and uploading against
 // status. It refuses a latest_local that status doesn't have, and a recorded
-// uploading snapshot with no upload URI. An uploading snapshot that status no
-// longer has passes, because pause drops an older local snapshot while atelet
-// uploads it.
+// uploading snapshot whose upload URI is missing or different. An uploading
+// snapshot that status no longer has passes, because a newer checkpoint can
+// drop its entry while atelet still uploads it.
 func checkReportedLocal(status *ateapipb.ActorStatus, node string, state *ateapipb.ActorSnapshotState) error {
 	if local := state.GetLatestLocal(); local != nil {
 		snap, err := recordedSnapshot(status, node, local)
@@ -205,8 +206,14 @@ func checkReportedLocal(status *ateapipb.ActorStatus, node string, state *ateapi
 		if err != nil {
 			return err
 		}
-		if snap != nil && snap.GetDurableSnapshot().GetObject().GetSnapshotUri() == "" {
-			return apierror.FailedPrecondition("snapshot generation %d has no upload location recorded", up.GetGeneration())
+		if snap != nil {
+			recorded := snap.GetDurableSnapshot().GetObject().GetSnapshotUri()
+			if recorded == "" {
+				return apierror.FailedPrecondition("snapshot generation %d has no upload location recorded", up.GetGeneration())
+			}
+			if got := up.GetObject().GetSnapshotUri(); got != recorded {
+				return apierror.InvalidArgument("snapshot generation %d is uploading to %q, want %q", up.GetGeneration(), got, recorded)
+			}
 		}
 	}
 	return nil
@@ -271,9 +278,9 @@ func applyLatestDurable(status *ateapipb.ActorStatus, node string, reported *ate
 }
 
 // applyDetach records that the atelet on node deleted its copies of the
-// Actor's snapshots. If they held the only copy of a SUSPENDED Actor's latest
-// snapshot, it marks the Actor CRASHED rather than let it resume from an older
-// one.
+// Actor's snapshots, and releases a SUSPENDED Actor from node. If they held the
+// only copy of its latest snapshot, it marks the Actor CRASHED rather than let
+// it resume from an older one.
 func applyDetach(status *ateapipb.ActorStatus, node string) {
 	onNode := latestSnapshot(status, func(s *ateapipb.Snapshot) bool { return s.GetLocality() == node })
 	lost := onNode != nil &&
@@ -288,13 +295,12 @@ func applyDetach(status *ateapipb.ActorStatus, node string) {
 		// A running Actor stays placed on node.
 		return
 	}
+	if status.GetAssignedNode() == node {
+		status.AssignedNode = ""
+	}
 	if lost {
 		status.State = ateapipb.ActorState_ACTOR_STATE_CRASHED
 		status.Crash = newActorCrash(ateattr.OperationSuspend, fmt.Sprintf("atelet on node %s deleted snapshot generation %d before it was durable", node, onNode.GetGeneration()))
-		return
-	}
-	if status.GetAssignedNode() == node {
-		status.AssignedNode = ""
 	}
 }
 
