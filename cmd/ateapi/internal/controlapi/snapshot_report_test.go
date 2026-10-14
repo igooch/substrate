@@ -40,7 +40,7 @@ const (
 
 func snapName(gen int32) string { return fmt.Sprintf("snap-%d", gen) }
 
-// ownedURI is where actorUID's snapshot of generation gen lives.
+// ownedURI returns the upload URI of actorUID's snapshot of generation gen.
 func ownedURI(t *testing.T, actorUID string, gen int32) string {
 	t.Helper()
 	uri, err := resources.NewActorSnapshotURI("gs://snapshots", reportAtespace, actorUID, snapName(gen))
@@ -50,13 +50,14 @@ func ownedURI(t *testing.T, actorUID string, gen int32) string {
 	return uri.String()
 }
 
-// localOnly is a Snapshot entry as pause records it: a local checkpoint on
-// locality, with no durable copy.
+// localOnly returns a Snapshot as pause records it, held on locality with no
+// durable copy.
 func localOnly(gen int32, locality string) *ateapipb.Snapshot {
 	return &ateapipb.Snapshot{Uuid: snapName(gen), Generation: gen, Locality: locality, Fidelity: ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY}
 }
 
-// withDurable is a Snapshot entry with a durable copy at storage status.
+// withDurable returns a Snapshot with a durable copy in the given storage
+// status.
 func withDurable(t *testing.T, gen int32, locality string, storage ateapipb.SnapshotStorageStatus) *ateapipb.Snapshot {
 	t.Helper()
 	snap := localOnly(gen, locality)
@@ -458,8 +459,8 @@ func TestApplyActorSnapshotState(t *testing.T) {
 	}
 }
 
-// Durable copies the actor no longer names are released, including an upload
-// atelet gave up on. One still uploading, or still named, is left alone.
+// Upload URIs that the actor no longer records are released, except the one
+// atelet is still uploading.
 func TestReplacedDurableURIs(t *testing.T) {
 	const (
 		pending   = ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_PENDING
@@ -479,8 +480,8 @@ func TestReplacedDurableURIs(t *testing.T) {
 	}
 }
 
-// A report is applied to the stored actor under its lease, and the durable
-// copy it replaces is released.
+// A report is applied to the stored actor, and the snapshot it replaces is
+// released. A refused report writes and releases nothing.
 func TestApplyReportedSnapshotState(t *testing.T) {
 	ctx := context.Background()
 	persistence := newTestPersistence(t)
@@ -537,8 +538,7 @@ func TestApplyReportedSnapshotState(t *testing.T) {
 			}
 		})
 	}
-	// A workflow owns a transitioning actor's snapshots, even with its lease
-	// lapsed, and a crashed actor's wait for a revert.
+	// A transitioning actor gets Aborted, and a crashed one FailedPrecondition.
 	for _, tc := range []struct {
 		state ateapipb.ActorState
 		want  codes.Code

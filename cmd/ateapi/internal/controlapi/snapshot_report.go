@@ -29,18 +29,17 @@ import (
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 )
 
-// ApplyActorSnapshotState records the snapshot state the atelet on node
+// ApplyActorSnapshotState records the snapshot state that the atelet on node
 // reports for the Actor. The caller has authenticated that atelet.
 func (s *RPCService) ApplyActorSnapshotState(ctx context.Context, actorRef resources.ActorRef, actorUID, node string, state *ateapipb.ActorSnapshotState) error {
 	setSpanActorRefAttributes(ctx, actorRef)
 	return s.actorWorkflow.ApplyReportedSnapshotState(ctx, actorRef, actorUID, node, state)
 }
 
-// ApplyReportedSnapshotState applies state under the Actor's lease, and only to
-// a SUSPENDED or RUNNING Actor, so it never interleaves with a workflow that
-// reads and rewrites the Actor's snapshots. A report sent while a workflow runs
-// gets Aborted, and atelet retries it with whatever its state is by then. A
-// report that changes nothing writes nothing.
+// ApplyReportedSnapshotState applies a report from the atelet on node to the
+// Actor. It holds the Actor's lease and applies reports only to a SUSPENDED or
+// RUNNING Actor, so a report never interleaves with a workflow. A report that
+// changes nothing writes nothing.
 func (w *ActorWorkflow) ApplyReportedSnapshotState(ctx context.Context, actorRef resources.ActorRef, actorUID, node string, state *ateapipb.ActorSnapshotState) error {
 	leaseCtx, lease, err := w.acquireActorLease(ctx, actorRef)
 	if err != nil {
@@ -55,8 +54,8 @@ func (w *ActorWorkflow) ApplyReportedSnapshotState(ctx context.Context, actorRef
 		}
 		return err
 	}
-	// Every refusal is NotFound, so an atelet learns nothing about Actors on
-	// other nodes.
+	// Refuse with NotFound so an atelet learns nothing about Actors on other
+	// nodes.
 	if got := before.GetMetadata().GetUid(); got != actorUID {
 		slog.WarnContext(ctx, "Refusing a snapshot state report naming a stale actor incarnation",
 			slog.Any("actor", actorRef),
@@ -73,9 +72,8 @@ func (w *ActorWorkflow) ApplyReportedSnapshotState(ctx context.Context, actorRef
 		return apierror.NotFound("Actor %s not found", actorRef)
 	}
 
-	// A workflow owns a transitioning actor's snapshots, even after its lease
-	// lapsed: its retry finishes the transition, and the report is retried
-	// after it. A crashed actor's snapshots wait for a revert.
+	// A workflow owns a transitioning Actor's snapshots, even after its lease
+	// lapses. A crashed Actor's snapshots wait for a revert.
 	switch st := before.GetStatus().GetState(); st {
 	case ateapipb.ActorState_ACTOR_STATE_SUSPENDED, ateapipb.ActorState_ACTOR_STATE_PAUSED, ateapipb.ActorState_ACTOR_STATE_RUNNING:
 	case ateapipb.ActorState_ACTOR_STATE_CRASHED:
@@ -120,8 +118,8 @@ func (w *ActorWorkflow) ApplyReportedSnapshotState(ctx context.Context, actorRef
 	return nil
 }
 
-// releaseReportedSnapshot deletes the objects under uri if the actor owns it.
-// A snapshot borrowed from a tag is left to the tag.
+// releaseReportedSnapshot deletes the objects under raw if the Actor owns
+// them. A snapshot borrowed from a tag belongs to the tag.
 func (w *ActorWorkflow) releaseReportedSnapshot(ctx context.Context, actor *ateapipb.Actor, raw string) error {
 	if w.snapshotPlugin == nil {
 		return nil
@@ -153,7 +151,7 @@ func replacedDurableURIs(before, after *ateapipb.Actor, state *ateapipb.ActorSna
 	return replaced
 }
 
-// actorOnNode reports whether the Actor is placed on node, or holds a local
+// actorOnNode reports whether the Actor is placed on node or has a local
 // snapshot there.
 func actorOnNode(actor *ateapipb.Actor, node string) bool {
 	if actor.GetStatus().GetAssignedNode() == node {
@@ -167,8 +165,8 @@ func actorOnNode(actor *ateapipb.Actor, node string) bool {
 	return false
 }
 
-// applyActorSnapshotState updates status to match the snapshot state the
-// atelet on node reports.
+// applyActorSnapshotState updates status to match the report from the atelet
+// on node.
 func applyActorSnapshotState(status *ateapipb.ActorStatus, node string, state *ateapipb.ActorSnapshotState) error {
 	if err := checkReportedLocal(status, node, state); err != nil {
 		return err
@@ -176,8 +174,8 @@ func applyActorSnapshotState(status *ateapipb.ActorStatus, node string, state *a
 	if err := applyLatestDurable(status, node, state.GetLatestDurable()); err != nil {
 		return err
 	}
-	// atelet holds nothing locally once it has detached. A report with an
-	// upload still in flight is not a detach, even with no latest_local.
+	// A report with neither latest_local nor uploading is a detach. A report
+	// with an upload in flight isn't.
 	if state.GetLatestLocal() == nil && state.GetUploading() == nil {
 		applyDetach(status, node)
 	} else {
@@ -187,13 +185,11 @@ func applyActorSnapshotState(status *ateapipb.ActorStatus, node string, state *a
 	return nil
 }
 
-// checkReportedLocal checks latest_local and uploading against the record.
-// Either is refused if it names a recorded generation under another uuid, or
-// one held on another node. latest_local must be recorded; an entry with no
-// locality is accepted but not placed, since the control plane places local
-// snapshots. An uploading snapshot the record no longer holds is accepted,
-// because pause drops an older local snapshot while atelet still uploads it.
-// A recorded one must have an upload URI, or its upload could never complete.
+// checkReportedLocal checks the report's latest_local and uploading against
+// status. It refuses a latest_local that status doesn't have, and a recorded
+// uploading snapshot with no upload URI. An uploading snapshot that status no
+// longer has passes, because pause drops an older local snapshot while atelet
+// uploads it.
 func checkReportedLocal(status *ateapipb.ActorStatus, node string, state *ateapipb.ActorSnapshotState) error {
 	if local := state.GetLatestLocal(); local != nil {
 		snap, err := recordedSnapshot(status, node, local)
@@ -216,9 +212,9 @@ func checkReportedLocal(status *ateapipb.ActorStatus, node string, state *ateapi
 	return nil
 }
 
-// recordedSnapshot returns the recorded snapshot r names, or nil if its
-// generation is not recorded. A recorded generation under another uuid, or
-// held on another node, is refused: a report speaks only for its own node.
+// recordedSnapshot returns the snapshot in status that r names, or nil if r's
+// generation isn't in status. It refuses a snapshot recorded under another uuid
+// or held on another node.
 func recordedSnapshot(status *ateapipb.ActorStatus, node string, r *ateapipb.SnapshotReport) (*ateapipb.Snapshot, error) {
 	snap := findSnapshotByGeneration(status.GetSnapshots(), r.GetGeneration())
 	if snap == nil {
@@ -233,16 +229,11 @@ func recordedSnapshot(status *ateapipb.ActorStatus, node string, r *ateapipb.Sna
 	return snap, nil
 }
 
-// applyLatestDurable records the reported durable snapshot as COMPLETED, with
-// the fidelity its manifest records. Its URI must be the one recorded when the
-// snapshot was taken. A duplicate, or a report older than the latest COMPLETED
-// snapshot, changes nothing. So does an upload of a generation the record no
-// longer holds, such as one a revert discarded; actor deletion collects its
-// objects.
-//
-// Only the node holding the snapshot can newly mark it COMPLETED. A snapshot
-// held on another node was refused by recordedSnapshot, so this refuses one
-// recorded on no node: no node can say it uploaded it.
+// applyLatestDurable marks the reported durable snapshot COMPLETED and records
+// the fidelity from its manifest. The snapshot must be held on node, and its
+// URI must match the recorded upload URI. A report that isn't newer than the
+// latest COMPLETED snapshot changes nothing, and neither does one for a
+// generation that status no longer has, such as one a revert discarded.
 func applyLatestDurable(status *ateapipb.ActorStatus, node string, reported *ateapipb.SnapshotReport) error {
 	if reported == nil {
 		return nil
@@ -279,10 +270,10 @@ func applyLatestDurable(status *ateapipb.ActorStatus, node string, reported *ate
 	return nil
 }
 
-// applyDetach records that atelet no longer holds the Actor's snapshots on
-// node. atelet has already deleted them, so the record follows. If that
-// deleted the only copy of a SUSPENDED Actor's latest snapshot, the Actor
-// crashes rather than resume silently from an older one.
+// applyDetach records that the atelet on node deleted its copies of the
+// Actor's snapshots. If they held the only copy of a SUSPENDED Actor's latest
+// snapshot, it marks the Actor CRASHED rather than let it resume from an older
+// one.
 func applyDetach(status *ateapipb.ActorStatus, node string) {
 	onNode := latestSnapshot(status, func(s *ateapipb.Snapshot) bool { return s.GetLocality() == node })
 	lost := onNode != nil &&
@@ -294,7 +285,7 @@ func applyDetach(status *ateapipb.ActorStatus, node string) {
 		}
 	}
 	if st := status.GetState(); st != ateapipb.ActorState_ACTOR_STATE_SUSPENDED && st != ateapipb.ActorState_ACTOR_STATE_PAUSED {
-		// A running Actor's state is its workload, and it stays placed here.
+		// A running Actor stays placed on node.
 		return
 	}
 	if lost {
@@ -307,8 +298,8 @@ func applyDetach(status *ateapipb.ActorStatus, node string) {
 	}
 }
 
-// dropUnlistedLocalSnapshots clears the locality of older snapshots on node
-// that atelet no longer lists: it has deleted them and will never upload them.
+// dropUnlistedLocalSnapshots clears node's locality on older snapshots that the
+// report doesn't list. atelet deleted them and won't upload them.
 func dropUnlistedLocalSnapshots(status *ateapipb.ActorStatus, node string, state *ateapipb.ActorSnapshotState) {
 	listed := map[string]bool{}
 	var newest int32
@@ -325,12 +316,9 @@ func dropUnlistedLocalSnapshots(status *ateapipb.ActorStatus, node string, state
 	}
 }
 
-// pruneReportedSnapshots drops the entries a report has made useless: a
-// COMPLETED durable snapshot older than the latest one, and a snapshot no node
-// holds that never became durable, such as an upload atelet gave up on. It
-// keeps every snapshot a node holds and the newest generation. Unlike
-// pruneSnapshots, it touches no locality: a report speaks only for its own
-// node.
+// pruneReportedSnapshots removes older COMPLETED snapshots, and snapshots that
+// no node holds and that never became durable, such as an abandoned upload. It
+// keeps the newest generation and doesn't change any locality.
 func pruneReportedSnapshots(status *ateapipb.ActorStatus) {
 	if status == nil {
 		return

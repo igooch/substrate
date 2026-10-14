@@ -23,12 +23,11 @@ import (
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 )
 
-// ReportActorSnapshotState records the snapshot state an atelet reports for an
-// Actor on its node. The control plane checks, under the Actor's lease, that
-// the Actor is the incarnation named and is on the caller's node.
+// ReportActorSnapshotState records the snapshot state that the calling atelet
+// reports for an Actor on its node.
 func (s *Server) ReportActorSnapshotState(ctx context.Context, req *ateapipb.ReportActorSnapshotStateRequest) (*ateapipb.ReportActorSnapshotStateResponse, error) {
-	// Authz never checks WorkerService, so this is the only gate. It runs
-	// before anything reads the request.
+	// Authz doesn't cover WorkerService, so authenticate before reading the
+	// request.
 	caller, err := ateletauth.Authenticate(ctx, s.ateletSPIFFEID)
 	if err != nil {
 		return nil, err

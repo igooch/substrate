@@ -36,8 +36,7 @@ const (
 var testAteletSPIFFEID = installdefaults.SPIFFEID(installdefaults.SystemNamespace, installdefaults.AteletServiceAccount)
 
 // fakeControl stands in for the Control service. It records each suspend and
-// snapshot state report that reaches it, which is the point of most tests in
-// this package: whether the request got that far.
+// snapshot state report that reaches it.
 type fakeControl struct {
 	calls []*ateapipb.SuspendActorRequest
 	resp  *ateapipb.SuspendActorResponse

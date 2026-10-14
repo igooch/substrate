@@ -45,9 +45,8 @@ func reportRequest() *ateapipb.ReportActorSnapshotStateRequest {
 	}
 }
 
-// A report reaches the control plane tagged with the node the caller's
-// certificate proved, not anything the request claims. The handler reads no
-// store state of its own: the control plane checks the actor under its lease.
+// A report reaches the control plane with the node from the caller's
+// certificate. The handler reads nothing from the store.
 func TestReportActorSnapshotState(t *testing.T) {
 	control := &fakeControl{}
 	s := New(nil, control, testAteletSPIFFEID, nil)
@@ -71,8 +70,8 @@ func TestReportActorSnapshotState(t *testing.T) {
 	}
 }
 
-// A caller that is not atelet, or a malformed request, never reaches the
-// control plane. A refusal from the control plane reaches atelet as is.
+// A caller that isn't atelet, or a malformed request, doesn't reach the control
+// plane. A refusal from the control plane reaches atelet unchanged.
 func TestReportActorSnapshotState_Refused(t *testing.T) {
 	onNode := ateletauthtest.ContextWith(ateletauthtest.CertOn(t, testNode))
 	invalid := reportRequest()
