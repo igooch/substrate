@@ -208,20 +208,41 @@ func TestApplyActorSnapshotState(t *testing.T) {
 			withDurable(t, 2, "", completed),
 		}},
 	}, {
-		name: "a detach of a snapshot that isn't durable is refused",
+		name: "a late detach leaves a newer snapshot on the node and keeps the actor placed",
+		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
+			withDurable(t, 2, reportNode, completed),
+			withDurable(t, 3, reportNode, completed),
+		}},
+		state: &ateapipb.ActorSnapshotState{LatestDurable: reported(t, 2)},
+		want: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
+			withDurable(t, 2, "", completed),
+			withDurable(t, 3, reportNode, completed),
+		}},
+	}, {
+		name: "a late detach leaves a newer local-only snapshot on the node",
 		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
 			withDurable(t, 1, "", completed),
 			localOnly(2, reportNode),
 		}},
-		state:    &ateapipb.ActorSnapshotState{LatestDurable: reported(t, 1)},
+		state: &ateapipb.ActorSnapshotState{LatestDurable: reported(t, 1)},
+		want: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
+			withDurable(t, 1, "", completed),
+			localOnly(2, reportNode),
+		}},
+	}, {
+		name: "a detach of a snapshot that isn't durable is refused",
+		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, LastAssignedGeneration: 2, Snapshots: []*ateapipb.Snapshot{
+			localOnly(1, reportNode),
+		}},
+		state:    &ateapipb.ActorSnapshotState{LatestDurable: reported(t, 2)},
 		wantCode: codes.FailedPrecondition,
 	}, {
-		name: "detach releases a paused actor from the node",
-		status: &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_PAUSED, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
-			withDurable(t, 2, reportNode, pending),
+		name: "a detach from a node that holds no snapshot only releases the actor",
+		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
+			withDurable(t, 2, "", completed),
 		}},
-		state: &ateapipb.ActorSnapshotState{LatestDurable: reported(t, 2)},
-		want: &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_PAUSED, Snapshots: []*ateapipb.Snapshot{
+		state: &ateapipb.ActorSnapshotState{},
+		want: &ateapipb.ActorStatus{State: suspended, Snapshots: []*ateapipb.Snapshot{
 			withDurable(t, 2, "", completed),
 		}},
 	}, {
@@ -376,4 +397,29 @@ func TestApplyReportedSnapshotState(t *testing.T) {
 		t.Fatalf("repeated ApplyReportedSnapshotState() failed: %v", err)
 	}
 	assertUnwritten(t)
+}
+
+func TestActorOnNode(t *testing.T) {
+	actor := func(assigned string, localities ...string) *ateapipb.Actor {
+		status := &ateapipb.ActorStatus{AssignedNode: assigned}
+		for i, l := range localities {
+			status.Snapshots = append(status.Snapshots, localOnly(int32(i+1), l))
+		}
+		return &ateapipb.Actor{Status: status}
+	}
+	for _, tc := range []struct {
+		name  string
+		actor *ateapipb.Actor
+		want  bool
+	}{
+		{"placed on the node", actor(reportNode), true},
+		{"holds a snapshot on the node", actor(reportOther, "", reportNode), true},
+		{"neither", actor(reportOther, reportOther), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := actorOnNode(tc.actor, reportNode); got != tc.want {
+				t.Errorf("actorOnNode() = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }

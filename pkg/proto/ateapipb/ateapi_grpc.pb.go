@@ -1876,14 +1876,16 @@ type WorkerServiceClient interface {
 	// retries a suspend it had already been granted therefore sees a failure
 	// rather than a repeat of its success.
 	RequestActorSuspend(ctx context.Context, in *RequestActorSuspendRequest, opts ...grpc.CallOption) (*RequestActorSuspendResponse, error)
-	// ReportActorSnapshotState records which snapshots of an Actor the calling
-	// atelet holds on its node, and which of them are durable. Only atelet can
-	// observe when an upload finishes or a local copy is deleted.
+	// ReportActorSnapshotState reports an Actor's snapshot state on the caller's
+	// node. The control plane records two facts from it: an upload finished, and
+	// atelet detached the Actor from the node. Only atelet observes either.
 	//
 	// atelet calls this with its own client certificate, for an Actor on its
-	// node. Each report replaces the previous one. Returns ABORTED
-	// while another operation is changing the Actor; retry. Returns NOT_FOUND
-	// once the Actor is gone or no longer on the caller's node.
+	// node. Each report carries the whole state, so repeating one is safe.
+	// Returns ABORTED while another operation is changing the Actor; retry.
+	// Returns NOT_FOUND once the Actor is gone or no longer on the caller's
+	// node. Returns FAILED_PRECONDITION or INVALID_ARGUMENT when the report
+	// conflicts with the record; don't retry.
 	ReportActorSnapshotState(ctx context.Context, in *ReportActorSnapshotStateRequest, opts ...grpc.CallOption) (*ReportActorSnapshotStateResponse, error)
 }
 
@@ -1980,14 +1982,16 @@ type WorkerServiceServer interface {
 	// retries a suspend it had already been granted therefore sees a failure
 	// rather than a repeat of its success.
 	RequestActorSuspend(context.Context, *RequestActorSuspendRequest) (*RequestActorSuspendResponse, error)
-	// ReportActorSnapshotState records which snapshots of an Actor the calling
-	// atelet holds on its node, and which of them are durable. Only atelet can
-	// observe when an upload finishes or a local copy is deleted.
+	// ReportActorSnapshotState reports an Actor's snapshot state on the caller's
+	// node. The control plane records two facts from it: an upload finished, and
+	// atelet detached the Actor from the node. Only atelet observes either.
 	//
 	// atelet calls this with its own client certificate, for an Actor on its
-	// node. Each report replaces the previous one. Returns ABORTED
-	// while another operation is changing the Actor; retry. Returns NOT_FOUND
-	// once the Actor is gone or no longer on the caller's node.
+	// node. Each report carries the whole state, so repeating one is safe.
+	// Returns ABORTED while another operation is changing the Actor; retry.
+	// Returns NOT_FOUND once the Actor is gone or no longer on the caller's
+	// node. Returns FAILED_PRECONDITION or INVALID_ARGUMENT when the report
+	// conflicts with the record; don't retry.
 	ReportActorSnapshotState(context.Context, *ReportActorSnapshotStateRequest) (*ReportActorSnapshotStateResponse, error)
 	mustEmbedUnimplementedWorkerServiceServer()
 }

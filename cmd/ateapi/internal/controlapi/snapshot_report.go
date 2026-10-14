@@ -39,35 +39,19 @@ func (s *RPCService) ApplyActorSnapshotState(ctx context.Context, actorRef resou
 // RUNNING Actor, so a report never interleaves with a workflow. A report that
 // changes nothing writes nothing.
 func (w *ActorWorkflow) ApplyReportedSnapshotState(ctx context.Context, actorRef resources.ActorRef, actorUID, node string, state *ateapipb.ActorSnapshotState) error {
+	// Check before taking the lease, so an atelet can't hold the lease of an
+	// Actor that isn't on its node. Check again under the lease.
+	if _, err := w.loadReportedActor(ctx, actorRef, actorUID, node); err != nil {
+		return err
+	}
 	leaseCtx, lease, err := w.acquireActorLease(ctx, actorRef)
 	if err != nil {
 		return err
 	}
 	defer lease.Close()
-
-	before, err := w.store.GetActor(leaseCtx, actorRef)
+	before, err := w.loadReportedActor(leaseCtx, actorRef, actorUID, node)
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return apierror.NotFound("Actor %s not found", actorRef)
-		}
 		return err
-	}
-	// Refuse with NotFound so an atelet learns nothing about Actors on other
-	// nodes.
-	if got := before.GetMetadata().GetUid(); got != actorUID {
-		slog.WarnContext(ctx, "Refusing a snapshot state report naming a stale actor incarnation",
-			slog.Any("actor", actorRef),
-			slog.String("requested_uid", actorUID),
-			slog.String("actual_uid", got),
-			slog.String("caller_node", node))
-		return apierror.NotFound("Actor %s not found", actorRef)
-	}
-	if !actorOnNode(before, node) {
-		slog.WarnContext(ctx, "Refusing a snapshot state report for an actor not on the caller's node",
-			slog.Any("actor", actorRef),
-			slog.String("caller_node", node),
-			slog.String("assigned_node", before.GetStatus().GetAssignedNode()))
-		return apierror.NotFound("Actor %s not found", actorRef)
 	}
 
 	// A workflow owns a transitioning Actor's snapshots, even after its lease
@@ -102,6 +86,35 @@ func (w *ActorWorkflow) ApplyReportedSnapshotState(ctx context.Context, actorRef
 	return nil
 }
 
+// loadReportedActor returns the Actor if it is the incarnation actorUID names
+// and is on node. Otherwise it returns NotFound, so an atelet learns nothing
+// about Actors on other nodes.
+func (w *ActorWorkflow) loadReportedActor(ctx context.Context, actorRef resources.ActorRef, actorUID, node string) (*ateapipb.Actor, error) {
+	actor, err := w.store.GetActor(ctx, actorRef)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, apierror.NotFound("Actor %s not found", actorRef)
+		}
+		return nil, err
+	}
+	if got := actor.GetMetadata().GetUid(); got != actorUID {
+		slog.WarnContext(ctx, "Refusing a snapshot state report naming a stale actor incarnation",
+			slog.Any("actor", actorRef),
+			slog.String("requested_uid", actorUID),
+			slog.String("actual_uid", got),
+			slog.String("caller_node", node))
+		return nil, apierror.NotFound("Actor %s not found", actorRef)
+	}
+	if !actorOnNode(actor, node) {
+		slog.WarnContext(ctx, "Refusing a snapshot state report for an actor not on the caller's node",
+			slog.Any("actor", actorRef),
+			slog.String("caller_node", node),
+			slog.String("assigned_node", actor.GetStatus().GetAssignedNode()))
+		return nil, apierror.NotFound("Actor %s not found", actorRef)
+	}
+	return actor, nil
+}
+
 // actorOnNode reports whether the Actor is placed on node or has a local
 // snapshot there. Unlike HostingNode, it includes a node that only holds the
 // Actor's snapshots, since that node's atelet reports them.
@@ -125,7 +138,7 @@ func applyActorSnapshotState(status *ateapipb.ActorStatus, node string, state *a
 		return err
 	}
 	if state.GetLatestLocal() == nil && state.GetUploading() == nil {
-		return applyDetach(status, node)
+		return applyDetach(status, node, state.GetLatestDurable().GetGeneration())
 	}
 	return nil
 }
@@ -165,20 +178,24 @@ func applyLatestDurable(status *ateapipb.ActorStatus, reported *ateapipb.Snapsho
 }
 
 // applyDetach records that the atelet on node deleted its copies of the
-// Actor's snapshots, and releases a SUSPENDED Actor from node. It refuses if
-// the latest snapshot on node isn't durable, so the Actor can't resume from an
-// older snapshot.
-func applyDetach(status *ateapipb.ActorStatus, node string) error {
-	if latest := latestSnapshot(status, func(s *ateapipb.Snapshot) bool { return s.GetLocality() == node }); latest != nil &&
+// Actor's snapshots up to generation upTo, the latest snapshot it reported
+// durable. A newer snapshot on node postdates the detach, so it stays. A
+// SUSPENDED Actor is released from node once none of its snapshots are there.
+// It refuses if the latest deleted snapshot isn't durable, so the Actor can't
+// resume from an older one.
+func applyDetach(status *ateapipb.ActorStatus, node string, upTo int32) error {
+	deleted := func(s *ateapipb.Snapshot) bool { return s.GetLocality() == node && s.GetGeneration() <= upTo }
+	if latest := latestSnapshot(status, deleted); latest != nil &&
 		latest.GetDurableSnapshot().GetStatus() != ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED {
 		return apierror.FailedPrecondition("snapshot generation %d on node %s is not durable", latest.GetGeneration(), node)
 	}
 	for _, snap := range status.GetSnapshots() {
-		if snap.GetLocality() == node {
+		if deleted(snap) {
 			snap.Locality = ""
 		}
 	}
-	if st := status.GetState(); (st == ateapipb.ActorState_ACTOR_STATE_SUSPENDED || st == ateapipb.ActorState_ACTOR_STATE_PAUSED) && status.GetAssignedNode() == node {
+	onNode := latestSnapshot(status, func(s *ateapipb.Snapshot) bool { return s.GetLocality() == node })
+	if st := status.GetState(); (st == ateapipb.ActorState_ACTOR_STATE_SUSPENDED || st == ateapipb.ActorState_ACTOR_STATE_PAUSED) && status.GetAssignedNode() == node && onNode == nil {
 		status.AssignedNode = ""
 	}
 	return nil
