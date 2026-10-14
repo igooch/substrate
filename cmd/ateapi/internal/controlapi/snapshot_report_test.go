@@ -238,24 +238,23 @@ func TestApplyActorSnapshotState(t *testing.T) {
 		state:    &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 2), LatestDurable: reported(t, 3)},
 		wantCode: codes.FailedPrecondition,
 	}, {
-		name: "the assigned node completes an upload recorded on no node",
+		name: "an upload recorded on no node cannot be completed",
 		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
-			localOnly(2, reportNode),
-			withDurable(t, 3, "", pending),
-		}},
-		state: &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 2), LatestDurable: reported(t, 3)},
-		want: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
-			localOnly(2, reportNode),
-			withDurable(t, 3, "", completed),
-		}},
-	}, {
-		name: "another node cannot complete an upload recorded on no node",
-		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportOther, Snapshots: []*ateapipb.Snapshot{
 			localOnly(2, reportNode),
 			withDurable(t, 3, "", pending),
 		}},
 		state:    &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 2), LatestDurable: reported(t, 3)},
 		wantCode: codes.FailedPrecondition,
+	}, {
+		name: "an upload atelet gave up on is dropped",
+		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, LastAssignedGeneration: 3, Snapshots: []*ateapipb.Snapshot{
+			withDurable(t, 2, reportNode, pending),
+			localOnly(3, reportNode),
+		}},
+		state: &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 3)},
+		want: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, LastAssignedGeneration: 3, Snapshots: []*ateapipb.Snapshot{
+			localOnly(3, reportNode),
+		}},
 	}, {
 		name: "an upload of a recorded snapshot with no upload location is refused",
 		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
@@ -352,6 +351,33 @@ func TestApplyActorSnapshotState(t *testing.T) {
 			withDurable(t, 2, "", completed),
 		}},
 	}, {
+		name: "a detach that deleted the only copy of the latest snapshot crashes the actor",
+		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, LastAssignedGeneration: 2, Snapshots: []*ateapipb.Snapshot{
+			withDurable(t, 1, "", completed),
+			localOnly(2, reportNode),
+		}},
+		state: &ateapipb.ActorSnapshotState{LatestDurable: reported(t, 1)},
+		want: &ateapipb.ActorStatus{
+			State:                  ateapipb.ActorState_ACTOR_STATE_CRASHED,
+			AssignedNode:           reportNode,
+			LastAssignedGeneration: 2,
+			Crash:                  &ateapipb.ActorCrash{Message: "suspend failed: atelet on node node-a deleted snapshot generation 2 before it was durable"},
+			Snapshots: []*ateapipb.Snapshot{
+				withDurable(t, 1, "", completed),
+				localOnly(2, ""),
+			},
+		},
+	}, {
+		name: "a detach of an older snapshot that never became durable only drops it",
+		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportOther, LastAssignedGeneration: 3, Snapshots: []*ateapipb.Snapshot{
+			localOnly(2, reportNode),
+			localOnly(3, reportOther),
+		}},
+		state: &ateapipb.ActorSnapshotState{},
+		want: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportOther, LastAssignedGeneration: 3, Snapshots: []*ateapipb.Snapshot{
+			localOnly(3, reportOther),
+		}},
+	}, {
 		name: "detach releases a paused actor from the node",
 		status: &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_PAUSED, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
 			withDurable(t, 2, reportNode, pending),
@@ -361,13 +387,14 @@ func TestApplyActorSnapshotState(t *testing.T) {
 			withDurable(t, 2, "", completed),
 		}},
 	}, {
-		name: "detach of a non-durable latest snapshot is refused",
-		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
-			withDurable(t, 1, "", completed),
+		name: "a running actor's detach only clears the locality",
+		status: &ateapipb.ActorStatus{State: running, AssignedNode: reportNode, LastAssignedGeneration: 2, Snapshots: []*ateapipb.Snapshot{
 			localOnly(2, reportNode),
 		}},
-		state:    &ateapipb.ActorSnapshotState{LatestDurable: reported(t, 1)},
-		wantCode: codes.FailedPrecondition,
+		state: &ateapipb.ActorSnapshotState{},
+		want: &ateapipb.ActorStatus{State: running, AssignedNode: reportNode, LastAssignedGeneration: 2, Snapshots: []*ateapipb.Snapshot{
+			localOnly(2, ""),
+		}},
 	}, {
 		name: "detach keeps the assigned node of a running actor",
 		status: &ateapipb.ActorStatus{State: running, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
@@ -401,13 +428,13 @@ func TestApplyActorSnapshotState(t *testing.T) {
 			localOnly(3, reportNode),
 		}},
 	}, {
-		name: "a pending suspend's entry is kept",
-		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
+		name: "the newest generation is kept even with no holder",
+		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, LastAssignedGeneration: 3, Snapshots: []*ateapipb.Snapshot{
 			localOnly(2, reportNode),
 			withDurable(t, 3, "", pending),
 		}},
 		state: &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 2)},
-		want: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
+		want: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, LastAssignedGeneration: 3, Snapshots: []*ateapipb.Snapshot{
 			localOnly(2, reportNode),
 			withDurable(t, 3, "", pending),
 		}},
@@ -424,10 +451,31 @@ func TestApplyActorSnapshotState(t *testing.T) {
 			if err != nil {
 				t.Fatalf("applyActorSnapshotState() error = %v", err)
 			}
-			if diff := cmp.Diff(tt.want, tt.status, protocmp.Transform()); diff != "" {
+			if diff := cmp.Diff(tt.want, tt.status, protocmp.Transform(), protocmp.IgnoreFields(&ateapipb.ActorCrash{}, "crash_time")); diff != "" {
 				t.Errorf("status mismatch (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+// Durable copies the actor no longer names are released, including an upload
+// atelet gave up on. One still uploading, or still named, is left alone.
+func TestReplacedDurableURIs(t *testing.T) {
+	const (
+		pending   = ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_PENDING
+		completed = ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED
+	)
+	actor := func(snaps ...*ateapipb.Snapshot) *ateapipb.Actor {
+		return &ateapipb.Actor{Status: &ateapipb.ActorStatus{Snapshots: snaps}}
+	}
+	before := actor(withDurable(t, 1, "", completed), withDurable(t, 2, "", completed), withDurable(t, 3, "", pending), withDurable(t, 4, reportNode, completed))
+	after := actor(withDurable(t, 4, reportNode, completed))
+	state := &ateapipb.ActorSnapshotState{Uploading: reported(t, 2)}
+
+	got := replacedDurableURIs(before, after, state)
+	want := []string{ownedURI(t, reportActorUID, 1), ownedURI(t, reportActorUID, 3)}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("replacedDurableURIs() mismatch (-want +got):\n%s", diff)
 	}
 }
 
@@ -489,9 +537,51 @@ func TestApplyReportedSnapshotState(t *testing.T) {
 			}
 		})
 	}
+	// A workflow owns a transitioning actor's snapshots, even with its lease
+	// lapsed, and a crashed actor's wait for a revert.
+	for _, tc := range []struct {
+		state ateapipb.ActorState
+		want  codes.Code
+	}{
+		{ateapipb.ActorState_ACTOR_STATE_SUSPENDING, codes.Aborted},
+		{ateapipb.ActorState_ACTOR_STATE_PAUSING, codes.Aborted},
+		{ateapipb.ActorState_ACTOR_STATE_RESUMING, codes.Aborted},
+		{ateapipb.ActorState_ACTOR_STATE_DELETING, codes.Aborted},
+		{ateapipb.ActorState_ACTOR_STATE_REVERTING, codes.Aborted},
+		{ateapipb.ActorState_ACTOR_STATE_CRASHED, codes.FailedPrecondition},
+	} {
+		t.Run("refused for a "+tc.state.String()+" actor", func(t *testing.T) {
+			actor = mustUpdateActorStatus(t, ctx, persistence, actor, func(s *ateapipb.ActorStatus) { s.State = tc.state })
+			defer func() {
+				actor = mustUpdateActorStatus(t, ctx, persistence, actor, func(s *ateapipb.ActorStatus) {
+					s.State = ateapipb.ActorState_ACTOR_STATE_SUSPENDED
+				})
+			}()
+			if err := w.ApplyReportedSnapshotState(ctx, actorRef, uid, reportNode, state); apierror.Code(err) != tc.want {
+				t.Fatalf("ApplyReportedSnapshotState() = %v, want %v", err, tc.want)
+			}
+			if got, err := persistence.GetActor(ctx, actorRef); err != nil {
+				t.Fatal(err)
+			} else if got.GetMetadata().GetVersion() != actor.GetMetadata().GetVersion() {
+				t.Errorf("a refused report wrote the actor: version %d, want %d", got.GetMetadata().GetVersion(), actor.GetMetadata().GetVersion())
+			}
+		})
+	}
+	t.Run("an upload to the wrong URI is refused and changes nothing", func(t *testing.T) {
+		wrong := &ateapipb.ActorSnapshotState{LatestLocal: uploaded, LatestDurable: reportedAt(t, 2, old.String())}
+		if err := w.ApplyReportedSnapshotState(ctx, actorRef, uid, reportNode, wrong); apierror.Code(err) != codes.InvalidArgument {
+			t.Fatalf("ApplyReportedSnapshotState() = %v, want InvalidArgument", err)
+		}
+		if left := objects.Prefix(t, old.Prefix()); len(left) == 0 {
+			t.Error("a refused report released a snapshot")
+		}
+	})
 	got, err := persistence.GetActor(ctx, actorRef)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if got.GetMetadata().GetVersion() != actor.GetMetadata().GetVersion() {
+		t.Fatalf("a refused report wrote the actor: version %d, want %d", got.GetMetadata().GetVersion(), actor.GetMetadata().GetVersion())
 	}
 	if diff := cmp.Diff(actor.GetStatus(), got.GetStatus(), protocmp.Transform()); diff != "" {
 		t.Fatalf("a refused report changed the actor (-want +got):\n%s", diff)
@@ -520,5 +610,17 @@ func TestApplyReportedSnapshotState(t *testing.T) {
 	}
 	if left := objects.Prefix(t, old.Prefix()); len(left) != 0 {
 		t.Errorf("replaced durable snapshot still holds %v, want it released", left)
+	}
+
+	// A report that changes nothing writes nothing.
+	if err := w.ApplyReportedSnapshotState(ctx, actorRef, uid, reportNode, state); err != nil {
+		t.Fatalf("repeated ApplyReportedSnapshotState() failed: %v", err)
+	}
+	again, err := persistence.GetActor(ctx, actorRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.GetMetadata().GetVersion() != got.GetMetadata().GetVersion() {
+		t.Errorf("an unchanged report wrote the actor: version %d, want %d", again.GetMetadata().GetVersion(), got.GetMetadata().GetVersion())
 	}
 }

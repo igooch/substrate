@@ -1882,9 +1882,8 @@ type WorkerServiceClient interface {
 	//
 	// atelet calls this with its own client certificate, for an Actor on its
 	// node. Idempotent: each report replaces the previous one. Returns ABORTED
-	// while another operation holds the Actor; retry. NOT_FOUND,
-	// FAILED_PRECONDITION, and INVALID_ARGUMENT are final for the reported
-	// state.
+	// while another operation is changing the Actor; retry. Returns NOT_FOUND
+	// once the Actor is gone or no longer on the caller's node.
 	ReportActorSnapshotState(ctx context.Context, in *ReportActorSnapshotStateRequest, opts ...grpc.CallOption) (*ReportActorSnapshotStateResponse, error)
 }
 
@@ -1987,9 +1986,8 @@ type WorkerServiceServer interface {
 	//
 	// atelet calls this with its own client certificate, for an Actor on its
 	// node. Idempotent: each report replaces the previous one. Returns ABORTED
-	// while another operation holds the Actor; retry. NOT_FOUND,
-	// FAILED_PRECONDITION, and INVALID_ARGUMENT are final for the reported
-	// state.
+	// while another operation is changing the Actor; retry. Returns NOT_FOUND
+	// once the Actor is gone or no longer on the caller's node.
 	ReportActorSnapshotState(context.Context, *ReportActorSnapshotStateRequest) (*ReportActorSnapshotStateResponse, error)
 	mustEmbedUnimplementedWorkerServiceServer()
 }
