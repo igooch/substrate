@@ -16,7 +16,6 @@ package controlapi
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"testing"
 
@@ -24,7 +23,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/testing/protocmp"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/storetest"
 	"github.com/agent-substrate/substrate/internal/apierror"
 	"github.com/agent-substrate/substrate/internal/objectstore/objectstoretest"
@@ -91,27 +89,23 @@ func TestApplyActorSnapshotState(t *testing.T) {
 		suspended = ateapipb.ActorState_ACTOR_STATE_SUSPENDED
 		running   = ateapipb.ActorState_ACTOR_STATE_RUNNING
 	)
-	otherActor := "1a7e4c83-6d20-4f95-b3c8-9e0a2f6d4b17"
 	elsewhere, err := resources.NewActorSnapshotURI("gs://elsewhere", reportAtespace, reportActorUID, snapName(2))
 	if err != nil {
 		t.Fatal(err)
 	}
 	tests := []struct {
-		name       string
-		status     *ateapipb.ActorStatus
-		state      *ateapipb.ActorSnapshotState
-		noTemplate bool
-		want       *ateapipb.ActorStatus
-		wantCode   codes.Code
+		name     string
+		status   *ateapipb.ActorStatus
+		state    *ateapipb.ActorSnapshotState
+		want     *ateapipb.ActorStatus
+		wantCode codes.Code
 	}{{
-		name: "upload of a paused actor's snapshot records it durable and keeps it local",
+		name: "upload of a snapshot with no recorded upload location is refused",
 		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
 			localOnly(2, reportNode),
 		}},
-		state: &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 2), LatestDurable: reported(t, 2)},
-		want: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
-			withDurable(t, 2, reportNode, completed),
-		}},
+		state:    &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 2), LatestDurable: reported(t, 2)},
+		wantCode: codes.FailedPrecondition,
 	}, {
 		name: "upload completes a recorded pending durable copy",
 		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
@@ -125,7 +119,7 @@ func TestApplyActorSnapshotState(t *testing.T) {
 		name: "upload prunes the older durable snapshot",
 		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
 			withDurable(t, 1, "", completed),
-			localOnly(2, reportNode),
+			withDurable(t, 2, reportNode, pending),
 		}},
 		state: &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 2), LatestDurable: reported(t, 2)},
 		want: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
@@ -134,18 +128,18 @@ func TestApplyActorSnapshotState(t *testing.T) {
 	}, {
 		name: "an older snapshot still uploading keeps its entry",
 		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
-			localOnly(2, reportNode),
+			withDurable(t, 2, reportNode, pending),
 			localOnly(3, reportNode),
 		}},
 		state: &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 3), Uploading: reported(t, 2)},
 		want: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
-			localOnly(2, reportNode),
+			withDurable(t, 2, reportNode, pending),
 			localOnly(3, reportNode),
 		}},
 	}, {
 		name: "the older upload's completion is recorded after the newer snapshot",
 		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
-			localOnly(2, reportNode),
+			withDurable(t, 2, reportNode, pending),
 			localOnly(3, reportNode),
 		}},
 		state: &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 3), LatestDurable: reported(t, 2)},
@@ -156,16 +150,16 @@ func TestApplyActorSnapshotState(t *testing.T) {
 	}, {
 		name: "an upload in flight with no local snapshot is not a detach",
 		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
-			localOnly(2, reportNode),
+			withDurable(t, 2, reportNode, pending),
 		}},
 		state: &ateapipb.ActorSnapshotState{Uploading: reported(t, 2)},
 		want: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
-			localOnly(2, reportNode),
+			withDurable(t, 2, reportNode, pending),
 		}},
 	}, {
 		name: "a report from one node leaves another node's newer snapshot alone",
 		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportOther, Snapshots: []*ateapipb.Snapshot{
-			localOnly(2, reportNode),
+			withDurable(t, 2, reportNode, pending),
 			localOnly(3, reportOther),
 		}},
 		state: &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 2), LatestDurable: reported(t, 2)},
@@ -221,7 +215,7 @@ func TestApplyActorSnapshotState(t *testing.T) {
 	}, {
 		name: "upload records the fidelity the manifest reports",
 		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
-			localOnly(2, reportNode),
+			withDurable(t, 2, reportNode, pending),
 		}},
 		state: &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 2), LatestDurable: func() *ateapipb.SnapshotReport {
 			r := reported(t, 2)
@@ -244,12 +238,31 @@ func TestApplyActorSnapshotState(t *testing.T) {
 		state:    &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 2), LatestDurable: reported(t, 3)},
 		wantCode: codes.FailedPrecondition,
 	}, {
-		name: "a snapshot no node holds cannot be reported durable",
+		name: "the assigned node completes an upload recorded on no node",
 		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
 			localOnly(2, reportNode),
 			withDurable(t, 3, "", pending),
 		}},
+		state: &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 2), LatestDurable: reported(t, 3)},
+		want: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
+			localOnly(2, reportNode),
+			withDurable(t, 3, "", completed),
+		}},
+	}, {
+		name: "another node cannot complete an upload recorded on no node",
+		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportOther, Snapshots: []*ateapipb.Snapshot{
+			localOnly(2, reportNode),
+			withDurable(t, 3, "", pending),
+		}},
 		state:    &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 2), LatestDurable: reported(t, 3)},
+		wantCode: codes.FailedPrecondition,
+	}, {
+		name: "an upload of a recorded snapshot with no upload location is refused",
+		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
+			localOnly(2, reportNode),
+			localOnly(3, reportNode),
+		}},
+		state:    &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 3), Uploading: reported(t, 2)},
 		wantCode: codes.FailedPrecondition,
 	}, {
 		name: "another node's snapshot cannot be reported as local",
@@ -330,38 +343,9 @@ func TestApplyActorSnapshotState(t *testing.T) {
 		state:    &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 2), LatestDurable: reportedAt(t, 2, ownedURI(t, reportActorUID, 9))},
 		wantCode: codes.InvalidArgument,
 	}, {
-		name: "uri in another bucket is refused",
-		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
-			localOnly(2, reportNode),
-		}},
-		state:    &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 2), LatestDurable: reportedAt(t, 2, elsewhere.String())},
-		wantCode: codes.InvalidArgument,
-	}, {
-		name: "uri under another actor's prefix is refused",
-		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
-			localOnly(2, reportNode),
-		}},
-		state:    &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 2), LatestDurable: reportedAt(t, 2, ownedURI(t, otherActor, 2))},
-		wantCode: codes.InvalidArgument,
-	}, {
-		name: "uri naming another snapshot is refused",
-		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
-			localOnly(2, reportNode),
-		}},
-		state:    &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 2), LatestDurable: reportedAt(t, 2, ownedURI(t, reportActorUID, 3))},
-		wantCode: codes.InvalidArgument,
-	}, {
-		name: "a report needing the template's location is refused when the template is gone",
-		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
-			localOnly(2, reportNode),
-		}},
-		state:      &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 2), LatestDurable: reported(t, 2)},
-		noTemplate: true,
-		wantCode:   codes.FailedPrecondition,
-	}, {
 		name: "detach releases a suspended actor from the node",
 		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
-			localOnly(2, reportNode),
+			withDurable(t, 2, reportNode, pending),
 		}},
 		state: &ateapipb.ActorSnapshotState{LatestDurable: reported(t, 2)},
 		want: &ateapipb.ActorStatus{State: suspended, Snapshots: []*ateapipb.Snapshot{
@@ -430,14 +414,7 @@ func TestApplyActorSnapshotState(t *testing.T) {
 	}}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			expectedURI := func(uuid string) (string, error) {
-				if tt.noTemplate {
-					return "", apierror.FailedPrecondition("template gone")
-				}
-				uri, err := resources.NewActorSnapshotURI("gs://snapshots", reportAtespace, reportActorUID, uuid)
-				return uri.String(), err
-			}
-			err := applyActorSnapshotState(tt.status, reportNode, tt.state, expectedURI)
+			err := applyActorSnapshotState(tt.status, reportNode, tt.state)
 			if tt.wantCode != codes.OK {
 				if got := apierror.Code(err); got != tt.wantCode {
 					t.Fatalf("applyActorSnapshotState() error = %v, want code %v", err, tt.wantCode)
@@ -478,7 +455,11 @@ func TestApplyReportedSnapshotState(t *testing.T) {
 		s.LastAssignedGeneration = 2
 		s.Snapshots = []*ateapipb.Snapshot{
 			newDurableSnapshot(1, ateapipb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR, ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, "", old.Name(), old.String(), ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED),
-			localOnly(2, reportNode),
+			func() *ateapipb.Snapshot {
+				snap := newDurableSnapshot(2, ateapipb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR, ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, "", paused.Name(), paused.String(), ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_PENDING)
+				snap.Locality = reportNode
+				return snap
+			}(),
 		}
 	})
 	uploaded := reportedAt(t, 2, paused.String())
@@ -528,6 +509,7 @@ func TestApplyReportedSnapshotState(t *testing.T) {
 		Generation: 2,
 		Locality:   reportNode,
 		Fidelity:   ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
+		Owner:      ateapipb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR,
 		DurableSnapshot: &ateapipb.SnapshotStorage{
 			Status: ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED,
 			Object: &ateapipb.ObjectSnapshot{SnapshotUri: paused.String()},
@@ -538,41 +520,5 @@ func TestApplyReportedSnapshotState(t *testing.T) {
 	}
 	if left := objects.Prefix(t, old.Prefix()); len(left) != 0 {
 		t.Errorf("replaced durable snapshot still holds %v, want it released", left)
-	}
-}
-
-// fakeTemplates returns tmpl, or err when set.
-type fakeTemplates struct {
-	tmpl *ateapipb.ActorTemplate
-	err  error
-}
-
-func (f fakeTemplates) GetActorTemplate(context.Context, resources.ActorTemplateRef) (*ateapipb.ActorTemplate, error) {
-	return f.tmpl, f.err
-}
-
-// A missing template refuses the report for good. Any other failure to read
-// it is returned as is, so atelet retries.
-func TestExpectedSnapshotURI(t *testing.T) {
-	ctx := context.Background()
-	actor := &ateapipb.Actor{
-		Metadata:      &ateapipb.ResourceMetadata{Atespace: reportAtespace, Name: "actor-1", Uid: reportActorUID},
-		ActorTemplate: &ateapipb.ObjectRef{Atespace: reportAtespace, Name: "tmpl"},
-	}
-	tmpl := &ateapipb.ActorTemplate{SnapshotConfig: &ateapipb.SnapshotConfig{StorageLocation: "gs://snapshots"}}
-
-	got, err := expectedSnapshotURI(ctx, fakeTemplates{tmpl: tmpl}, actor, snapName(2))
-	if err != nil {
-		t.Fatalf("expectedSnapshotURI() failed: %v", err)
-	}
-	if want := ownedURI(t, reportActorUID, 2); got != want {
-		t.Errorf("expectedSnapshotURI() = %q, want %q", got, want)
-	}
-	if _, err := expectedSnapshotURI(ctx, fakeTemplates{err: store.ErrNotFound}, actor, snapName(2)); apierror.Code(err) != codes.FailedPrecondition {
-		t.Errorf("missing template: error = %v, want FailedPrecondition", err)
-	}
-	blip := errors.New("connection reset")
-	if _, err := expectedSnapshotURI(ctx, fakeTemplates{err: blip}, actor, snapName(2)); !errors.Is(err, blip) || apierror.Code(err) == codes.FailedPrecondition {
-		t.Errorf("store failure: error = %v, want it returned as is", err)
 	}
 }

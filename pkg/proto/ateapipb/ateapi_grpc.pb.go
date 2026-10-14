@@ -1888,7 +1888,10 @@ type WorkerServiceClient interface {
 	// one. Returns ABORTED while another operation holds the Actor; retry.
 	// Returns NOT_FOUND once the Actor is gone or no longer on the caller's
 	// node, including after a detach the control plane already recorded; stop
-	// reporting it.
+	// reporting it. Returns FAILED_PRECONDITION when the report disagrees with
+	// the control plane's record of the Actor's snapshots, and INVALID_ARGUMENT
+	// when an upload went somewhere other than its recorded URI. Retrying the
+	// same state gets the same answer: report again only once the state changes.
 	ReportActorSnapshotState(ctx context.Context, in *ReportActorSnapshotStateRequest, opts ...grpc.CallOption) (*ReportActorSnapshotStateResponse, error)
 }
 
@@ -1997,7 +2000,10 @@ type WorkerServiceServer interface {
 	// one. Returns ABORTED while another operation holds the Actor; retry.
 	// Returns NOT_FOUND once the Actor is gone or no longer on the caller's
 	// node, including after a detach the control plane already recorded; stop
-	// reporting it.
+	// reporting it. Returns FAILED_PRECONDITION when the report disagrees with
+	// the control plane's record of the Actor's snapshots, and INVALID_ARGUMENT
+	// when an upload went somewhere other than its recorded URI. Retrying the
+	// same state gets the same answer: report again only once the state changes.
 	ReportActorSnapshotState(context.Context, *ReportActorSnapshotStateRequest) (*ReportActorSnapshotStateResponse, error)
 	mustEmbedUnimplementedWorkerServiceServer()
 }
