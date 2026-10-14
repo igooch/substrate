@@ -70,9 +70,9 @@ func (w *ActorWorkflow) ApplyReportedSnapshotState(ctx context.Context, actorRef
 	}
 
 	// A snapshot with no durable location recorded, such as a paused actor's,
-	// is uploaded where suspend would put it. The template cannot move it:
-	// UpdateActor replaces a template only while the actor is SUSPENDED, and a
-	// paused actor is PAUSED.
+	// is uploaded where suspend would put it. That location cannot change:
+	// templates cannot be edited, and UpdateActor switches an actor to another
+	// template only while it is SUSPENDED, never while it is PAUSED.
 	expectedURI := func(uuid string) (string, error) {
 		return expectedSnapshotURI(leaseCtx, w.store, before, uuid)
 	}
