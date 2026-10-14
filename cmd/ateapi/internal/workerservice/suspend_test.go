@@ -78,7 +78,7 @@ func TestRequestActorSuspend(t *testing.T) {
 		Metadata: actor.GetMetadata(),
 		Status:   &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED},
 	}
-	suspender := &fakeSuspender{resp: &ateapipb.SuspendActorResponse{Actor: suspended}}
+	suspender := &fakeControl{resp: &ateapipb.SuspendActorResponse{Actor: suspended}}
 	s := New(st, suspender, testAteletSPIFFEID, nil)
 
 	got, err := s.RequestActorSuspend(
@@ -126,7 +126,7 @@ func TestRequestActorSuspend_OnlyForHostedActors(t *testing.T) {
 			defer cleanup()
 			seedReportedWorker(t, st, testNode, &ateapipb.WorkerResources{Actors: 1})
 			actor := seedHostedActor(t, st, tc.assignedWorker)
-			suspender := &fakeSuspender{}
+			suspender := &fakeControl{}
 			s := New(st, suspender, testAteletSPIFFEID, nil)
 
 			uid := tc.requestedUID
@@ -152,7 +152,7 @@ func TestRequestActorSuspend_Errors(t *testing.T) {
 	seedReportedWorker(t, st, testNode, &ateapipb.WorkerResources{Actors: 1})
 	actor := seedHostedActor(t, st, testWorkerName)
 	uid := actor.GetMetadata().GetUid()
-	suspender := &fakeSuspender{}
+	suspender := &fakeControl{}
 	s := New(st, suspender, testAteletSPIFFEID, nil)
 	authed := ateletauthtest.ContextWith(ateletauthtest.CertOn(t, testNode))
 
@@ -231,7 +231,7 @@ func TestRequestActorSuspend_GoldenActorCannotSelfSuspend(t *testing.T) {
 			},
 		},
 	})
-	suspender := &fakeSuspender{}
+	suspender := &fakeControl{}
 	s := New(st, suspender, testAteletSPIFFEID, nil)
 
 	// Everything else about the request is in order: the Worker really does
@@ -259,7 +259,7 @@ func TestRequestActorSuspend_PassesThroughTheWorkflowsRefusal(t *testing.T) {
 	defer cleanup()
 	seedReportedWorker(t, st, testNode, &ateapipb.WorkerResources{Actors: 1})
 	actor := seedHostedActor(t, st, testWorkerName)
-	suspender := &fakeSuspender{err: apierror.FailedPrecondition("Actor is RESUMING")}
+	suspender := &fakeControl{err: apierror.FailedPrecondition("Actor is RESUMING")}
 	s := New(st, suspender, testAteletSPIFFEID, nil)
 
 	_, err := s.RequestActorSuspend(

@@ -35,10 +35,10 @@ const (
 // certificates from ateletauthtest carry.
 var testAteletSPIFFEID = installdefaults.SPIFFEID(installdefaults.SystemNamespace, installdefaults.AteletServiceAccount)
 
-// fakeSuspender stands in for the Control service. What it records is the
-// point of most of the suspend tests: whether the request reached the suspend
-// at all.
-type fakeSuspender struct {
+// fakeControl stands in for the Control service. It records each suspend and
+// snapshot state report that reaches it, which is the point of most tests in
+// this package: whether the request got that far.
+type fakeControl struct {
 	calls []*ateapipb.SuspendActorRequest
 	resp  *ateapipb.SuspendActorResponse
 	err   error
@@ -47,12 +47,12 @@ type fakeSuspender struct {
 	reportErr error
 }
 
-func (f *fakeSuspender) SuspendActor(_ context.Context, req *ateapipb.SuspendActorRequest) (*ateapipb.SuspendActorResponse, error) {
+func (f *fakeControl) SuspendActor(_ context.Context, req *ateapipb.SuspendActorRequest) (*ateapipb.SuspendActorResponse, error) {
 	f.calls = append(f.calls, req)
 	return f.resp, f.err
 }
 
-func (f *fakeSuspender) ApplyActorSnapshotState(_ context.Context, actorRef resources.ActorRef, actorUID, node string, state *ateapipb.ActorSnapshotState) error {
+func (f *fakeControl) ApplyActorSnapshotState(_ context.Context, actorRef resources.ActorRef, actorUID, node string, state *ateapipb.ActorSnapshotState) error {
 	f.reports = append(f.reports, appliedReport{actorRef: actorRef, actorUID: actorUID, node: node, state: state})
 	return f.reportErr
 }

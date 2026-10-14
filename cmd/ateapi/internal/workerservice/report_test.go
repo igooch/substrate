@@ -49,7 +49,7 @@ func reportRequest() *ateapipb.ReportActorSnapshotStateRequest {
 // certificate proved, not anything the request claims. The handler reads no
 // store state of its own: the control plane checks the actor under its lease.
 func TestReportActorSnapshotState(t *testing.T) {
-	control := &fakeSuspender{}
+	control := &fakeControl{}
 	s := New(nil, control, testAteletSPIFFEID, nil)
 
 	req := reportRequest()
@@ -92,7 +92,7 @@ func TestReportActorSnapshotState_Refused(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			control := &fakeSuspender{reportErr: tt.controlErr}
+			control := &fakeControl{reportErr: tt.controlErr}
 			s := New(nil, control, testAteletSPIFFEID, nil)
 			_, err := s.ReportActorSnapshotState(tt.ctx, tt.req)
 			if got := apierror.Code(err); got != tt.want {

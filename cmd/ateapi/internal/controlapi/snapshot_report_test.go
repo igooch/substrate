@@ -16,6 +16,7 @@ package controlapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -23,6 +24,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/testing/protocmp"
 
+	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/storetest"
 	"github.com/agent-substrate/substrate/internal/apierror"
 	"github.com/agent-substrate/substrate/internal/objectstore/objectstoretest"
@@ -53,7 +55,7 @@ func ownedURI(t *testing.T, actorUID string, gen int32) string {
 // localOnly is a Snapshot entry as pause records it: a local checkpoint on
 // locality, with no durable copy.
 func localOnly(gen int32, locality string) *ateapipb.Snapshot {
-	return &ateapipb.Snapshot{Uuid: snapName(gen), Generation: gen, Locality: locality}
+	return &ateapipb.Snapshot{Uuid: snapName(gen), Generation: gen, Locality: locality, Fidelity: ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY}
 }
 
 // withDurable is a Snapshot entry with a durable copy at storage status.
@@ -182,11 +184,11 @@ func TestApplyActorSnapshotState(t *testing.T) {
 		}},
 	}, {
 		name: "stale durable report is a no-op",
-		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
+		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, LastAssignedGeneration: 3, Snapshots: []*ateapipb.Snapshot{
 			withDurable(t, 3, reportNode, completed),
 		}},
 		state: &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 3), LatestDurable: reported(t, 2)},
-		want: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
+		want: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, LastAssignedGeneration: 3, Snapshots: []*ateapipb.Snapshot{
 			withDurable(t, 3, reportNode, completed),
 		}},
 	}, {
@@ -207,6 +209,82 @@ func TestApplyActorSnapshotState(t *testing.T) {
 		want: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
 			localOnly(3, reportNode),
 		}},
+	}, {
+		name: "upload of a generation a revert discarded is a no-op",
+		status: &ateapipb.ActorStatus{State: suspended, LastAssignedGeneration: 3, Snapshots: []*ateapipb.Snapshot{
+			withDurable(t, 2, "", completed),
+		}},
+		state: &ateapipb.ActorSnapshotState{LatestDurable: reported(t, 3)},
+		want: &ateapipb.ActorStatus{State: suspended, LastAssignedGeneration: 3, Snapshots: []*ateapipb.Snapshot{
+			withDurable(t, 2, "", completed),
+		}},
+	}, {
+		name: "upload records the fidelity the manifest reports",
+		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
+			localOnly(2, reportNode),
+		}},
+		state: &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 2), LatestDurable: func() *ateapipb.SnapshotReport {
+			r := reported(t, 2)
+			r.Fidelity = ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS
+			return r
+		}()},
+		want: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
+			func() *ateapipb.Snapshot {
+				snap := withDurable(t, 2, reportNode, completed)
+				snap.Fidelity = ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS
+				return snap
+			}(),
+		}},
+	}, {
+		name: "another node's snapshot cannot be reported durable",
+		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportOther, Snapshots: []*ateapipb.Snapshot{
+			localOnly(2, reportNode),
+			localOnly(3, reportOther),
+		}},
+		state:    &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 2), LatestDurable: reported(t, 3)},
+		wantCode: codes.FailedPrecondition,
+	}, {
+		name: "a snapshot no node holds cannot be reported durable",
+		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
+			localOnly(2, reportNode),
+			withDurable(t, 3, "", pending),
+		}},
+		state:    &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 2), LatestDurable: reported(t, 3)},
+		wantCode: codes.FailedPrecondition,
+	}, {
+		name: "another node's snapshot cannot be reported as local",
+		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportOther, Snapshots: []*ateapipb.Snapshot{
+			localOnly(2, reportNode),
+			localOnly(3, reportOther),
+		}},
+		state:    &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 3)},
+		wantCode: codes.FailedPrecondition,
+	}, {
+		name: "another node's snapshot cannot be reported as uploading",
+		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportOther, Snapshots: []*ateapipb.Snapshot{
+			localOnly(2, reportNode),
+			localOnly(3, reportOther),
+		}},
+		state:    &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 2), Uploading: reported(t, 3)},
+		wantCode: codes.FailedPrecondition,
+	}, {
+		name: "a duplicate with the wrong uri is refused",
+		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
+			withDurable(t, 2, reportNode, completed),
+		}},
+		state:    &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 2), LatestDurable: reportedAt(t, 2, elsewhere.String())},
+		wantCode: codes.InvalidArgument,
+	}, {
+		name: "a duplicate with the wrong uuid is refused",
+		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
+			withDurable(t, 2, reportNode, completed),
+		}},
+		state: &ateapipb.ActorSnapshotState{LatestDurable: func() *ateapipb.SnapshotReport {
+			r := reported(t, 2)
+			r.Uuid = "other"
+			return r
+		}()},
+		wantCode: codes.FailedPrecondition,
 	}, {
 		name: "unknown durable generation is refused",
 		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
@@ -449,6 +527,7 @@ func TestApplyReportedSnapshotState(t *testing.T) {
 		Uuid:       "snap-2",
 		Generation: 2,
 		Locality:   reportNode,
+		Fidelity:   ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
 		DurableSnapshot: &ateapipb.SnapshotStorage{
 			Status: ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED,
 			Object: &ateapipb.ObjectSnapshot{SnapshotUri: paused.String()},
@@ -459,5 +538,41 @@ func TestApplyReportedSnapshotState(t *testing.T) {
 	}
 	if left := objects.Prefix(t, old.Prefix()); len(left) != 0 {
 		t.Errorf("replaced durable snapshot still holds %v, want it released", left)
+	}
+}
+
+// fakeTemplates returns tmpl, or err when set.
+type fakeTemplates struct {
+	tmpl *ateapipb.ActorTemplate
+	err  error
+}
+
+func (f fakeTemplates) GetActorTemplate(context.Context, resources.ActorTemplateRef) (*ateapipb.ActorTemplate, error) {
+	return f.tmpl, f.err
+}
+
+// A missing template refuses the report for good. Any other failure to read
+// it is returned as is, so atelet retries.
+func TestExpectedSnapshotURI(t *testing.T) {
+	ctx := context.Background()
+	actor := &ateapipb.Actor{
+		Metadata:      &ateapipb.ResourceMetadata{Atespace: reportAtespace, Name: "actor-1", Uid: reportActorUID},
+		ActorTemplate: &ateapipb.ObjectRef{Atespace: reportAtespace, Name: "tmpl"},
+	}
+	tmpl := &ateapipb.ActorTemplate{SnapshotConfig: &ateapipb.SnapshotConfig{StorageLocation: "gs://snapshots"}}
+
+	got, err := expectedSnapshotURI(ctx, fakeTemplates{tmpl: tmpl}, actor, snapName(2))
+	if err != nil {
+		t.Fatalf("expectedSnapshotURI() failed: %v", err)
+	}
+	if want := ownedURI(t, reportActorUID, 2); got != want {
+		t.Errorf("expectedSnapshotURI() = %q, want %q", got, want)
+	}
+	if _, err := expectedSnapshotURI(ctx, fakeTemplates{err: store.ErrNotFound}, actor, snapName(2)); apierror.Code(err) != codes.FailedPrecondition {
+		t.Errorf("missing template: error = %v, want FailedPrecondition", err)
+	}
+	blip := errors.New("connection reset")
+	if _, err := expectedSnapshotURI(ctx, fakeTemplates{err: blip}, actor, snapName(2)); !errors.Is(err, blip) || apierror.Code(err) == codes.FailedPrecondition {
+		t.Errorf("store failure: error = %v, want it returned as is", err)
 	}
 }
