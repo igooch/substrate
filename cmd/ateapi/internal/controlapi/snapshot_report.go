@@ -19,8 +19,6 @@ import (
 	"errors"
 	"log/slog"
 
-	"google.golang.org/protobuf/proto"
-
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/internal/apierror"
 	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
@@ -55,21 +53,39 @@ func (w *ActorWorkflow) ApplyReportedSnapshotState(ctx context.Context, actorRef
 	}
 	// Every refusal is NotFound, so an atelet learns nothing about Actors on
 	// other nodes.
-	if before.GetMetadata().GetUid() != actorUID || !actorOnNode(before, node) {
-		slog.WarnContext(ctx, "Refusing a snapshot state report for an actor not on the caller's node",
+	if got := before.GetMetadata().GetUid(); got != actorUID {
+		slog.WarnContext(ctx, "Refusing a snapshot state report naming a stale actor incarnation",
 			slog.Any("actor", actorRef),
 			slog.String("requested_uid", actorUID),
+			slog.String("actual_uid", got),
 			slog.String("caller_node", node))
 		return apierror.NotFound("Actor %s not found", actorRef)
 	}
+	if !actorOnNode(before, node) {
+		slog.WarnContext(ctx, "Refusing a snapshot state report for an actor not on the caller's node",
+			slog.Any("actor", actorRef),
+			slog.String("caller_node", node),
+			slog.String("assigned_node", before.GetStatus().GetAssignedNode()))
+		return apierror.NotFound("Actor %s not found", actorRef)
+	}
 
-	// Apply to a copy first, so a refused report returns its own error rather
-	// than one wrapped by the store.
-	if err := applyActorSnapshotState(proto.Clone(before).(*ateapipb.Actor).GetStatus(), node, state); err != nil {
-		return err
+	// A snapshot with no durable location recorded, such as a paused actor's,
+	// is uploaded where suspend would put it. The template cannot move it: a
+	// template is replaced only while the actor is suspended, and the
+	// replacement keeps the actor's snapshot location.
+	expectedURI := func(uuid string) (string, error) {
+		tmpl, err := resolveActorTemplate(leaseCtx, w.store, before)
+		if err != nil {
+			return "", apierror.FailedPrecondition("while resolving the template of actor %s: %v", actorRef, err)
+		}
+		uri, err := newInProgressSnapshotURI(tmpl, before, uuid)
+		if err != nil {
+			return "", apierror.FailedPrecondition("%v", err)
+		}
+		return uri.String(), nil
 	}
 	after, err := w.store.UpdateActor(leaseCtx, actorRef, store.PreconditionFrom(before), func(toUpdate *ateapipb.Actor) error {
-		return applyActorSnapshotState(toUpdate.GetStatus(), node, state)
+		return applyActorSnapshotState(toUpdate.GetStatus(), node, state, expectedURI)
 	})
 	if err != nil {
 		if errors.Is(err, store.ErrVersionConflict) {
@@ -84,6 +100,24 @@ func (w *ActorWorkflow) ApplyReportedSnapshotState(ctx context.Context, actorRef
 			slog.String("err", err.Error()))
 	}
 	return nil
+}
+
+// releaseView carries the parts of state releaseStaleSnapshots reads.
+func releaseView(state *ateapipb.ActorSnapshotState) *ateletpb.ActorSnapshotState {
+	view := func(r *ateapipb.SnapshotReport) *ateletpb.SnapshotReport {
+		if r == nil {
+			return nil
+		}
+		return &ateletpb.SnapshotReport{Snapshot: &ateletpb.Snapshot{
+			SnapshotUuid: r.GetUuid(),
+			Generation:   r.GetGeneration(),
+			Object:       &ateletpb.ObjectStorage{SnapshotUri: r.GetObject().GetSnapshotUri()},
+		}}
+	}
+	return &ateletpb.ActorSnapshotState{
+		Uploading:     view(state.GetUploading()),
+		LatestDurable: view(state.GetLatestDurable()),
+	}
 }
 
 // actorOnNode reports whether the Actor is placed on node, or holds a local
@@ -101,23 +135,50 @@ func actorOnNode(actor *ateapipb.Actor, node string) bool {
 }
 
 // applyActorSnapshotState updates status to match the snapshot state the
-// atelet on node reports.
-func applyActorSnapshotState(status *ateapipb.ActorStatus, node string, state *ateapipb.ActorSnapshotState) error {
-	if err := applyLatestDurable(status, state.GetLatestDurable()); err != nil {
+// atelet on node reports. expectedURI says where a snapshot with no durable
+// location recorded is uploaded.
+func applyActorSnapshotState(status *ateapipb.ActorStatus, node string, state *ateapipb.ActorSnapshotState, expectedURI func(uuid string) (string, error)) error {
+	if err := checkReportedLocal(status, state); err != nil {
 		return err
 	}
-	if state.GetLatestLocal() == nil {
-		return applyDetach(status, node)
+	if err := applyLatestDurable(status, state.GetLatestDurable(), expectedURI); err != nil {
+		return err
 	}
-	dropUnlistedLocalSnapshots(status, node, state)
-	pruneSnapshots(status, findLatestLocalSnapshot(status))
+	// atelet holds nothing locally once it has detached. A report with an
+	// upload still in flight is not a detach, even with no latest_local.
+	if state.GetLatestLocal() == nil && state.GetUploading() == nil {
+		if err := applyDetach(status, node); err != nil {
+			return err
+		}
+	} else {
+		dropUnlistedLocalSnapshots(status, node, state)
+	}
+	pruneReportedSnapshots(status)
 	return nil
 }
 
-// applyLatestDurable marks the reported durable snapshot COMPLETED. A report
-// no newer than what is recorded changes nothing: it is a duplicate, or was
-// overtaken by a later one.
-func applyLatestDurable(status *ateapipb.ActorStatus, reported *ateapipb.SnapshotReport) error {
+// checkReportedLocal refuses a report naming a local snapshot the control plane
+// does not record. An upload of a snapshot the record has since dropped is
+// allowed: pause drops an older local snapshot while atelet still uploads it.
+func checkReportedLocal(status *ateapipb.ActorStatus, state *ateapipb.ActorSnapshotState) error {
+	if local := state.GetLatestLocal(); local != nil {
+		if snap := findSnapshotByGeneration(status.GetSnapshots(), local.GetGeneration()); snap == nil || snap.GetUuid() != local.GetUuid() {
+			return apierror.FailedPrecondition("local snapshot generation %d (%s) is not recorded for this actor", local.GetGeneration(), local.GetUuid())
+		}
+	}
+	if up := state.GetUploading(); up != nil {
+		if snap := findSnapshotByGeneration(status.GetSnapshots(), up.GetGeneration()); snap != nil && snap.GetUuid() != up.GetUuid() {
+			return apierror.FailedPrecondition("uploading snapshot generation %d (%s) does not match the recorded %s", up.GetGeneration(), up.GetUuid(), snap.GetUuid())
+		}
+	}
+	return nil
+}
+
+// applyLatestDurable records the reported durable snapshot as COMPLETED. A
+// report no newer than what is recorded changes nothing: it is a duplicate, or
+// was overtaken by a later one. So does an upload of a generation the record
+// has since moved past; actor deletion collects its objects.
+func applyLatestDurable(status *ateapipb.ActorStatus, reported *ateapipb.SnapshotReport, expectedURI func(uuid string) (string, error)) error {
 	if reported == nil {
 		return nil
 	}
@@ -126,17 +187,26 @@ func applyLatestDurable(status *ateapipb.ActorStatus, reported *ateapipb.Snapsho
 		return nil
 	}
 	snap := findSnapshotByGeneration(status.GetSnapshots(), reported.GetGeneration())
+	if snap == nil && reported.GetGeneration() < status.GetLastAssignedGeneration() {
+		return nil
+	}
 	if snap == nil || snap.GetUuid() != reported.GetUuid() {
 		return apierror.FailedPrecondition("snapshot generation %d (%s) is not recorded for this actor", reported.GetGeneration(), reported.GetUuid())
 	}
-	recorded := snap.GetDurableSnapshot().GetObject().GetSnapshotUri()
-	if recorded == "" {
-		return apierror.FailedPrecondition("snapshot generation %d has no durable location recorded", reported.GetGeneration())
+	want := snap.GetDurableSnapshot().GetObject().GetSnapshotUri()
+	if want == "" {
+		var err error
+		if want, err = expectedURI(reported.GetUuid()); err != nil {
+			return err
+		}
 	}
-	if got := reported.GetObject().GetSnapshotUri(); got != recorded {
-		return apierror.InvalidArgument("snapshot generation %d was uploaded to %q, want %q", reported.GetGeneration(), got, recorded)
+	if got := reported.GetObject().GetSnapshotUri(); got != want {
+		return apierror.InvalidArgument("snapshot generation %d was uploaded to %q, want %q", reported.GetGeneration(), got, want)
 	}
-	snap.DurableSnapshot.Status = ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED
+	snap.DurableSnapshot = &ateapipb.SnapshotStorage{
+		Status: ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED,
+		Object: &ateapipb.ObjectSnapshot{SnapshotUri: want},
+	}
 	return nil
 }
 
@@ -162,18 +232,20 @@ func applyDetach(status *ateapipb.ActorStatus, node string) error {
 			status.AssignedNode = ""
 		}
 	}
-	pruneSnapshots(status, findLatestLocalSnapshot(status))
 	return nil
 }
 
 // dropUnlistedLocalSnapshots clears the locality of older snapshots on node
 // that atelet no longer lists: it has deleted them and will never upload them.
 func dropUnlistedLocalSnapshots(status *ateapipb.ActorStatus, node string, state *ateapipb.ActorSnapshotState) {
-	listed := map[string]bool{state.GetLatestLocal().GetUuid(): true}
-	if up := state.GetUploading(); up != nil {
-		listed[up.GetUuid()] = true
+	listed := map[string]bool{}
+	var newest int32
+	for _, r := range []*ateapipb.SnapshotReport{state.GetLatestLocal(), state.GetUploading()} {
+		if r != nil {
+			listed[r.GetUuid()] = true
+			newest = max(newest, r.GetGeneration())
+		}
 	}
-	newest := state.GetLatestLocal().GetGeneration()
 	for _, snap := range status.GetSnapshots() {
 		if snap.GetLocality() == node && !listed[snap.GetUuid()] && snap.GetGeneration() < newest {
 			snap.Locality = ""
@@ -181,20 +253,21 @@ func dropUnlistedLocalSnapshots(status *ateapipb.ActorStatus, node string, state
 	}
 }
 
-// releaseView carries the parts of state releaseStaleSnapshots reads.
-func releaseView(state *ateapipb.ActorSnapshotState) *ateletpb.ActorSnapshotState {
-	view := func(r *ateapipb.SnapshotReport) *ateletpb.SnapshotReport {
-		if r == nil {
-			return nil
+// pruneReportedSnapshots drops the entries a report has made useless: a
+// COMPLETED durable snapshot older than the latest one, and a local-only
+// snapshot no node holds anymore. It keeps every snapshot a node holds, every
+// pending upload, and the newest generation, which a workflow may still be
+// filling in. Unlike pruneSnapshots, it touches no locality: a report speaks
+// only for its own node.
+func pruneReportedSnapshots(status *ateapipb.ActorStatus) {
+	latestDurable := findLatestDurableSnapshot(status, ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED)
+	kept := status.Snapshots[:0]
+	for _, snap := range status.Snapshots {
+		superseded := snap.GetDurableSnapshot().GetStatus() == ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED && snap != latestDurable
+		unheld := snap.GetDurableSnapshot() == nil && snap.GetLocality() == ""
+		if snap.GetLocality() != "" || snap.GetGeneration() == status.GetLastAssignedGeneration() || !(superseded || unheld) {
+			kept = append(kept, snap)
 		}
-		return &ateletpb.SnapshotReport{Snapshot: &ateletpb.Snapshot{
-			SnapshotUuid: r.GetUuid(),
-			Generation:   r.GetGeneration(),
-			Object:       &ateletpb.ObjectStorage{SnapshotUri: r.GetObject().GetSnapshotUri()},
-		}}
 	}
-	return &ateletpb.ActorSnapshotState{
-		Uploading:     view(state.GetUploading()),
-		LatestDurable: view(state.GetLatestDurable()),
-	}
+	status.Snapshots = kept
 }
