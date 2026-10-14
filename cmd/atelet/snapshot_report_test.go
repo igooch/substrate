@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -205,4 +206,51 @@ func TestTrackerDoesNotReportUnnamedActor(t *testing.T) {
 	if got := reporter.reports(); len(got) != 0 {
 		t.Errorf("reports = %v, want none for an unnamed actor", got)
 	}
+}
+
+// A change made before atelet can reach the control plane is reported once it
+// can.
+func TestTrackerReportsOnceReporterIsSet(t *testing.T) {
+	store := newFakeSnapshotStore()
+	store.setBlocking(true)
+	tr := newTestTracker(t, store)
+	tr.identify(trackedActorUID, "ate-demo", "counter")
+	tr.commitLocal(trackedActorUID, testRef("s1", 1, tr.clock.Now()))
+	uploadNow(t, tr, store, nil)
+
+	reporter := &fakeReporter{}
+	tr.setReporter(reporter)
+	eventually(t, "the upload is reported", func() bool { return len(reporter.reports()) == 1 })
+	if got := reporter.reports()[0].GetState().GetLatestDurable().GetUuid(); got != "s1" {
+		t.Errorf("latest_durable = %q, want s1", got)
+	}
+}
+
+// A report atelet owed when it stopped is sent by the next atelet.
+func TestTrackerReportsOwedAfterRestart(t *testing.T) {
+	store := newFakeSnapshotStore()
+	store.setBlocking(true)
+	tr := newTestTracker(t, store)
+	tr.identify(trackedActorUID, "ate-demo", "counter")
+	tr.commitLocal(trackedActorUID, testRef("s1", 1, tr.clock.Now()))
+	uploadNow(t, tr, store, nil)
+
+	restarted := newTestTrackerOnNode(t, newFakeSnapshotStore())
+	if err := restarted.load(); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	restarted.start()
+	reporter := &fakeReporter{}
+	restarted.setReporter(reporter)
+	eventually(t, "the owed report is sent", func() bool { return len(reporter.reports()) == 1 })
+	got := reporter.reports()[0]
+	if got.GetActor().GetName() != "counter" || got.GetState().GetLatestDurable().GetUuid() != "s1" {
+		t.Errorf("report = %v, want counter with s1 durable", got)
+	}
+
+	// Once sent, nothing is owed: a third atelet reports nothing.
+	eventually(t, "the sent report is no longer owed", func() bool {
+		data, err := os.ReadFile(ateletpath.ActorSnapshotStateFile(trackedActorUID))
+		return err == nil && !strings.Contains(string(data), "reportOwed")
+	})
 }

@@ -53,7 +53,13 @@ func (w *ActorWorkflow) ApplyReportedSnapshotState(ctx context.Context, actorRef
 		}
 		return err
 	}
+	// Every refusal is NotFound, so an atelet learns nothing about Actors on
+	// other nodes.
 	if before.GetMetadata().GetUid() != actorUID || !actorOnNode(before, node) {
+		slog.WarnContext(ctx, "Refusing a snapshot state report for an actor not on the caller's node",
+			slog.Any("actor", actorRef),
+			slog.String("requested_uid", actorUID),
+			slog.String("caller_node", node))
 		return apierror.NotFound("Actor %s not found", actorRef)
 	}
 

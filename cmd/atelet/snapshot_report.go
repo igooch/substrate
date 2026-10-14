@@ -38,13 +38,19 @@ type snapshotReporter interface {
 	ReportActorSnapshotState(ctx context.Context, in *ateapipb.ReportActorSnapshotStateRequest, opts ...grpc.CallOption) (*ateapipb.ReportActorSnapshotStateResponse, error)
 }
 
-// setReporter sets where the tracker reports actors' snapshot state. Until it
-// is set, nothing is reported; the next Checkpoint response carries the same
-// state.
+// setReporter sets where the tracker reports actors' snapshot state, and
+// starts reporting what is owed: changes made before it was set, and changes
+// a previous atelet never reported.
 func (t *snapshotTracker) setReporter(r snapshotReporter) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.reporter = r
+	for _, a := range t.actors {
+		if a.reportSent < a.reportWanted && !a.reporting {
+			a.reporting = true
+			t.workersDone.Go(func() { t.reportLoop(t.ctx, a) })
+		}
+	}
 }
 
 // identify records the actor's name, for reports about it.
@@ -60,15 +66,19 @@ func (t *snapshotTracker) identify(actorUID, atespace, actorName string) {
 
 // reportAsync reports the actor's state in the background, retrying until the
 // control plane accepts or refuses it. Each attempt sends the state as it is
-// then, so a report that a later change overtakes is never resent.
+// then, so a report that a later change overtakes is never resent. The owed
+// report is saved, so a restarted atelet sends it.
 func (t *snapshotTracker) reportAsync(a *actorSnapshots) {
 	t.mu.Lock()
 	a.reportWanted++
-	start := !a.reporting
-	a.reporting = true
+	t.saveLocked(a)
+	start := !a.reporting && t.reporter != nil
+	if start {
+		a.reporting = true
+	}
 	t.mu.Unlock()
 	if start {
-		go t.reportLoop(t.ctx, a)
+		t.workersDone.Go(func() { t.reportLoop(t.ctx, a) })
 	}
 }
 
@@ -76,7 +86,7 @@ func (t *snapshotTracker) reportLoop(ctx context.Context, a *actorSnapshots) {
 	delay := reportRetryDelay
 	for {
 		t.mu.Lock()
-		if t.actors[a.actorUID] != a || a.reportSent >= a.reportWanted || ctx.Err() != nil {
+		if t.actors[a.actorUID] != a || a.reportSent >= a.reportWanted || ctx.Err() != nil || t.reporter == nil {
 			a.reporting = false
 			t.mu.Unlock()
 			return
@@ -88,6 +98,9 @@ func (t *snapshotTracker) reportLoop(ctx context.Context, a *actorSnapshots) {
 			t.mu.Lock()
 			if want > a.reportSent {
 				a.reportSent = want
+				if a.reportSent >= a.reportWanted {
+					t.saveLocked(a)
+				}
 			}
 			t.mu.Unlock()
 			delay = reportRetryDelay
@@ -102,8 +115,7 @@ func (t *snapshotTracker) reportLoop(ctx context.Context, a *actorSnapshots) {
 }
 
 // reportOnce sends the actor's current state once. It reports whether to stop
-// trying: the control plane accepted the report, refused it for good, or there
-// is no one to report to.
+// trying: the control plane accepted the report or refused it for good.
 func (t *snapshotTracker) reportOnce(ctx context.Context, a *actorSnapshots) bool {
 	t.mu.Lock()
 	reporter := t.reporter
@@ -113,7 +125,12 @@ func (t *snapshotTracker) reportOnce(ctx context.Context, a *actorSnapshots) boo
 		State:    ateapiSnapshotState(t.stateLocked(a)),
 	}
 	t.mu.Unlock()
-	if reporter == nil || req.GetActor().GetName() == "" {
+	if reporter == nil {
+		return false
+	}
+	if req.GetActor().GetName() == "" {
+		// No Checkpoint or Restore named the actor, so the control plane
+		// could not find it.
 		return true
 	}
 

@@ -74,8 +74,11 @@ func (rec *snapshotRecord) ref() *snapshotRef {
 // part of actorSnapshots that outlives an atelet restart.
 type actorSnapshotsRecord struct {
 	// Atespace and ActorName name the actor in reports to the control plane.
-	Atespace           string          `json:"atespace,omitempty"`
-	ActorName          string          `json:"actorName,omitempty"`
+	Atespace  string `json:"atespace,omitempty"`
+	ActorName string `json:"actorName,omitempty"`
+	// ReportOwed is set while a change has not reached the control plane, so
+	// a restarted atelet reports it.
+	ReportOwed         bool            `json:"reportOwed,omitempty"`
 	Newest             *snapshotRecord `json:"newest,omitempty"`
 	NewestByCheckpoint bool            `json:"newestByCheckpoint,omitempty"`
 	LatestLocal        *snapshotRecord `json:"latestLocal,omitempty"`
@@ -93,6 +96,7 @@ func (a *actorSnapshots) record() *actorSnapshotsRecord {
 	return &actorSnapshotsRecord{
 		Atespace:           a.atespace,
 		ActorName:          a.actorName,
+		ReportOwed:         a.reportSent < a.reportWanted,
 		Newest:             recordOf(a.newest),
 		NewestByCheckpoint: a.newestByCheckpoint,
 		LatestLocal:        recordOf(a.latestLocal),
@@ -120,6 +124,9 @@ func (rec *actorSnapshotsRecord) actorSnapshots(actorUID string) *actorSnapshots
 		retryAt:            rec.RetryAt,
 		detachAt:           rec.DetachDue,
 		running:            rec.Running,
+	}
+	if rec.ReportOwed {
+		a.reportWanted = 1
 	}
 	if up := rec.Uploading.ref(); up != nil && !a.durable(up) {
 		if a.undurableSince.IsZero() || up.commitTime.Before(a.undurableSince) {

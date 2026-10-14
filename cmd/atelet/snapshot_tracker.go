@@ -336,7 +336,7 @@ type snapshotTracker struct {
 
 	// queue holds the UIDs of actors with background work scheduled.
 	queue workqueue.TypedDelayingInterface[string]
-	// workersDone counts the workers still running.
+	// workersDone counts the workers and report goroutines still running.
 	workersDone sync.WaitGroup
 
 	mu sync.Mutex
@@ -372,8 +372,8 @@ func (t *snapshotTracker) start() {
 	}
 }
 
-// wait blocks until the workers have stopped, after the tracker's context
-// ends.
+// wait blocks until the workers and report goroutines have stopped, after the
+// tracker's context ends.
 func (t *snapshotTracker) wait() {
 	t.workersDone.Wait()
 }

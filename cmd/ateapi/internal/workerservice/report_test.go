@@ -23,31 +23,14 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/ateletauth/ateletauthtest"
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/storetest"
 	"github.com/agent-substrate/substrate/internal/apierror"
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 )
 
-// seedPausedActor stores a PAUSED actor whose local snapshot is on node.
-func seedPausedActor(t *testing.T, st store.Interface, node string) *ateapipb.Actor {
-	t.Helper()
-	return storetest.MustCreateActor(t, context.Background(), st, &ateapipb.Actor{
-		Metadata: &ateapipb.ResourceMetadata{Atespace: suspendAtespace, Name: suspendActor},
-		Status: &ateapipb.ActorStatus{
-			State:        ateapipb.ActorState_ACTOR_STATE_PAUSED,
-			AssignedNode: node,
-			Snapshots: []*ateapipb.Snapshot{{
-				Uuid:       "snap-1",
-				Generation: 1,
-				Locality:   node,
-			}},
-		},
-	})
-}
+const reportActorUID = "5f2c1a90-7b34-4e6d-8a11-0c3e9d5b7f42"
 
-func reportRequest(actorUID string) *ateapipb.ReportActorSnapshotStateRequest {
+func reportRequest() *ateapipb.ReportActorSnapshotStateRequest {
 	durable := &ateapipb.SnapshotReport{
 		Uuid:            "snap-1",
 		Generation:      1,
@@ -57,21 +40,19 @@ func reportRequest(actorUID string) *ateapipb.ReportActorSnapshotStateRequest {
 	}
 	return &ateapipb.ReportActorSnapshotStateRequest{
 		Actor:    &ateapipb.ObjectRef{Atespace: suspendAtespace, Name: suspendActor},
-		ActorUid: actorUID,
+		ActorUid: reportActorUID,
 		State:    &ateapipb.ActorSnapshotState{LatestDurable: durable},
 	}
 }
 
-// A report from the actor's node reaches the control plane, tagged with the
-// node the caller's certificate proved, not anything the request claims.
+// A report reaches the control plane tagged with the node the caller's
+// certificate proved, not anything the request claims. The handler reads no
+// store state of its own: the control plane checks the actor under its lease.
 func TestReportActorSnapshotState(t *testing.T) {
-	st, cleanup := storetest.SetupTestStore(t)
-	defer cleanup()
-	actor := seedPausedActor(t, st, testNode)
 	control := &fakeSuspender{}
-	s := New(st, control, testAteletSPIFFEID, nil)
+	s := New(nil, control, testAteletSPIFFEID, nil)
 
-	req := reportRequest(actor.GetMetadata().GetUid())
+	req := reportRequest()
 	if _, err := s.ReportActorSnapshotState(ateletauthtest.ContextWith(ateletauthtest.CertOn(t, testNode)), req); err != nil {
 		t.Fatalf("ReportActorSnapshotState() failed: %v", err)
 	}
@@ -82,50 +63,43 @@ func TestReportActorSnapshotState(t *testing.T) {
 	if want := (resources.ActorRef{Atespace: suspendAtespace, Name: suspendActor}); got.actorRef != want {
 		t.Errorf("actorRef = %v, want %v", got.actorRef, want)
 	}
-	if got.actorUID != actor.GetMetadata().GetUid() || got.node != testNode {
-		t.Errorf("applied (uid %q, node %q), want (%q, %q)", got.actorUID, got.node, actor.GetMetadata().GetUid(), testNode)
+	if got.actorUID != reportActorUID || got.node != testNode {
+		t.Errorf("applied (uid %q, node %q), want (%q, %q)", got.actorUID, got.node, reportActorUID, testNode)
 	}
 	if !proto.Equal(got.state, req.GetState()) {
 		t.Errorf("applied state = %v, want %v", got.state, req.GetState())
 	}
 }
 
-// Refusals happen before the report reaches the control plane. Actors on
-// other nodes are reported as absent, so a caller learns nothing about them.
+// A caller that is not atelet, or a malformed request, never reaches the
+// control plane. A refusal from the control plane reaches atelet as is.
 func TestReportActorSnapshotState_Refused(t *testing.T) {
-	st, cleanup := storetest.SetupTestStore(t)
-	defer cleanup()
-	actor := seedPausedActor(t, st, testNode)
-	uid := actor.GetMetadata().GetUid()
 	onNode := ateletauthtest.ContextWith(ateletauthtest.CertOn(t, testNode))
-
-	invalid := reportRequest(uid)
+	invalid := reportRequest()
 	invalid.State = nil
-	missing := reportRequest(uid)
-	missing.Actor.Name = "no-such-actor"
 
 	tests := []struct {
-		name string
-		ctx  context.Context
-		req  *ateapipb.ReportActorSnapshotStateRequest
-		want codes.Code
+		name        string
+		ctx         context.Context
+		req         *ateapipb.ReportActorSnapshotStateRequest
+		controlErr  error
+		want        codes.Code
+		wantApplied bool
 	}{
-		{"unauthenticated", ateletauthtest.ContextWith(nil), reportRequest(uid), codes.Unauthenticated},
-		{"invalid request", onNode, invalid, codes.InvalidArgument},
-		{"actor missing", onNode, missing, codes.NotFound},
-		{"stale incarnation", onNode, reportRequest("1a7e4c83-6d20-4f95-b3c8-9e0a2f6d4b17"), codes.NotFound},
-		{"actor on another node", ateletauthtest.ContextWith(ateletauthtest.CertOn(t, "some-other-node")), reportRequest(uid), codes.NotFound},
+		{name: "unauthenticated", ctx: ateletauthtest.ContextWith(nil), req: reportRequest(), want: codes.Unauthenticated},
+		{name: "invalid request", ctx: onNode, req: invalid, want: codes.InvalidArgument},
+		{name: "control plane refuses", ctx: onNode, req: reportRequest(), controlErr: apierror.NotFound("Actor not found"), want: codes.NotFound, wantApplied: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			control := &fakeSuspender{}
-			s := New(st, control, testAteletSPIFFEID, nil)
+			control := &fakeSuspender{reportErr: tt.controlErr}
+			s := New(nil, control, testAteletSPIFFEID, nil)
 			_, err := s.ReportActorSnapshotState(tt.ctx, tt.req)
 			if got := apierror.Code(err); got != tt.want {
 				t.Fatalf("ReportActorSnapshotState() error = %v, want code %v", err, tt.want)
 			}
-			if len(control.reports) != 0 {
-				t.Errorf("a refused report reached the control plane: %v", control.reports)
+			if applied := len(control.reports) > 0; applied != tt.wantApplied {
+				t.Errorf("report reached the control plane = %v, want %v", applied, tt.wantApplied)
 			}
 		})
 	}
