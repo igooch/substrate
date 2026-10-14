@@ -86,6 +86,7 @@ func TestReportActorSnapshotState_Refused(t *testing.T) {
 		wantApplied bool
 	}{
 		{name: "unauthenticated", ctx: ateletauthtest.ContextWith(nil), req: reportRequest(), want: codes.Unauthenticated},
+		{name: "not atelet", ctx: ateletauthtest.ContextWith(ateletauthtest.CertIn(t, "other-namespace", testNode)), req: reportRequest(), want: codes.PermissionDenied},
 		{name: "invalid request", ctx: onNode, req: invalid, want: codes.InvalidArgument},
 		{name: "control plane refuses", ctx: onNode, req: reportRequest(), controlErr: apierror.NotFound("Actor not found"), want: codes.NotFound, wantApplied: true},
 	}

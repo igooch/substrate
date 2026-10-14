@@ -153,7 +153,8 @@ func replacedDurableURIs(before, after *ateapipb.Actor, state *ateapipb.ActorSna
 }
 
 // actorOnNode reports whether the Actor is placed on node or has a local
-// snapshot there.
+// snapshot there. Unlike HostingNode, it includes a node that only holds the
+// Actor's snapshots, since that node's atelet reports them.
 func actorOnNode(actor *ateapipb.Actor, node string) bool {
 	if actor.GetStatus().GetAssignedNode() == node {
 		return true
@@ -187,8 +188,9 @@ func applyActorSnapshotState(status *ateapipb.ActorStatus, node string, state *a
 }
 
 // checkReportedLocal checks the report's latest_local and uploading against
-// status. It refuses a latest_local that status doesn't have, and a recorded
-// uploading snapshot whose upload URI is missing or different. An uploading
+// status. It refuses a latest_local that status doesn't have, either one with
+// an upload URI other than the recorded one, and a recorded uploading snapshot
+// with no upload URI. An uploading
 // snapshot that status no longer has passes, because a newer checkpoint can
 // drop its entry while atelet still uploads it.
 func checkReportedLocal(status *ateapipb.ActorStatus, node string, state *ateapipb.ActorSnapshotState) error {
@@ -199,6 +201,9 @@ func checkReportedLocal(status *ateapipb.ActorStatus, node string, state *ateapi
 		}
 		if snap == nil {
 			return apierror.FailedPrecondition("local snapshot generation %d (%s) is not recorded for this actor", local.GetGeneration(), local.GetUuid())
+		}
+		if recorded := snap.GetDurableSnapshot().GetObject().GetSnapshotUri(); recorded != "" && local.GetObject().GetSnapshotUri() != recorded {
+			return apierror.InvalidArgument("local snapshot generation %d names upload URI %q, want %q", local.GetGeneration(), local.GetObject().GetSnapshotUri(), recorded)
 		}
 	}
 	if up := state.GetUploading(); up != nil {
@@ -283,9 +288,9 @@ func applyLatestDurable(status *ateapipb.ActorStatus, node string, reported *ate
 // it resume from an older one.
 func applyDetach(status *ateapipb.ActorStatus, node string) {
 	onNode := latestSnapshot(status, func(s *ateapipb.Snapshot) bool { return s.GetLocality() == node })
-	lost := onNode != nil &&
-		onNode.GetDurableSnapshot().GetStatus() != ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED &&
-		onNode == latestSnapshot(status, func(*ateapipb.Snapshot) bool { return true })
+	lost := onNode != nil && !isCompleted(onNode) && latestSnapshot(status, func(s *ateapipb.Snapshot) bool {
+		return s != onNode && s.GetGeneration() >= onNode.GetGeneration() && (isCompleted(s) || s.GetLocality() != "" && s.GetLocality() != node)
+	}) == nil
 	for _, snap := range status.GetSnapshots() {
 		if snap.GetLocality() == node {
 			snap.Locality = ""
@@ -302,6 +307,11 @@ func applyDetach(status *ateapipb.ActorStatus, node string) {
 		status.State = ateapipb.ActorState_ACTOR_STATE_CRASHED
 		status.Crash = newActorCrash(ateattr.OperationSuspend, fmt.Sprintf("atelet on node %s deleted snapshot generation %d before it was durable", node, onNode.GetGeneration()))
 	}
+}
+
+// isCompleted reports whether the snapshot has a COMPLETED durable copy.
+func isCompleted(snap *ateapipb.Snapshot) bool {
+	return snap.GetDurableSnapshot().GetStatus() == ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED
 }
 
 // dropUnlistedLocalSnapshots clears node's locality on older snapshots that the
@@ -324,7 +334,7 @@ func dropUnlistedLocalSnapshots(status *ateapipb.ActorStatus, node string, state
 
 // pruneReportedSnapshots removes older COMPLETED snapshots, and snapshots that
 // no node holds and that never became durable, such as an abandoned upload. It
-// keeps the newest generation and doesn't change any locality.
+// doesn't change any locality.
 func pruneReportedSnapshots(status *ateapipb.ActorStatus) {
 	if status == nil {
 		return
@@ -332,9 +342,9 @@ func pruneReportedSnapshots(status *ateapipb.ActorStatus) {
 	latestDurable := findLatestDurableSnapshot(status, ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED)
 	kept := status.Snapshots[:0]
 	for _, snap := range status.Snapshots {
-		superseded := snap.GetDurableSnapshot().GetStatus() == ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED && snap != latestDurable
-		unheld := snap.GetDurableSnapshot().GetStatus() != ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED && snap.GetLocality() == ""
-		if snap.GetLocality() != "" || snap.GetGeneration() == status.GetLastAssignedGeneration() || !(superseded || unheld) {
+		superseded := isCompleted(snap) && snap != latestDurable
+		unheld := !isCompleted(snap) && snap.GetLocality() == ""
+		if snap.GetLocality() != "" || !(superseded || unheld) {
 			kept = append(kept, snap)
 		}
 	}

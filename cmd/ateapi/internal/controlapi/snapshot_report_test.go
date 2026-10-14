@@ -332,6 +332,13 @@ func TestApplyActorSnapshotState(t *testing.T) {
 		state:    &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 3), Uploading: reportedAt(t, 2, ownedURI(t, reportActorUID, 9))},
 		wantCode: codes.InvalidArgument,
 	}, {
+		name: "a local snapshot naming a URI other than the recorded one is refused",
+		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
+			withDurable(t, 2, reportNode, pending),
+		}},
+		state:    &ateapipb.ActorSnapshotState{LatestLocal: reportedAt(t, 2, ownedURI(t, reportActorUID, 9))},
+		wantCode: codes.InvalidArgument,
+	}, {
 		name: "durable uuid mismatch is refused",
 		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
 			localOnly(2, reportNode),
@@ -371,8 +378,19 @@ func TestApplyActorSnapshotState(t *testing.T) {
 			Crash:                  &ateapipb.ActorCrash{Message: "suspend failed: atelet on node node-a deleted snapshot generation 2 before it was durable"},
 			Snapshots: []*ateapipb.Snapshot{
 				withDurable(t, 1, "", completed),
-				localOnly(2, ""),
 			},
+		},
+	}, {
+		name: "a detach that leaves only a pending upload no node holds crashes the actor",
+		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, LastAssignedGeneration: 3, Snapshots: []*ateapipb.Snapshot{
+			localOnly(2, reportNode),
+			withDurable(t, 3, "", pending),
+		}},
+		state: &ateapipb.ActorSnapshotState{},
+		want: &ateapipb.ActorStatus{
+			State:                  ateapipb.ActorState_ACTOR_STATE_CRASHED,
+			LastAssignedGeneration: 3,
+			Crash:                  &ateapipb.ActorCrash{Message: "suspend failed: atelet on node node-a deleted snapshot generation 2 before it was durable"},
 		},
 	}, {
 		name: "a detach of an older snapshot that never became durable only drops it",
@@ -394,14 +412,12 @@ func TestApplyActorSnapshotState(t *testing.T) {
 			withDurable(t, 2, "", completed),
 		}},
 	}, {
-		name: "a running actor's detach only clears the locality",
+		name: "a running actor's detach drops the copy it no longer holds",
 		status: &ateapipb.ActorStatus{State: running, AssignedNode: reportNode, LastAssignedGeneration: 2, Snapshots: []*ateapipb.Snapshot{
 			localOnly(2, reportNode),
 		}},
 		state: &ateapipb.ActorSnapshotState{},
-		want: &ateapipb.ActorStatus{State: running, AssignedNode: reportNode, LastAssignedGeneration: 2, Snapshots: []*ateapipb.Snapshot{
-			localOnly(2, ""),
-		}},
+		want:  &ateapipb.ActorStatus{State: running, AssignedNode: reportNode, LastAssignedGeneration: 2},
 	}, {
 		name: "detach keeps the assigned node of a running actor",
 		status: &ateapipb.ActorStatus{State: running, AssignedNode: reportNode, Snapshots: []*ateapipb.Snapshot{
@@ -435,7 +451,7 @@ func TestApplyActorSnapshotState(t *testing.T) {
 			localOnly(3, reportNode),
 		}},
 	}, {
-		name: "the newest generation is kept even with no holder",
+		name: "a pending upload no node holds is dropped even at the newest generation",
 		status: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, LastAssignedGeneration: 3, Snapshots: []*ateapipb.Snapshot{
 			localOnly(2, reportNode),
 			withDurable(t, 3, "", pending),
@@ -443,7 +459,6 @@ func TestApplyActorSnapshotState(t *testing.T) {
 		state: &ateapipb.ActorSnapshotState{LatestLocal: reported(t, 2)},
 		want: &ateapipb.ActorStatus{State: suspended, AssignedNode: reportNode, LastAssignedGeneration: 3, Snapshots: []*ateapipb.Snapshot{
 			localOnly(2, reportNode),
-			withDurable(t, 3, "", pending),
 		}},
 	}}
 	for _, tt := range tests {
