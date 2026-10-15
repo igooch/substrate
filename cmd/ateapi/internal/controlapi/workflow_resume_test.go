@@ -1065,6 +1065,8 @@ type capturingAtelet struct {
 	// whatever else happens while the workload checkpoints. Its error fails
 	// the RPC.
 	onCheckpoint func(ctx context.Context) error
+	// checkpointState is the snapshot state Checkpoint returns.
+	checkpointState *ateletpb.ActorSnapshotState
 }
 
 func (f *capturingAtelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (*ateletpb.RestoreResponse, error) {
@@ -1092,7 +1094,9 @@ func (f *capturingAtelet) Checkpoint(ctx context.Context, req *ateletpb.Checkpoi
 			return nil, err
 		}
 	}
-	return &ateletpb.CheckpointResponse{}, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return &ateletpb.CheckpointResponse{State: proto.CloneOf(f.checkpointState)}, nil
 }
 
 func (f *capturingAtelet) PromoteSnapshot(ctx context.Context, req *ateletpb.PromoteSnapshotRequest) (*ateletpb.PromoteSnapshotResponse, error) {

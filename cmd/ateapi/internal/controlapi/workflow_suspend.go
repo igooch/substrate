@@ -80,6 +80,8 @@ func (w *ActorWorkflow) suspendActor(ctx context.Context, actorRef resources.Act
 	var actor *ateapipb.Actor
 	var actorTemplate *ateapipb.ActorTemplate
 	var wireFidelity string
+	// The state atelet returned from Checkpoint, applied at finalize.
+	var ateletState *ateletpb.ActorSnapshotState
 	// Set just before finalize; nil until then, so earlier exits label
 	// themselves from the record they hold.
 	var finalAttrs []attribute.KeyValue
@@ -129,7 +131,7 @@ func (w *ActorWorkflow) suspendActor(ctx context.Context, actorRef resources.Act
 	if fromPaused {
 		wireFidelity, err = w.ensurePausedSnapshotUploaded(leaseCtx, actorRef, actor, actorTemplate)
 	} else {
-		wireFidelity, err = w.ensureAteletSuspended(leaseCtx, actorRef, actor, actorTemplate, mode)
+		wireFidelity, ateletState, err = w.ensureAteletSuspended(leaseCtx, actorRef, actor, actorTemplate, mode)
 	}
 	if err != nil {
 		return nil, err
@@ -142,7 +144,7 @@ func (w *ActorWorkflow) suspendActor(ctx context.Context, actorRef resources.Act
 	// them here, as crash.go does for the crash counter.
 	finalAttrs = lifecycleOpAttrs(actor, actorTemplate, "", wireFidelity)
 	var finalized *ateapipb.Actor
-	if finalized, err = w.ensureSuspendedFinalized(leaseCtx, actorRef, mode); err != nil {
+	if finalized, err = w.ensureSuspendedFinalized(leaseCtx, actorRef, mode, ateletState); err != nil {
 		return nil, err
 	}
 	actor = finalized
@@ -310,25 +312,25 @@ func isPausedOriginSuspend(actor *ateapipb.Actor) bool {
 // once-minted snapshot location, so a re-entered workflow re-sends the same
 // semantic request; once atelet's Checkpoint is idempotent on those keys this
 // step becomes fully reentrant with no changes here.
-func (w *ActorWorkflow) ensureAteletSuspended(ctx context.Context, actorRef resources.ActorRef, actor *ateapipb.Actor, actorTemplate *ateapipb.ActorTemplate, mode suspendMode) (wireFidelity string, err error) {
+func (w *ActorWorkflow) ensureAteletSuspended(ctx context.Context, actorRef resources.ActorRef, actor *ateapipb.Actor, actorTemplate *ateapipb.ActorTemplate, mode suspendMode) (wireFidelity string, state *ateletpb.ActorSnapshotState, err error) {
 	ctx, done := stepSpan(ctx, "CallAteletSuspend")
 	defer func() { err = done(err) }()
 
 	assignment := actor.GetStatus().GetWorkerAssignment()
 	if assignment == nil {
 		// Missing active worker pod reference in SUSPENDING state indicates corrupted store state.
-		return "", crashActorAndFail(ctx, w.store, actorRef, ateattr.OperationSuspend, crashMessageWorkerAssignmentMissing)
+		return "", nil, crashActorAndFail(ctx, w.store, actorRef, ateattr.OperationSuspend, crashMessageWorkerAssignmentMissing)
 	}
 
 	ateletConn, err := w.dialer.DialForAteletOnNode(assignment.GetNodeName())
 	if err != nil {
-		return "", fmt.Errorf("while getting atelet conn for node %q: %w", assignment.GetNodeName(), err)
+		return "", nil, fmt.Errorf("while getting atelet conn for node %q: %w", assignment.GetNodeName(), err)
 	}
 	client := ateletpb.NewAteletClient(ateletConn)
 
 	workloadSpec, err := workloadSpecFromActorTemplate(actorTemplate, actor, nil)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	// Checkpoint does not carry the sandbox config: atelet uses the version the
@@ -361,10 +363,11 @@ func (w *ActorWorkflow) ensureAteletSuspended(ctx context.Context, actorRef reso
 	}
 	wireFidelity = ateattr.SnapshotFidelityValue(fidelity)
 
-	if _, err = client.Checkpoint(ctx, req); err != nil {
-		return wireFidelity, handleAteletError(ctx, w.store, actorRef, ateattr.OperationSuspend, "Checkpoint", false, err)
+	resp, err := client.Checkpoint(ctx, req)
+	if err != nil {
+		return wireFidelity, nil, handleAteletError(ctx, w.store, actorRef, ateattr.OperationSuspend, "Checkpoint", false, err)
 	}
-	return wireFidelity, nil
+	return wireFidelity, resp.GetState(), nil
 }
 
 // TODO(paused-suspend): remove with the paused -> suspended transition.
@@ -451,6 +454,22 @@ func (w *ActorWorkflow) ensureVolumesDetached(ctx context.Context, actor *ateapi
 	return detachActorVolumes(ctx, w.pluginRegistry, actor, actorTemplate, op)
 }
 
+// applyReturnedSnapshotState applies the state atelet returned from
+// Checkpoint, with the same rules as a ReportActorSnapshotState report. A
+// state that conflicts with the record is logged and ignored: finalize has
+// already released the worker, so failing would strand the actor.
+func applyReturnedSnapshotState(ctx context.Context, actorRef resources.ActorRef, status *ateapipb.ActorStatus, state *ateletpb.ActorSnapshotState) {
+	applied := proto.CloneOf(status)
+	if err := applyCheckpointState(ctx, applied, state); err != nil {
+		slog.WarnContext(ctx, "Ignoring the snapshot state atelet returned from Checkpoint",
+			slog.Any("actor", actorRef),
+			slog.Any("err", err))
+		return
+	}
+	proto.Reset(status)
+	proto.Merge(status, applied)
+}
+
 // ensureSuspendedFinalized releases the actor's worker (only when it is still
 // owned by this actor), records the in-progress snapshot as the actor's
 // durable snapshot (sync) or node-local snapshot (async), and commits
@@ -461,7 +480,9 @@ func (w *ActorWorkflow) ensureVolumesDetached(ctx context.Context, actor *ateapi
 // It re-reads the actor first so an out-of-band transition (e.g. the syncer
 // crashing the actor after its worker died) is not overwritten: with no
 // assignment left there is nothing to finalize.
-func (w *ActorWorkflow) ensureSuspendedFinalized(ctx context.Context, actorRef resources.ActorRef, mode suspendMode) (_ *ateapipb.Actor, err error) {
+// ateletState is the state atelet returned from Checkpoint, applied in the
+// same update; nil when the suspend called no Checkpoint.
+func (w *ActorWorkflow) ensureSuspendedFinalized(ctx context.Context, actorRef resources.ActorRef, mode suspendMode, ateletState *ateletpb.ActorSnapshotState) (_ *ateapipb.Actor, err error) {
 	ctx, done := stepSpan(ctx, "FinalizeSuspended")
 	defer func() { err = done(err) }()
 
@@ -523,6 +544,7 @@ func (w *ActorWorkflow) ensureSuspendedFinalized(ctx context.Context, actorRef r
 	t = time.Now()
 	storedActor, err := w.store.UpdateActor(ctx, actorRef, store.PreconditionFrom(latestActor), func(toUpdate *ateapipb.Actor) error {
 		toUpdate.Status.State = ateapipb.ActorState_ACTOR_STATE_SUSPENDED
+		applyReturnedSnapshotState(ctx, actorRef, toUpdate.Status, ateletState)
 		snap := snapshotAtLatestGeneration(toUpdate.Status)
 		switch mode {
 		case suspendSync:
