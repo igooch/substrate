@@ -57,6 +57,7 @@ func TestRunConfigValidate(t *testing.T) {
 			c.setFlags = []string{"some-new-flag"}
 		}, "only valid with --refs-file", true},
 		{"min-free-gb overflow", func(c *runConfig) { c.minFreeGB = math.MaxUint64 }, "overflows", false},
+		{"min-free-gb past the int64 target", func(c *runConfig) { c.minFreeGB = 10_000_000_000 }, "overflows", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -54,6 +54,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -94,6 +95,10 @@ func looksLikeLiveNode(dir string) bool {
 // must not be tuned away. Validation hosts keep full freedom.
 const liveNodeIdleFloor = time.Minute
 
+// maxMinFreeGB is the most GB whose byte count fits in an int64, the type
+// of imagecache.Store.EvictUnused's targetBytes.
+const maxMinFreeGB = math.MaxInt64 / 1_000_000_000
+
 // errUsage marks validation failures that should print flag usage.
 var errUsage = errors.New("usage")
 
@@ -117,7 +122,7 @@ func (c runConfig) validate() error {
 		// future), making even in-flight pulls' layers evictable.
 		return fmt.Errorf("--evict-idle %v must be >= 0", c.evictIdle)
 	}
-	if c.minFreeGB > math.MaxUint64/uint64(1e9) {
+	if c.minFreeGB > maxMinFreeGB {
 		return fmt.Errorf("--min-free-gb %d overflows a byte count", c.minFreeGB)
 	}
 	if c.evictAll {
@@ -186,8 +191,14 @@ func main() {
 	ctx := context.Background()
 
 	if *evictAll {
-		// Flush mode: no refs, no registry auth. New also reclaims any
-		// crash-debris orphans before the pass.
+		// --evict-all only evicts, so it needs no refs file and no registry
+		// credentials. newStore creates a cache in a missing dir, as atelet
+		// needs on a fresh node. Check for the version file so a mistyped
+		// --cache-dir fails instead of flushing an empty cache.
+		if _, err := os.Stat(filepath.Join(*cacheDir, "version")); err != nil {
+			log.Fatalf("%s is not an existing image cache: %v", *cacheDir, err)
+		}
+		// newStore also deletes what a crash left behind, and layers no image uses.
 		store, err := newStore()
 		if err != nil {
 			log.Fatalf("opening cache: %v", err)
