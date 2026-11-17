@@ -260,6 +260,9 @@ func main() {
 	if err := validateImageCacheGCFlags(); err != nil {
 		serverboot.Fatal(ctx, "Invalid image cache GC flags", err)
 	}
+	if err := validateDiskGCFlags(); err != nil {
+		serverboot.Fatal(ctx, "Invalid disk GC flags", err)
+	}
 	if err := validateSandboxAssetCacheFlags(); err != nil {
 		serverboot.Fatal(ctx, "Invalid sandbox asset cache flags", err)
 	}
@@ -313,6 +316,9 @@ func main() {
 		if err := filecachegc.Start(ctx, ateattr.FileCacheSnapshot, snapshotCache, snapshotCacheGCFlags, fileCacheInstruments); err != nil {
 			serverboot.Fatal(ctx, "Failed to start the snapshot cache GC", err)
 		}
+	}
+	if err := startDiskGC(ctx, imageCache, sandboxAssetCache, snapshotCache); err != nil {
+		serverboot.Fatal(ctx, "Failed to start the disk GC", err)
 	}
 
 	// Sandbox assets go through the object-store plugin; a gs:// asset it
