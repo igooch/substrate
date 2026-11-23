@@ -450,6 +450,7 @@ func main() {
 	)
 	store.s = wmService
 	snapshots.Start()
+	startLocalSnapshotGC(ctx, snapshots)
 	go systemInfoVolumes.run(ctx)
 
 	herderCaller, err := spiffeid.FromString(*herderAllowedSPIFFEID)
