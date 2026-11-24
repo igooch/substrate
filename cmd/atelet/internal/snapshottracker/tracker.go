@@ -224,6 +224,13 @@ type Tracker struct {
 	// reads the state from the file. Read and change it through findLocked,
 	// findOrAddLocked, addLocked, dropLocked, and localInUseLocked.
 	actors map[string]*actorSnapshots
+
+	// earlyMu guards earlyUploads.
+	earlyMu sync.Mutex
+	// earlyUploads maps actorUID to when FreeLocal made the actor's upload
+	// due, ahead of the upload delay, until the snapshot is durable. It is not
+	// saved, so a restart falls back to the upload delay.
+	earlyUploads map[string]time.Time
 }
 
 // Option configures a Tracker.
@@ -343,6 +350,7 @@ func New(ctx context.Context, store Store, clk clock.WithTicker, opts ...Option)
 		reporting:           newReportQueue(clk),
 		locks:               actorlock.New(),
 		actors:              map[string]*actorSnapshots{},
+		earlyUploads:        map[string]time.Time{},
 	}
 	for k := range t.queues {
 		t.queues[k] = workqueue.NewTypedDelayingQueueWithConfig(workqueue.TypedDelayingQueueConfig[string]{Clock: clk})
@@ -427,7 +435,18 @@ func (t *Tracker) uploadDueLocked(a *actorSnapshots) (time.Time, bool) {
 	if t.store == nil {
 		return time.Time{}, false
 	}
-	return a.uploadDue(t.uploadDelay)
+	due, ok := a.uploadDue(t.uploadDelay)
+	t.earlyMu.Lock()
+	defer t.earlyMu.Unlock()
+	early, isEarly := t.earlyUploads[a.actorUID]
+	if !ok {
+		delete(t.earlyUploads, a.actorUID)
+		return due, ok
+	}
+	if isEarly && early.Before(due) {
+		due = later(early, a.retryAt)
+	}
+	return due, ok
 }
 
 // detachDueLocked returns when atelet next checks whether to detach the actor,

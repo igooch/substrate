@@ -65,12 +65,37 @@ func addLocalActor(t *testing.T, tr *Tracker, a localActor) {
 	}
 }
 
+// uploadDueOf returns when atelet uploads the actor's snapshot, or zero if it
+// does not.
+func uploadDueOf(tr *Tracker, actorUID string) time.Time {
+	tr.lock(actorUID)
+	defer tr.unlock(actorUID)
+	if a := tr.findLocked(actorUID); a != nil {
+		due, _ := tr.uploadDueLocked(a)
+		return due
+	}
+	return time.Time{}
+}
+
+// dueNow returns, sorted, the actors whose detach, or upload, is due now.
+func dueNow(tr *Tracker, actors []localActor, due func(*Tracker, string) time.Time) []string {
+	var out []string
+	for _, a := range actors {
+		if due(tr, a.uid).Equal(tr.clock.Now()) {
+			out = append(out, a.uid)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
 func TestFreeLocal(t *testing.T) {
 	tests := []struct {
-		name   string
-		actors []localActor
-		target int64
-		want   []string // the actors whose detach FreeLocal makes due now
+		name        string
+		actors      []localActor
+		target      int64
+		wantDetach  []string // the actors whose detach FreeLocal makes due now
+		wantUploads []string // the actors whose upload FreeLocal makes due now
 	}{
 		{
 			name: "oldest checkpoint first, stopping once the target is covered",
@@ -79,22 +104,43 @@ func TestFreeLocal(t *testing.T) {
 				{uid: "a", age: 30 * time.Minute, durable: true},
 				{uid: "c", age: 10 * time.Minute, durable: true},
 			},
-			target: snapshotSize + snapshotSize/2,
-			want:   []string{"a", "b"},
+			target:     snapshotSize + snapshotSize/2,
+			wantDetach: []string{"a", "b"},
 		},
 		{
-			name: "an undurable snapshot is left out",
+			name:       "a durable snapshot committed just now qualifies",
+			actors:     []localActor{{uid: "a", durable: true}},
+			target:     snapshotSize,
+			wantDetach: []string{"a"},
+		},
+		{
+			name: "an undurable snapshot is never detached, and its upload starts early when durable ones fall short",
 			actors: []localActor{
 				{uid: "a", age: 30 * time.Minute},
 				{uid: "b", age: 20 * time.Minute, durable: true},
 			},
-			target: 10 * snapshotSize,
-			want:   []string{"b"},
+			target:      snapshotSize + snapshotSize/2,
+			wantDetach:  []string{"b"},
+			wantUploads: []string{"a"},
 		},
 		{
-			name:   "a snapshot younger than the minimum age is left out",
-			actors: []localActor{{uid: "a", age: freeLocalMinAge - time.Second, durable: true}},
-			target: 10 * snapshotSize,
+			name: "undurable snapshots are left alone when durable ones cover the target",
+			actors: []localActor{
+				{uid: "a", age: 30 * time.Minute},
+				{uid: "b", age: 20 * time.Minute, durable: true},
+			},
+			target:     snapshotSize / 2,
+			wantDetach: []string{"b"},
+		},
+		{
+			name: "early uploads go oldest first, only as many as the target needs",
+			actors: []localActor{
+				{uid: "c", age: 10 * time.Minute},
+				{uid: "a", age: 30 * time.Minute},
+				{uid: "b", age: 20 * time.Minute},
+			},
+			target:      snapshotSize + snapshotSize/2,
+			wantUploads: []string{"a", "b"},
 		},
 		{
 			name:   "an actor started since its checkpoint is left out",
@@ -116,21 +162,38 @@ func TestFreeLocal(t *testing.T) {
 			if err != nil {
 				t.Fatalf("FreeLocal: %v", err)
 			}
-			now := tr.clock.Now()
-			var dueNow []string
-			for _, a := range tc.actors {
-				if detachDueOf(tr, a.uid).Equal(now) {
-					dueNow = append(dueNow, a.uid)
-				}
+			if d := dueNow(tr, tc.actors, detachDueOf); !slices.Equal(d, tc.wantDetach) {
+				t.Errorf("detaches due now = %v, want %v", d, tc.wantDetach)
 			}
-			slices.Sort(dueNow)
-			if !slices.Equal(dueNow, tc.want) {
-				t.Errorf("detaches due now = %v, want %v", dueNow, tc.want)
+			if u := dueNow(tr, tc.actors, uploadDueOf); !slices.Equal(u, tc.wantUploads) {
+				t.Errorf("uploads due now = %v, want %v", u, tc.wantUploads)
 			}
-			if least := int64(len(tc.want)) * snapshotSize; got < least {
+			if least := int64(len(tc.wantDetach)) * snapshotSize; got < least {
 				t.Errorf("FreeLocal scheduled %d bytes, want at least %d", got, least)
 			}
 		})
+	}
+}
+
+// Uploads FreeLocal already made due count toward the target, so a second
+// call doesn't pull another one forward.
+func TestFreeLocalCountsEarlyUploads(t *testing.T) {
+	tr := newIdleTestTracker(t, newFakeSnapshotStore())
+	actors := []localActor{
+		{uid: "a", age: 30 * time.Minute},
+		{uid: "b", age: 20 * time.Minute},
+		{uid: "c", age: 10 * time.Minute},
+	}
+	for _, a := range actors {
+		addLocalActor(t, tr, a)
+	}
+	for range 2 {
+		if _, err := tr.FreeLocal(t.Context(), snapshotSize+snapshotSize/2); err != nil {
+			t.Fatalf("FreeLocal: %v", err)
+		}
+	}
+	if u, want := dueNow(tr, actors, uploadDueOf), []string{"a", "b"}; !slices.Equal(u, want) {
+		t.Errorf("uploads due now after two calls = %v, want %v", u, want)
 	}
 }
 

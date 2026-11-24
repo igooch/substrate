@@ -27,30 +27,29 @@ import (
 	"go.ate.dev/substrate/cmd/atelet/internal/ateletpath"
 )
 
-// freeLocalMinAge keeps a durable local snapshot from an early detach for this
-// long after its checkpoint, so an actor that suspends and resumes soon after
-// still resumes from this node. It matters for immediate checkpoints, whose
-// snapshot is durable at once. A deferred one is durable only after
-// DefaultUploadDelay anyway.
-const freeLocalMinAge = 5 * time.Minute
-
-// FreeLocal brings forward the detach of suspended actors whose latest local
-// snapshot is already durable, oldest checkpoint first, until their local
-// snapshots add up to target bytes, and returns the bytes it scheduled. The
+// FreeLocal frees up to target bytes of local snapshots. It brings forward
+// the detach of suspended actors whose latest local snapshot is already
+// durable, oldest checkpoint first, and returns the bytes it scheduled. The
 // detach workers then delete the snapshots and report each detach, as they do
-// once the detach delay passes. A tracker without a store detaches nothing.
+// once the detach delay passes.
+//
+// When those don't cover the target, it also makes the uploads of the oldest
+// undurable snapshots due now, so a later call can detach them once they are
+// durable. Uploads it made due earlier and that are still running count
+// toward the target, so repeated calls don't pull every upload forward. A
+// tracker without a store frees nothing.
 func (t *Tracker) FreeLocal(ctx context.Context, target int64) (int64, error) {
 	if t.store == nil || target <= 0 {
 		return 0, nil
 	}
-	candidates, err := t.earlyDetachCandidates(ctx)
+	durable, undurable, err := t.localCandidates(ctx)
 	if err != nil {
 		return 0, err
 	}
 	var scheduled int64
-	for _, actorUID := range candidates {
+	for _, actorUID := range durable {
 		if scheduled >= target {
-			break
+			return scheduled, nil
 		}
 		// Sized outside the actor's lock, since it walks the actor's files.
 		size := localSnapshotBytes(actorUID)
@@ -64,47 +63,83 @@ func (t *Tracker) FreeLocal(ctx context.Context, target int64) (int64, error) {
 			scheduled += size
 		}
 	}
+	remaining := target - scheduled
+	var notStarted []string
+	for _, actorUID := range undurable {
+		if t.uploadingEarly(actorUID) {
+			remaining -= localSnapshotBytes(actorUID)
+		} else {
+			notStarted = append(notStarted, actorUID)
+		}
+	}
+	for _, actorUID := range notStarted {
+		if remaining <= 0 {
+			break
+		}
+		size := localSnapshotBytes(actorUID)
+		ok, err := t.uploadEarly(ctx, actorUID)
+		if err != nil {
+			return scheduled, err
+		}
+		if ok {
+			slog.InfoContext(ctx, "Uploading a local snapshot early to free disk",
+				slog.String("actorUID", actorUID), slog.Int64("bytes", size))
+			remaining -= size
+		}
+	}
 	return scheduled, nil
 }
 
-// earlyDetachCandidates returns the actors FreeLocal may detach early, oldest
-// checkpoint first.
-func (t *Tracker) earlyDetachCandidates(ctx context.Context) ([]string, error) {
+// localCandidates returns the suspended actors whose latest local snapshot
+// FreeLocal may act on, split into those durable already and those not, each
+// oldest checkpoint first.
+func (t *Tracker) localCandidates(ctx context.Context) (durable, undurable []string, err error) {
 	actorUIDs, err := savedActorUIDs()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	type candidate struct {
 		actorUID  string
 		committed time.Time
 	}
-	var candidates []candidate
+	var d, u []candidate
 	for _, actorUID := range actorUIDs {
 		if !t.locks.Lock(ctx, actorUID) {
-			return nil, ctx.Err()
+			return nil, nil, ctx.Err()
 		}
-		if a := t.findLocked(actorUID); a != nil && t.earlyDetachableLocked(a) {
-			candidates = append(candidates, candidate{actorUID, a.LatestLocal.CommitTime})
+		if a := t.findLocked(actorUID); a != nil && t.idleSuspendedLocked(a) {
+			c := candidate{actorUID, a.LatestLocal.CommitTime}
+			if _, isDurable, err := a.detachTarget(); err == nil && isDurable {
+				d = append(d, c)
+			} else if err == nil {
+				u = append(u, c)
+			}
 		}
 		t.unlock(actorUID)
 	}
-	slices.SortFunc(candidates, func(x, y candidate) int { return x.committed.Compare(y.committed) })
-	ordered := make([]string, len(candidates))
-	for i, c := range candidates {
-		ordered[i] = c.actorUID
+	ordered := func(cs []candidate) []string {
+		slices.SortFunc(cs, func(x, y candidate) int { return x.committed.Compare(y.committed) })
+		out := make([]string, len(cs))
+		for i, c := range cs {
+			out[i] = c.actorUID
+		}
+		return out
 	}
-	return ordered, nil
+	return ordered(d), ordered(u), nil
 }
 
-// detachEarly makes the actor's detach due now, if it still qualifies, and
-// reports whether it did. The actor may have changed since it was listed.
+// detachEarly makes the actor's detach due now, if its snapshot is still
+// durable and nothing runs on it, and reports whether it did.
 func (t *Tracker) detachEarly(ctx context.Context, actorUID string) (bool, error) {
 	if !t.locks.Lock(ctx, actorUID) {
 		return false, ctx.Err()
 	}
 	defer t.unlock(actorUID)
 	a := t.findLocked(actorUID)
-	if a == nil || !t.earlyDetachableLocked(a) {
+	if a == nil || !t.idleSuspendedLocked(a) {
+		return false, nil
+	}
+	if _, isDurable, err := a.detachTarget(); err != nil || !isDurable {
 		return false, nil
 	}
 	a.DetachAt = t.clock.Now()
@@ -113,23 +148,45 @@ func (t *Tracker) detachEarly(ctx context.Context, actorUID string) (bool, error
 	return true, nil
 }
 
-// earlyDetachableLocked reports whether FreeLocal may bring the actor's detach
-// forward: a detach is scheduled for later, nothing runs on the actor, its
-// latest local snapshot is durable already, and that snapshot is past
-// freeLocalMinAge.
-func (t *Tracker) earlyDetachableLocked(a *actorSnapshots) bool {
+// uploadEarly makes the upload of the actor's undurable local snapshot due
+// now, if it still waits for one and nothing runs on the actor, and reports
+// whether it did.
+func (t *Tracker) uploadEarly(ctx context.Context, actorUID string) (bool, error) {
+	if !t.locks.Lock(ctx, actorUID) {
+		return false, ctx.Err()
+	}
+	defer t.unlock(actorUID)
+	a := t.findLocked(actorUID)
+	if a == nil || !t.idleSuspendedLocked(a) {
+		return false, nil
+	}
+	if _, ok := a.uploadDue(t.uploadDelay); !ok {
+		return false, nil
+	}
+	t.earlyMu.Lock()
+	t.earlyUploads[actorUID] = t.clock.Now()
+	t.earlyMu.Unlock()
+	t.requeueLocked(a)
+	return true, nil
+}
+
+// uploadingEarly reports whether FreeLocal made the actor's upload due early
+// and the snapshot isn't durable yet.
+func (t *Tracker) uploadingEarly(actorUID string) bool {
+	t.earlyMu.Lock()
+	defer t.earlyMu.Unlock()
+	_, ok := t.earlyUploads[actorUID]
+	return ok
+}
+
+// idleSuspendedLocked reports whether the actor is suspended with a detach
+// scheduled for later, and nothing runs on it.
+func (t *Tracker) idleSuspendedLocked(a *actorSnapshots) bool {
 	now := t.clock.Now()
 	if !a.detachScheduled() || !a.DetachAt.After(now) {
 		return false
 	}
-	if a.op != nil || a.hold != holdNone || a.retryAt.After(now) {
-		return false
-	}
-	if now.Sub(a.LatestLocal.CommitTime) < freeLocalMinAge {
-		return false
-	}
-	_, durable, err := a.detachTarget()
-	return err == nil && durable
+	return a.op == nil && a.hold == holdNone && !a.retryAt.After(now)
 }
 
 // localSnapshotBytes returns the bytes deleting the actor's local snapshots
